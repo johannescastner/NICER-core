@@ -177,6 +177,18 @@ async def lifespan(app: FastAPI):
 
 APP = FastAPI(lifespan=lifespan)
 
+@APP.post("/")
+async def verify_slack(req: Request):
+    """
+    Handle Slack's URL verification challenge.
+    """
+    data = await req.json()
+    
+    # Respond to Slack verification challenge
+    if "challenge" in data:
+        return {"challenge": data["challenge"]}
+
+    return {"detail": "Unauthorized"}, 401
 
 @APP.post("/events/slack")
 async def slack_endpoint(req: Request):
