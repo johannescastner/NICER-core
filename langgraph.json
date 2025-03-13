@@ -1,10 +1,15 @@
 {
   "$schema": "https://raw.githubusercontent.com/langchain-ai/langgraph/refs/heads/main/libs/cli/schemas/schema.json",
-  "dependencies": ["."],
+  "dependencies": [
+    "."
+  ],
   "graphs": {
     "chat": "./src/graphs/agent.py:my_agent"
   },
   "http": {
     "app": "./src/langgraph_slack/server.py:APP"
+  },
+  "auth": {
+    "path": "./src/langgraph_slack/auth.py:auth"
   }
 }
