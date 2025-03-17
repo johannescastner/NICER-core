@@ -11,3 +11,9 @@ wheels/
 .venv
 .ipynb_checkpoints/
 .python_version
+env/
+
+#LangGraph related stuff
+
+uv.lock
+.langgraph_api/
