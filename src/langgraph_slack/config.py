@@ -1,5 +1,8 @@
-from os import environ
 import logging
+import base64
+import json
+from os import environ
+from google.oauth2 import service_account
 
 LOGGER = logging.getLogger(__name__)
 
@@ -21,3 +24,18 @@ ASSISTANT_ID = environ.get("LANGGRAPH_ASSISTANT_ID", "default_assistant_id")
 CONFIG = environ.get("CONFIG") or "{}"
 DEPLOYMENT_URL = environ.get("DEPLOYMENT_URL", "")
 SLACK_CHANNEL_ID = environ.get("SLACK_CHANNEL_ID")
+
+# Google Cloud project details
+PROJECT_ID = environ.get("GCP_PROJECT_ID", "default_project_id")
+DATASET_ID = environ.get("GCP_DATASET_ID", "agent_system_memory")
+LOCATION = environ.get("GCP_LOCATION", "EU")  # Default to 'US' if not set
+
+# Table names for different memory types
+SEMANTIC_TABLE = environ.get("GCP_SEMANTIC_TABLE", "semantic_memory")
+EPISODIC_TABLE = environ.get("GCP_EPISODIC_TABLE", "episodic_memory")
+PROCEDURAL_TABLE = environ.get("GCP_PROCEDURAL_TABLE", "procedural_memory")
+
+# Service account credentials
+service_account_json = base64.b64decode(environ.get("GCP_SERVICE_ACCOUNT_BASE64", "")).decode("utf-8")
+credentials_dict = json.loads(service_account_json)
+CREDENTIALS = service_account.Credentials.from_service_account_info(credentials_dict)
