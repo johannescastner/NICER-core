@@ -2,7 +2,8 @@ import json
 import base64
 from datetime import datetime, timezone
 from google.cloud import bigquery
-from typing import Iterable, Tuple
+from typing import Any, Optional, Union, Literal, Tuple, List, Dict, Iterable
+from typing_extensions import TypedDict
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_google_community.bq_storage_vectorstores.bigquery import BigQueryVectorStore
 from langmem import create_manage_memory_tool, create_search_memory_tool
@@ -22,7 +23,6 @@ dataset = bigquery.Dataset(dataset_ref)
 dataset.location = LOCATION
 bq_client.create_dataset(dataset, exists_ok=True)
 
-from typing import Any, Optional, Union, Literal, Tuple, List, Dict
 from langchain_core.documents import Document
 from langchain_google_community.bq_storage_vectorstores.bigquery import BigQueryVectorStore
 from langgraph.store.base import BaseStore, Item, SearchItem
@@ -89,15 +89,28 @@ class BigQueryMemoryStore(BigQueryVectorStore, BaseStore):
             return []
 
         docs = await self.asimilarity_search(query, k=limit)
-        return [
-            SearchItem(
+        results = []
+        for doc in docs:
+            try:
+                ts = doc.metadata.get("user_timestamp")
+                created = (
+                    ts if isinstance(ts, datetime)
+                    else datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    if isinstance(ts, str)
+                    else None
+                )
+            except Exception:
+                created = None
+
+            results.append(SearchItem(
                 namespace=tuple(doc.metadata.get("namespace", "").split(".")),
                 key=doc.metadata.get("doc_id", ""),
                 score=None,
                 value=doc.metadata,
-            )
-            for doc in docs
-        ]
+                created_at=created,
+                updated_at=None
+            ))
+        return results
 
     async def abatch(
         self,
