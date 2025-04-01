@@ -3,9 +3,9 @@ import logging
 import re
 import json
 import uuid
-from typing import Awaitable, Callable, TypedDict
+from typing import Awaitable, Callable
+from typing_extensions import TypedDict
 from contextlib import asynccontextmanager
-
 from fastapi import FastAPI, Request
 from langgraph_sdk import get_client
 from slack_bolt.adapter.fastapi.async_handler import AsyncSlackRequestHandler
