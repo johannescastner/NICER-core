@@ -11,5 +11,25 @@
   },
   "auth": {
     "path": "./src/langgraph_slack/auth.py:auth"
-  }
+  },
+  "tools": [
+    {
+      "name": "manage_semantic_memory"
+    },
+    {
+      "name": "search_semantic_memory"
+    },
+    {
+      "name": "manage_episodic_memory"
+    },
+    {
+      "name": "search_episodic_memory"
+    },
+    {
+      "name": "manage_procedural_memory"
+    },
+    {
+      "name": "search_procedural_memory"
+    }
+  ]
 }
