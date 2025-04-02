@@ -1,12 +1,13 @@
 import sys
-
-# Patch typing.TypedDict to typing_extensions.TypedDict for Python < 3.12
-if sys.version_info < (3, 12):
-    import typing_extensions
-    import typing
-    typing.TypedDict = typing_extensions.TypedDict
 import typing
 import typing_extensions
+
+# For Python < 3.12, patch typing.TypedDict to avoid Pydantic crash
+if sys.version_info < (3, 12):
+    if not hasattr(typing, "TypedDict") or typing.TypedDict is not typing_extensions.TypedDict:
+        typing.TypedDict = typing_extensions.TypedDict
+
+
 import pydantic
 import logging
 import importlib.metadata
