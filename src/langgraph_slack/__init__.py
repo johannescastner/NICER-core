@@ -9,6 +9,7 @@ import typing
 import typing_extensions
 import pydantic
 import logging
+import importlib.metadata
 
 
 import dotenv
@@ -23,5 +24,10 @@ logging.basicConfig(
 logging.info(f"typing.TypedDict = {typing.TypedDict}")
 logging.info(f"typing_extensions.TypedDict = {typing_extensions.TypedDict}")
 logging.info(f"Is typing.TypedDict patched? {typing.TypedDict is typing_extensions.TypedDict}")
-logging.info(f"typing-extensions version: {typing_extensions.__version__}")
+try:
+    version = importlib.metadata.version("typing_extensions")
+except importlib.metadata.PackageNotFoundError:
+    version = "unknown"
+
+logging.info(f"typing-extensions version: {version}")
 logging.info(f"pydantic version: {pydantic.VERSION}")
