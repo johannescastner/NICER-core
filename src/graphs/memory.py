@@ -145,51 +145,45 @@ def initialize_vector_store(table_name: str) -> BigQueryMemoryStore:
         credentials=CREDENTIALS
     )
 
-# Initialize vector stores for each memory type
-semantic_memory_store = initialize_vector_store(SEMANTIC_TABLE)
-episodic_memory_store = initialize_vector_store(EPISODIC_TABLE)
-procedural_memory_store = initialize_vector_store(PROCEDURAL_TABLE)
+def get_memory_tools() -> List:
+    semantic_memory_store = initialize_vector_store(SEMANTIC_TABLE)
+    episodic_memory_store = initialize_vector_store(EPISODIC_TABLE)
+    procedural_memory_store = initialize_vector_store(PROCEDURAL_TABLE)
 
-# Create memory tools with explicit names for registration in langgraph.json
-semantic_manage_tool = create_manage_memory_tool(
-    namespace=("semantic_memories", "{langgraph_auth_user_id}"),
-    store=semantic_memory_store,
-    name="manage_semantic_memory"
-)
+    semantic_manage_tool = create_manage_memory_tool(
+        namespace=("semantic_memories", "{langgraph_auth_user_id}"),
+        store=semantic_memory_store,
+        name="manage_semantic_memory"
+    )
+    episodic_manage_tool = create_manage_memory_tool(
+        namespace=("episodic_memories", "{langgraph_auth_user_id}"),
+        store=episodic_memory_store,
+        name="manage_episodic_memory"
+    )
+    procedural_manage_tool = create_manage_memory_tool(
+        namespace=("procedural_memories", "{langgraph_auth_user_id}"),
+        store=procedural_memory_store,
+        name="manage_procedural_memory"
+    )
 
-episodic_manage_tool = create_manage_memory_tool(
-    namespace=("episodic_memories", "{langgraph_auth_user_id}"),
-    store=episodic_memory_store,
-    name="manage_episodic_memory"
-)
+    semantic_search_tool = create_search_memory_tool(
+        namespace=("semantic_memories", "{langgraph_auth_user_id}"),
+        store=semantic_memory_store,
+        name="search_semantic_memory"
+    )
+    episodic_search_tool = create_search_memory_tool(
+        namespace=("episodic_memories", "{langgraph_auth_user_id}"),
+        store=episodic_memory_store,
+        name="search_episodic_memory"
+    )
+    procedural_search_tool = create_search_memory_tool(
+        namespace=("procedural_memories", "{langgraph_auth_user_id}"),
+        store=procedural_memory_store,
+        name="search_procedural_memory"
+    )
 
-procedural_manage_tool = create_manage_memory_tool(
-    namespace=("procedural_memories", "{langgraph_auth_user_id}"),
-    store=procedural_memory_store,
-    name="manage_procedural_memory"
-)
-
-semantic_search_tool = create_search_memory_tool(
-    namespace=("semantic_memories", "{langgraph_auth_user_id}"),
-    store=semantic_memory_store,
-    name="search_semantic_memory"
-)
-
-episodic_search_tool = create_search_memory_tool(
-    namespace=("episodic_memories", "{langgraph_auth_user_id}"),
-    store=episodic_memory_store,
-    name="search_episodic_memory"
-)
-
-procedural_search_tool = create_search_memory_tool(
-    namespace=("procedural_memories", "{langgraph_auth_user_id}"),
-    store=procedural_memory_store,
-    name="search_procedural_memory"
-)
-
-# Expose memory tools for use in agent.py
-MEMORY_TOOLS = [
-    semantic_manage_tool, semantic_search_tool,
-    episodic_manage_tool, episodic_search_tool,
-    procedural_manage_tool, procedural_search_tool
-]
+    return [
+        semantic_manage_tool, semantic_search_tool,
+        episodic_manage_tool, episodic_search_tool,
+        procedural_manage_tool, procedural_search_tool
+    ]
