@@ -1,3 +1,4 @@
+import src.langgraph_slack.patch_typing  # must run before any Pydantic model loading
 import json
 import base64
 from datetime import datetime, timezone
