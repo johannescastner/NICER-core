@@ -1,3 +1,11 @@
+import sys
+
+# Patch typing.TypedDict to typing_extensions.TypedDict for Python < 3.12
+if sys.version_info < (3, 12):
+    import typing_extensions
+    import typing
+    typing.TypedDict = typing_extensions.TypedDict
+
 import logging
 import dotenv
 
