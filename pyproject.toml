@@ -23,6 +23,7 @@ dependencies = [
     "langchain-google-community>=0.0.2", 
     "langchain-google-community[featurestore]>=0.0.2", 
     "typing-extensions>=4.5.0",
+    "pydantic>=2.6,<3.0"
 ]
 
 [project.packages]
