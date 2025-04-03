@@ -31,5 +31,6 @@
     {
       "name": "search_procedural_memory"
     }
-  ]
+  ],
+  "python_version": "3.12"
 }
