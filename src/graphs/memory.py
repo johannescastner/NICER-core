@@ -2,7 +2,6 @@ import src.langgraph_slack.patch_typing  # must run before any Pydantic model lo
 import json
 import base64
 from datetime import datetime, timezone
-from pydantic import ConfigDict
 from google.cloud import bigquery
 from typing import Any, Optional, Union, Literal, Tuple, List, Dict, Iterable
 from typing_extensions import TypedDict
@@ -31,7 +30,6 @@ from langgraph.store.base import BaseStore, Item, SearchItem
 
 
 class BigQueryMemoryStore(BigQueryVectorStore, BaseStore):
-    #model_config = ConfigDict(arbitrary_types_allowed=True)
     __pydantic_config__ = {'arbitrary_types_allowed': True}
     __pydantic_model__ = None
 

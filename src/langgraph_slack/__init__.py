@@ -8,7 +8,7 @@ if sys.version_info < (3, 12):
         typing.TypedDict = typing_extensions.TypedDict
 
 
-import pydantic
+
 import logging
 import importlib.metadata
 
@@ -31,4 +31,4 @@ except importlib.metadata.PackageNotFoundError:
     version = "unknown"
 
 logging.info(f"typing-extensions version: {version}")
-logging.info(f"pydantic version: {pydantic.VERSION}")
+#logging.info(f"pydantic version: {pydantic.VERSION}")

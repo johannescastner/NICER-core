@@ -22,8 +22,7 @@ dependencies = [
     "langchain-huggingface>=0.0.1",
     "langchain-google-community>=0.0.2", 
     "langchain-google-community[featurestore]>=0.0.2", 
-    "typing-extensions>=4.5.0",
-    "pydantic>=2.7.0,<3.0.0"
+    "typing-extensions>=4.5.0"
 ]
 
 [project.packages]
