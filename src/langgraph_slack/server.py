@@ -42,18 +42,22 @@ class SlackMessageData(TypedDict):
 async def worker():
     LOGGER.info("Background worker started.")
     while True:
+        task = None
         try:
             task = await TASK_QUEUE.get()
-            if not task:
+            if task is None:
                 LOGGER.info("Worker received sentinel, exiting.")
                 break
-
             LOGGER.info(f"Worker got a new task: {task}")
             await _process_task(task)
+        except asyncio.CancelledError:
+            LOGGER.info("Worker task was cancelled.")
+            break
         except Exception as exc:
             LOGGER.exception(f"Error in worker: {exc}")
         finally:
-            TASK_QUEUE.task_done()
+            if task is not None:
+                TASK_QUEUE.task_done()
 
 
 async def _process_task(task: dict):
@@ -169,10 +173,11 @@ APP_HANDLER.app.event("app_mention")(
 async def lifespan(app: FastAPI):
     LOGGER.info("App is starting up. Creating background worker...")
     loop = asyncio.get_running_loop()
-    loop.create_task(worker())
+    worker_task = loop.create_task(worker())
     yield
     LOGGER.info("App is shutting down. Stopping background worker...")
-    TASK_QUEUE.put_nowait(None)
+    await TASK_QUEUE.put(None)  # Send sentinel to worker
+    await worker_task  # Wait for the worker to exit
 
 
 APP = FastAPI(lifespan=lifespan)
