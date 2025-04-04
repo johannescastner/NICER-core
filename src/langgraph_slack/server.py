@@ -77,6 +77,10 @@ async def _process_task(task: dict):
             LOGGER.info("Skipping non-mention message")
             return
 
+        # Add the langgraph_auth_user_id to the GRAPH_CONFIG
+        user_id = event["user"]
+        updated_graph_config = {**GRAPH_CONFIG, "langgraph_auth_user_id": user_id}
+
         LOGGER.info(
             f"[{channel_id}].[{thread_id}] sending message to LangGraph: "
             f"with webhook {webhook}: {text_with_names}"
@@ -93,7 +97,7 @@ async def _process_task(task: dict):
                     }
                 ]
             },
-            config=GRAPH_CONFIG,
+            config=updated_graph_config,
             metadata={
                 "event": "slack",
                 "slack_event_type": "message",
