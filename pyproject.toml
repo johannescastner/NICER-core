@@ -22,7 +22,9 @@ dependencies = [
     "langchain-huggingface>=0.0.1",
     "langchain-google-community>=0.0.3", 
     "langchain-google-community[featurestore]>=0.0.2", 
-    "typing-extensions>=4.5.0"
+    "typing-extensions>=4.5.0",
+    "transformers>=4.28.1",
+    "accelerate>=0.12.0"
 ]
 
 [project.packages]
