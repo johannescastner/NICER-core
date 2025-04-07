@@ -35,7 +35,7 @@ class BigQueryMemoryStore(BigQueryVectorStore, BaseStore):
     model_config = {
         "arbitrary_types_allowed": True
     }
-    def __init__(self, project_id: str, dataset_name: str, table_name: str, location: str, embedding, credentials, schema: list[bigquery.SchemaField]):
+    def __init__(self, project_id: str, dataset_name: str, table_name: str, location: str, embedding, credentials, schema: list[bigquery.SchemaField], content_field: str):
         super().__init__(
             project_id=project_id,
             dataset_name=dataset_name,
@@ -47,6 +47,7 @@ class BigQueryMemoryStore(BigQueryVectorStore, BaseStore):
         )
         self.schema = schema
         self._ensure_table_exists()
+        self.content_field = content_field
 
     def _ensure_table_exists(self):
         client = bigquery.Client(credentials=self.credentials, project=self.project_id, location=self.location)
@@ -75,8 +76,12 @@ class BigQueryMemoryStore(BigQueryVectorStore, BaseStore):
         value["namespace"] = ".".join(namespace)
         value["doc_id"] = key
         # Generate embedding for the content
-        
-        document = Document(page_content=value.get("content", ""), metadata=value)
+        text = value.get(self.content_field)
+        if isinstance(text, dict):
+            text = json.dumps(text)  # Embed structured JSON as string
+        elif not isinstance(text, str):
+            raise ValueError(f"Expected {self.content_field} to be a string or dict, got {type(text)}")
+        document = Document(page_content=text, metadata=value)
         await self.aadd_documents([document])
 
     async def aget(
@@ -174,6 +179,12 @@ class BigQueryMemoryStore(BigQueryVectorStore, BaseStore):
         import asyncio
         asyncio.run(self.abatch(operations))
 
+CONTENT_FIELDS = {
+    SEMANTIC_TABLE: "fact",
+    EPISODIC_TABLE: "event_details",
+    PROCEDURAL_TABLE: "procedure",
+}
+
 # Function to initialize a BigQueryMemoryStore
 def initialize_vector_store(table_name: str, schema: List[bigquery.SchemaField]) -> BigQueryMemoryStore:
     return BigQueryMemoryStore(
@@ -183,7 +194,8 @@ def initialize_vector_store(table_name: str, schema: List[bigquery.SchemaField])
         location=LOCATION,
         embedding=embedding,
         credentials=CREDENTIALS,
-        schema=schema
+        schema=schema,
+        content_field=CONTENT_FIELDS[table_name]
     )
 
 #----------------------SCHEMAS------------------------------------------------
