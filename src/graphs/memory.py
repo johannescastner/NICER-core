@@ -27,7 +27,7 @@ bq_client.create_dataset(dataset, exists_ok=True)
 from langchain_core.documents import Document
 from langchain_google_community.bq_storage_vectorstores.bigquery import BigQueryVectorStore
 from langgraph.store.base import BaseStore, Item, SearchItem
-
+from google.cloud.exceptions import NotFound
 
 class BigQueryMemoryStore(BigQueryVectorStore, BaseStore):
     __pydantic_config__ = {'arbitrary_types_allowed': True}
@@ -72,10 +72,7 @@ class BigQueryMemoryStore(BigQueryVectorStore, BaseStore):
         value["namespace"] = ".".join(namespace)
         value["doc_id"] = key
         # Generate embedding for the content
-        content = value.get("content", "")
-        embedding_vector = self.embedding.embed(content)
-        value["embedding"] = embedding_vector
-
+        
         document = Document(page_content=value.get("content", ""), metadata=value)
         await self.aadd_documents([document])
 
@@ -130,11 +127,9 @@ class BigQueryMemoryStore(BigQueryVectorStore, BaseStore):
         if query is None:
             return []
 
-        # Generate embedding for the query
-        query_embedding = self.embedding.embed(query)
-
+        
         # Perform similarity search using the query embedding
-        docs = await self.asimilarity_search_by_vector(query_embedding, k=limit + offset)
+        docs = await self.asimilarity_search_by_vector(query, k=limit + offset)
         results = []
         for doc in docs[offset:]:
             metadata = doc.metadata
