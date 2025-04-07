@@ -30,8 +30,11 @@ from langgraph.store.base import BaseStore, Item, SearchItem
 from google.cloud.exceptions import NotFound
 
 class BigQueryMemoryStore(BigQueryVectorStore, BaseStore):
-    __pydantic_config__ = {'arbitrary_types_allowed': True}
-    __pydantic_model__ = None
+    schema: list[bigquery.SchemaField] = []
+
+    model_config = {
+        "arbitrary_types_allowed": True
+    }
     def __init__(self, project_id: str, dataset_name: str, table_name: str, location: str, embedding, credentials, schema: list[bigquery.SchemaField]):
         super().__init__(
             project_id=project_id,
