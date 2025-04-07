@@ -32,7 +32,30 @@ from langgraph.store.base import BaseStore, Item, SearchItem
 class BigQueryMemoryStore(BigQueryVectorStore, BaseStore):
     __pydantic_config__ = {'arbitrary_types_allowed': True}
     __pydantic_model__ = None
+    def __init__(self, project_id: str, dataset_name: str, table_name: str, location: str, embedding, credentials, schema: list[bigquery.SchemaField]):
+        super().__init__(
+            project_id=project_id,
+            dataset_name=dataset_name,
+            table_name=table_name,
+            location=location,
+            embedding=embedding,
+            credentials=credentials,
+            extra_fields={field.name: field.field_type for field in schema if field.name not in ['doc_id', 'content', 'embedding']}
+        )
+        self.schema = schema
+        self._ensure_table_exists()
 
+    def _ensure_table_exists(self):
+        client = bigquery.Client(credentials=self.credentials, project=self.project_id, location=self.location)
+        dataset_ref = client.dataset(self.dataset_name)
+        table_ref = dataset_ref.table(self.table_name)
+        try:
+            client.get_table(table_ref)
+        except NotFound:
+            table = bigquery.Table(table_ref, schema=self.schema)
+            client.create_table(table)
+
+    #--------------------------------------------------------------------------------
     async def aput(
         self,
         namespace: Tuple[str, ...],
@@ -48,6 +71,10 @@ class BigQueryMemoryStore(BigQueryVectorStore, BaseStore):
         value.setdefault("user_timestamp", now)  # Allow override if upstream provides it
         value["namespace"] = ".".join(namespace)
         value["doc_id"] = key
+        # Generate embedding for the content
+        content = value.get("content", "")
+        embedding_vector = self.embedding.embed(content)
+        value["embedding"] = embedding_vector
 
         document = Document(page_content=value.get("content", ""), metadata=value)
         await self.aadd_documents([document])
@@ -64,11 +91,22 @@ class BigQueryMemoryStore(BigQueryVectorStore, BaseStore):
             return None
 
         doc = docs[0]
+        metadata = doc.metadata
+        namespace_tuple = tuple(metadata.get("namespace", "").split("."))
+        user_timestamp = metadata.get("user_timestamp")
+
+        # Parse user_timestamp safely
+        if isinstance(user_timestamp, str):
+            try:
+                user_timestamp = datetime.fromisoformat(user_timestamp.replace("Z", "+00:00"))
+            except ValueError:
+                user_timestamp = None
+
         return Item(
-            namespace=tuple(doc.metadata.get("namespace", "").split(".")),
+            namespace=namespace_tuple,
             key=key,
-            value=doc.metadata,
-            created_at=None,
+            value=metadata,
+            created_at=user_timestamp,
             updated_at=None,
         )
 
@@ -92,26 +130,31 @@ class BigQueryMemoryStore(BigQueryVectorStore, BaseStore):
         if query is None:
             return []
 
-        docs = await self.asimilarity_search(query, k=limit)
+        # Generate embedding for the query
+        query_embedding = self.embedding.embed(query)
+
+        # Perform similarity search using the query embedding
+        docs = await self.asimilarity_search_by_vector(query_embedding, k=limit + offset)
         results = []
-        for doc in docs:
-            try:
-                ts = doc.metadata.get("user_timestamp")
-                created = (
-                    ts if isinstance(ts, datetime)
-                    else datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                    if isinstance(ts, str)
-                    else None
-                )
-            except Exception:
-                created = None
+        for doc in docs[offset:]:
+            metadata = doc.metadata
+            namespace_tuple = tuple(metadata.get("namespace", "").split("."))
+            doc_id = metadata.get("doc_id", "")
+            user_timestamp = metadata.get("user_timestamp")
+
+            # Parse user_timestamp safely
+            if isinstance(user_timestamp, str):
+                try:
+                    user_timestamp = datetime.fromisoformat(user_timestamp.replace("Z", "+00:00"))
+                except ValueError:
+                    user_timestamp = None
 
             results.append(SearchItem(
-                namespace=tuple(doc.metadata.get("namespace", "").split(".")),
-                key=doc.metadata.get("doc_id", ""),
-                score=None,
-                value=doc.metadata,
-                created_at=created,
+                namespace=namespace_tuple,
+                key=doc_id,
+                score=None,  # Populate with actual similarity score if available
+                value=metadata,
+                created_at=user_timestamp,
                 updated_at=None
             ))
         return results
@@ -134,20 +177,115 @@ class BigQueryMemoryStore(BigQueryVectorStore, BaseStore):
         asyncio.run(self.abatch(operations))
 
 # Function to initialize a BigQueryMemoryStore
-def initialize_vector_store(table_name: str) -> BigQueryMemoryStore:
+def initialize_vector_store(table_name: str, schema: List[bigquery.SchemaField]) -> BigQueryMemoryStore:
     return BigQueryMemoryStore(
         project_id=PROJECT_ID,
         dataset_name=DATASET_ID,
         table_name=table_name,
         location=LOCATION,
         embedding=embedding,
-        credentials=CREDENTIALS
+        credentials=CREDENTIALS,
+        schema=schema
     )
 
+#----------------------SCHEMAS------------------------------------------------
+# Define the desired schemas for each table
+SCHEMAS = {
+    SEMANTIC_TABLE: [
+        bigquery.SchemaField(
+        'doc_id', 'STRING', mode='REQUIRED',
+        description='A unique identifier for the knowledge entry.'
+    ),
+    bigquery.SchemaField(
+        'fact', 'JSON', mode='NULLABLE',
+        description='A JSON object representing the fact or piece of knowledge.'
+    ),
+    bigquery.SchemaField(
+        'embedding', 'FLOAT', mode='REPEATED',
+        description='A vector representation of the fact, aiding in semantic searches.'
+    ),
+    bigquery.SchemaField(
+        'namespace', 'STRING', mode='NULLABLE',
+        description='A category or domain to which the fact belongs.'
+    ),
+    bigquery.SchemaField(
+        'stored_at', 'TIMESTAMP', mode='NULLABLE', default_value_expression='CURRENT_TIMESTAMP()',
+        description='The timestamp when the fact was stored.'
+    ),
+    bigquery.SchemaField(
+        'source', 'STRING', mode='NULLABLE',
+        description='The origin of the fact, which could be a document, user input, or external knowledge base.'
+    ),
+    ],
+    EPISODIC_TABLE: [
+    bigquery.SchemaField(
+        'doc_id', 'STRING', mode='REQUIRED',
+        description='A unique identifier for the memory entry.'
+    ),
+    bigquery.SchemaField(
+        'event_details', 'JSON', mode='NULLABLE',
+        description='A JSON object containing detailed information about the event, such as participants, location, and actions.'
+    ),
+    bigquery.SchemaField(
+        'embedding', 'FLOAT', mode='REPEATED',
+        description='A vector representation of the memory, useful for similarity searches.'
+    ),
+    bigquery.SchemaField(
+        'namespace', 'STRING', mode='NULLABLE',
+        description='A category or domain to which the memory belongs, aiding in organization and retrieval.'
+    ), 
+    bigquery.SchemaField(
+        'user_timestamp', 'TIMESTAMP', mode='NULLABLE',
+        description='The timestamp when the user entered her prompt.'
+    ),
+    bigquery.SchemaField(
+        'stored_at', 'TIMESTAMP', mode='NULLABLE', default_value_expression='CURRENT_TIMESTAMP()',
+        description='The timestamp when the memory was stored.'
+    ),
+    bigquery.SchemaField(
+        'user_id', 'STRING', mode='NULLABLE',
+        description='The identifier of the user associated with this memory.'
+    ),
+    bigquery.SchemaField(
+        'channel_id', 'STRING', mode='NULLABLE',
+        description='The identifier of the communication channel where the event occurred.'
+    ),
+
+    ],
+    PROCEDURAL_TABLE: [
+        bigquery.SchemaField(
+        'doc_id', 'STRING', mode='REQUIRED',
+        description='A unique identifier for the procedural rule or behavior.'
+    ),
+    bigquery.SchemaField(
+        'procedure', 'JSON', mode='NULLABLE',
+        description='A JSON object detailing the procedure or behavior, including conditions and actions.'
+    ),
+    bigquery.SchemaField(
+        'embedding', 'FLOAT', mode='REPEATED',
+        description='A vector representation of the procedure, facilitating similarity assessments.'
+    ),
+    bigquery.SchemaField(
+        'namespace', 'STRING', mode='NULLABLE',
+        description='A category or domain to which the procedure belongs.'
+    ),
+    bigquery.SchemaField(
+        'stored_at', 'TIMESTAMP', mode='NULLABLE', default_value_expression='CURRENT_TIMESTAMP()',
+        description='The timestamp when the procedure was stored.'
+    ),
+    bigquery.SchemaField(
+        'version', 'STRING', mode='NULLABLE',
+        description='The version of the procedure, useful for tracking updates and changes.'
+    ),
+]
+
+}
+
+#---------------------------------get memory tools--------------------------------
 def get_memory_tools() -> List:
-    semantic_memory_store = initialize_vector_store(SEMANTIC_TABLE)
-    episodic_memory_store = initialize_vector_store(EPISODIC_TABLE)
-    procedural_memory_store = initialize_vector_store(PROCEDURAL_TABLE)
+    semantic_memory_store = initialize_vector_store(SEMANTIC_TABLE, SCHEMAS[SEMANTIC_TABLE])
+    episodic_memory_store = initialize_vector_store(EPISODIC_TABLE, SCHEMAS[EPISODIC_TABLE])
+    procedural_memory_store = initialize_vector_store(PROCEDURAL_TABLE, SCHEMAS[PROCEDURAL_TABLE])
 
     semantic_manage_tool = create_manage_memory_tool(
         namespace=("semantic_memories", "{langgraph_auth_user_id}"),
