@@ -36,6 +36,10 @@ EPISODIC_TABLE = environ.get("GCP_EPISODIC_TABLE", "episodic_memory")
 PROCEDURAL_TABLE = environ.get("GCP_PROCEDURAL_TABLE", "procedural_memory")
 
 # Service account credentials
-service_account_json = base64.b64decode(environ.get("GCP_SERVICE_ACCOUNT_BASE64", "")).decode("utf-8")
-credentials_dict = json.loads(service_account_json)
-CREDENTIALS = service_account.Credentials.from_service_account_info(credentials_dict)
+try:
+    service_account_json = base64.b64decode(environ.get("GCP_SERVICE_ACCOUNT_BASE64", "")).decode("utf-8")
+    credentials_dict = json.loads(service_account_json)
+    CREDENTIALS = service_account.Credentials.from_service_account_info(credentials_dict)
+    LOGGER.info("Service account credentials loaded successfully.")
+except Exception as e:
+    LOGGER.error(f"Failed to load service account credentials: {e}")
