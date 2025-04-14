@@ -81,6 +81,13 @@ async def _process_task(task: dict):
         user_id = event["user"]
         updated_graph_config = {**GRAPH_CONFIG, "langgraph_auth_user_id": user_id}
 
+        # Log the message content being sent to LangGraph
+        LOGGER.debug(f"Processed message for LangGraph: {text_with_names}")
+
+        # Log the event and user info
+        LOGGER.debug(f"Event info: {event}")
+        LOGGER.debug(f"User info: {event['user']}")
+
         LOGGER.info(
             f"[{channel_id}].[{thread_id}] sending message to LangGraph: "
             f"with webhook {webhook}: {text_with_names}"
@@ -113,7 +120,7 @@ async def _process_task(task: dict):
             if_not_exists="create",
             webhook=webhook,
         )
-        LOGGER.info(f"LangGraph run: {result}")
+        LOGGER.debug(f"LangGraph run: {result}")
 
     elif event_type == "callback":
         LOGGER.info(f"Processing LangGraph callback: {event['thread_id']}")

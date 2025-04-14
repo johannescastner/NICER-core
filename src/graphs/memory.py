@@ -1,4 +1,5 @@
 from __future__ import annotations
+import uuid
 import src.langgraph_slack.patch_typing  # must run before any Pydantic model loading
 import logging
 import json
@@ -18,6 +19,7 @@ from langchain_google_community.bq_storage_vectorstores.bigquery import BigQuery
 from langgraph.store.base import Item, SearchItem
 from langgraph.store.base.batch import AsyncBatchedBaseStore, Op, PutOp, GetOp, SearchOp, ListNamespacesOp, Result
 from langmem import create_manage_memory_tool, create_search_memory_tool
+from langchain_google_community.bq_storage_vectorstores.utils import validate_column_in_bq_schema
 
 from src.langgraph_slack.config import (
     PROJECT_ID, DATASET_ID, LOCATION,
@@ -26,6 +28,7 @@ from src.langgraph_slack.config import (
 )
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 embedding = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
@@ -37,7 +40,7 @@ except Exception as e:
 
 CONTENT_FIELDS = {
     SEMANTIC_TABLE: "fact",
-    EPISODIC_TABLE: "event_details",
+    EPISODIC_TABLE: "observation",
     PROCEDURAL_TABLE: "procedure",
 }
 
@@ -60,20 +63,176 @@ class Procedure(BaseModel):
 
 PYDANTIC_MODELS = {
     "fact": Fact,
-    "event_details": Episode,
+    "observation": Episode,
     "procedure": Procedure,
 }
 
-SCHEMAS = {
-    SEMANTIC_TABLE: [...],  # Redacted for brevity
-    EPISODIC_TABLE: [...],
-    PROCEDURAL_TABLE: [...],
-}
+
+class PatchedBigQueryVectorStore(BigQueryVectorStore):
+    def add_texts_with_embeddings(
+        self,
+        texts: List[Union[str, dict]],
+        embs: List[List[float]],
+        metadatas: Optional[List[dict]] = None,
+        ids: Optional[List[str]] = None,
+    ) -> List[str]:
+        # Generate IDs if not provided
+        if ids is None:
+            ids = [uuid.uuid4().hex for _ in texts]
+        if metadatas is None:
+            metadatas = [{} for _ in texts]
+
+        values_dict: List[Dict[str, Any]] = []
+        for idx, text, emb, metadata_dict in zip(ids, texts, embs, metadatas):
+            record = {
+                self.doc_id_field: idx,
+                self.embedding_field: emb,
+            }
+
+            if self._is_record_column():
+                # Use the structured data from metadata_dict for RECORD fields
+                if isinstance(metadata_dict.get(self.content_field), dict):
+                    record[self.content_field] = metadata_dict[self.content_field]
+                else:
+                    raise ValueError(
+                        f"Expected dict for RECORD column `{self.content_field}`, got: {type(metadata_dict.get(self.content_field))}"
+                    )
+            else:
+                # For non-RECORD fields, handle as before
+                if isinstance(text, dict):
+                    record[self.content_field] = json.dumps(text)
+                elif isinstance(text, str):
+                    record[self.content_field] = text
+                else:
+                    raise ValueError(
+                        f"Expected str or dict for `{self.content_field}`, got: {type(text)}"
+                    )
+
+            record.update(metadata_dict)
+            values_dict.append(record)
+
+        logger.debug(f"Type of 'fact' field: {type(record[self.content_field])}")
+        logger.debug(f"Content of 'fact' field: {record[self.content_field]}")
+        table = self._bq_client.get_table(self.full_table_id)
+        try:
+            if self.schema is not None:
+                job = self._bq_client.load_table_from_json(values_dict, table, self.schema)
+                logger.debug(f"loaded_table with schema!")
+            else: 
+                job = self._bq_client.load_table_from_json(values_dict, table)
+                logger.debug(f"loaded_table with no schema!")
+            job.result()  # Wait for the job to complete
+        except google.api_core.exceptions.GoogleAPIError as e:
+            # Handle errors returned by the Google API
+            print(f"Google API error occurred: {e}")
+            logger.debug(f"Google API error occurred: {e}")
+            raise
+        except ValueError as e:
+            # Handle value errors, such as schema mismatches
+            print(f"Value error: {e}")
+            logger.debug(f"Value error: {e}")
+            raise
+        except Exception as e:
+            # Handle other unexpected exceptions
+            print(f"An unexpected error occurred: {e}")
+            logger.debug(f"An unexpected error occurred: {e}")
+            raise
+        self._validate_bq_table()
+        self._logger.debug(f"Stored {len(ids)} records in BigQuery.")
+        self.sync_data()
+        return ids
+
+    def _is_record_column(self) -> bool:
+        """Check whether the content_field is a RECORD in the BigQuery schema."""
+        table = self._bq_client.get_table(self.full_table_id)
+        for field in table.schema:
+            if field.name == self.content_field:
+                return field.field_type.upper() == "RECORD"
+        return False
+    
+    def _validate_bq_table(self) -> Any:
+        from google.cloud import bigquery  # type: ignore[attr-defined]
+        from google.cloud.exceptions import NotFound
+
+        table_ref = bigquery.TableReference.from_string(self.full_table_id)
+
+        try:
+            # Attempt to retrieve the table information
+            table = self._bq_client.get_table(table_ref)
+        except NotFound:
+            self._logger.debug(
+                f"Couldn't find table {self.full_table_id}. "
+                f"Table will be created once documents are added"
+            )
+            return
+
+        schema = table.schema.copy()
+        if schema:  # Check if table has a schema
+            self.table_schema = {field.name: field.field_type for field in schema}
+            columns = {c.name: c for c in schema}
+
+            # Validate doc_id_field
+            validate_column_in_bq_schema(
+                column_name=self.doc_id_field,
+                columns=columns,
+                expected_types=["STRING"],
+                expected_modes=["NULLABLE", "REQUIRED"],
+            )
+
+            # Validate content_field based on actual schema
+            if self.content_field in columns:
+                content_field_type = columns[self.content_field].field_type.upper()
+                expected_types = [content_field_type]  # Accept the actual type
+                validate_column_in_bq_schema(
+                    column_name=self.content_field,
+                    columns=columns,
+                    expected_types=expected_types,
+                    expected_modes=["NULLABLE", "REQUIRED"],
+                )
+            else:
+                raise ValueError(f"Column '{self.content_field}' not found in the table schema.")
+
+            # Validate embedding_field
+            validate_column_in_bq_schema(
+                column_name=self.embedding_field,
+                columns=columns,
+                expected_types=["FLOAT", "FLOAT64"],
+                expected_modes=["REPEATED"],
+            )
+
+            # Validate extra_fields if provided
+            if self.extra_fields is None:
+                extra_fields = {}
+                for column in schema:
+                    if column.name not in [
+                        self.doc_id_field,
+                        self.content_field,
+                        self.embedding_field,
+                    ]:
+                        # Check for unsupported REPEATED mode
+                        if column.mode == "REPEATED":
+                            raise ValueError(
+                                f"Column '{column.name}' is REPEATED. "
+                                f"REPEATED fields are not supported in this context."
+                            )
+                        extra_fields[column.name] = column.field_type
+                self.extra_fields = extra_fields
+            else:
+                for field, type in self.extra_fields.items():
+                    validate_column_in_bq_schema(
+                        column_name=field,
+                        columns=columns,
+                        expected_types=[type],
+                        expected_modes=["NULLABLE", "REQUIRED"],
+                    )
+
+            self._logger.debug(f"Table {self.full_table_id} validated")
+        return table_ref
 
 class BigQueryMemoryStore(AsyncBatchedBaseStore):
     def __init__(
         self,
-        vectorstore: BigQueryVectorStore,
+        vectorstore: PatchedBigQueryVectorStore,
         content_field: str,
         content_model: Optional[Type[BaseModel]] = None,
         schema: Optional[List[bigquery.SchemaField]] = None,
@@ -95,8 +254,8 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         content_model: Optional[Type[BaseModel]] = None,
         schema: Optional[List[bigquery.SchemaField]] = None,
         **kwargs,
-    ) -> BigQueryMemoryStore:
-        vectorstore = BigQueryVectorStore(
+    ) -> PatchedBigQueryVectorStore:
+        vectorstore = PatchedBigQueryVectorStore(
             embedding=embedding,
             project_id=bq_client.project,
             dataset_name=dataset_name,
@@ -107,6 +266,8 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             **kwargs,
         )
         object.__setattr__(vectorstore, "_bq_client", bq_client)
+        if schema is not None:
+            vectorstore.schema = schema  # Assign schema to vectorstore
         return cls(
             vectorstore=vectorstore,
             content_field=content_field,
@@ -114,27 +275,36 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             schema=schema,
         )
 
-    def _normalize_structured_field(self, raw: Any) -> str:
+    def _normalize_structured_field(self, raw: Any) -> dict:
         if isinstance(raw, dict) and self.content_model:
-            logger.debug(f"Raw content before wrapping: {raw}")
-            return self.content_model(**raw)
+            # Wrap into the content model (e.g., Fact)
+            return raw  # Return as a dictionary
         elif isinstance(raw, str) and self.content_model:
-            return self.content_model(content=raw)
+            # If it's a string, wrap it into the content model
+            return {"content":raw}
         elif isinstance(raw, self.content_model):
-            return raw
-        raise ValueError(
-            f"{self.content_field} must be a dict, str, or {self.content_model.__name__} — got {type(raw)}"
-        )
+            return raw.dict()  # Already in the correct format
+        else:
+            raise ValueError(
+                f"{self.content_field} must be a dict, str, or {self.content_model.__name__} — got {type(raw)}"
+            )
 
     async def aput(self, namespace: Tuple[str, ...], key: str, value: dict[str, Any], index: Optional[Union[Literal[False], list[str]]] = None, *, ttl: Optional[float] = None) -> None:
         logger.info(f"[aput] Inserting doc_id={key} into namespace={namespace}")
         
-        value = dict(value)
-        value["namespace"] = ".".join(namespace)
-        value["doc_id"] = key
+        data = {"namespace" : ".".join(namespace), "doc_id" : key}
 
+        # Log the entire value being passed to aput
+        logger.debug(f"[aput] initial data: {json.dumps(data, indent=2)}")
+        
+        # Log the content field name to check if it's what we expect
+        logger.debug(f"[aput] Using content field: {self.content_field}")
+        
         # Get the raw content and ensure it's wrapped in the correct model (e.g., Fact)
-        raw_content = value.get(self.content_field)
+        raw_content = value.get("content")
+        
+        # Log the raw content that is being retrieved
+        logger.debug(f"[aput] Raw content retrieved: {raw_content}")
         
         if raw_content is None:
             logger.error(f"Content for {self.content_field} is None. This is not expected.")
@@ -142,13 +312,20 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
 
         # Ensure the content is wrapped into the content model (e.g., Fact)
         text = self._normalize_structured_field(raw_content)
-
+        # Now, prepare the embedding by serializing the transformed content as JSON
+        embedding_content = json.dumps(text)
+        # Log the normalized text content
+        logger.debug(f"[aput] Normalized content: {text}")
+        data[self.content_field] = text
+        logger.debug(f"[aput] Value being inserted: {json.dumps(data, indent=2)}")
+        logger.debug(f"[aput] the type(data[self.content_field]): {type(data[self.content_field])}")
         # Insert the document into BigQuery (wrapped content)
-        doc = Document(page_content=text, metadata=value)
+        
+        doc = Document(page_content=embedding_content, metadata=data, id=key)
         self.vectorstore.add_documents([doc])
 
     async def aget(self, namespace: Tuple[str, ...], key: str, *, refresh_ttl: Optional[bool] = None) -> Optional[Item]:
-        logger.info(f"[aget] Retrieving doc_id={key} from namespace={namespace}")
+        logger.debug(f"[aget] Retrieving doc_id={key} from namespace={namespace}")
         docs = self.vectorstore.get_documents(ids=[key])
         if not docs:
             return None
@@ -245,7 +422,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
 
 CONTENT_FIELDS = {
     SEMANTIC_TABLE: "fact",
-    EPISODIC_TABLE: "event_details",
+    EPISODIC_TABLE: "observation",
     PROCEDURAL_TABLE: "procedure",
 }
 
