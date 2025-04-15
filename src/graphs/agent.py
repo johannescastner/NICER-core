@@ -18,7 +18,8 @@ logger.debug(f"Agent tools before creation: {[tool.name for tool in MEMORY_TOOLS
 # Create the agent using memory tools and keep the variable name `my_agent`
 my_agent = create_react_agent(
     "openai:o3-mini",
-    tools=MEMORY_TOOLS,  #Use memory tools
+    tools=MEMORY_TOOLS,
+    debug=True
    )
 # Log what tools were actually registered
 logger.debug("Agent successfully created!")

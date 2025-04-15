@@ -1,5 +1,6 @@
 from __future__ import annotations
 import uuid
+import google
 import src.langgraph_slack.patch_typing  # must run before any Pydantic model loading
 import logging
 import json
@@ -40,7 +41,7 @@ except Exception as e:
 
 CONTENT_FIELDS = {
     SEMANTIC_TABLE: "fact",
-    EPISODIC_TABLE: "observation",
+    EPISODIC_TABLE: "episode",
     PROCEDURAL_TABLE: "procedure",
 }
 
@@ -63,7 +64,7 @@ class Procedure(BaseModel):
 
 PYDANTIC_MODELS = {
     "fact": Fact,
-    "observation": Episode,
+    "episode": Episode,
     "procedure": Procedure,
 }
 
@@ -344,6 +345,10 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         logger.info(f"[asearch] Searching in namespace_prefix={namespace_prefix} for query='{query}'")
         if not query:
             return []
+        # Serialize query if it's a dictionary
+        if isinstance(query, dict):
+            query = json.dumps(query)
+
         results = self.vectorstore.similarity_search_with_score(
             query=query,
             filter=filter,
@@ -422,7 +427,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
 
 CONTENT_FIELDS = {
     SEMANTIC_TABLE: "fact",
-    EPISODIC_TABLE: "observation",
+    EPISODIC_TABLE: "episode",
     PROCEDURAL_TABLE: "procedure",
 }
 
