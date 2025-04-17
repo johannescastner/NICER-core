@@ -3,7 +3,7 @@
 *A memory‑first, LangGraph‑powered agent that lives inside Slack and grows alongside your team.*
 
 ---
-
+![image](https://github.com/user-attachments/assets/a6baa9b3-0f89-4c08-9919-9760899f1967)
 ## Why baby‑NICER?
 
 Modern teams need more than a chatbot. They need a teammate that **remembers**—one that can surface past decisions, reuse proven workflows, and keep context alive across channels, threads and months. baby‑NICER ("Nimble Impartial Consensus Engendering Resource – beta") is our open‑source prototype of that vision.
