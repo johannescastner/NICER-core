@@ -1,218 +1,112 @@
-# LangGraph Application Integration with Slack
+# baby‑NICER
 
-Modern AI applications like chatbots and agents communicate through natural language, making messaging platforms like Slack an ideal interface for interacting with them. As these AI assistants take on more complex tasks, users need to engage with them in their native work environments rather than separate web interfaces.
+*A memory‑first, LangGraph‑powered agent that lives inside Slack and grows alongside your team.*
 
-This repository demonstrates how to connect any LangGraph-powered application (chatbot, agent, or other AI system) to Slack, allowing teams to interact with their AI assistants directly in their everyday communication channels. Currently focused on Slack integration, with a straightforward approach that can be adapted for other messaging platforms.
+---
 
-## Quickstart
+## Why baby‑NICER?
 
-### Prerequisites
+Modern teams need more than a chatbot. They need a teammate that **remembers**—one that can surface past decisions, reuse proven workflows, and keep context alive across channels, threads and months. baby‑NICER ("Nimble Impartial Consensus Engendering Resource – beta") is our open‑source prototype of that vision.
 
-- [LangGraph platform](https://langchain-ai.github.io/langgraph/concepts/langgraph_platform/) deployment with a `messages` state key (e.g., a chatbot).
+- **Agentic core.** Built on LangGraph’s ReAct agent pattern for autonomous reasoning + tool use.
+- **Three‑tier memory.** Semantic (facts), episodic (experiences) and procedural (skills) stores, powered by LangMem.
+- **Cloud‑scale recall.** BigQueryMemoryStore persists millions of vector‑indexed memories with millisecond search.
+- **Swarm‑ready.** Designed to spawn specialist agents—a SQL analyst, a Superset chart‑maker, a social‑listening scout—under a LangGraph Swarm.
+- **Positive ethics.** Granular BigQuery IAM, opt‑in retention and audit hooks so memory empowers people rather than surveils them.
 
-### Flow
+---
 
-The overall concept is simple: Slack routes are added directly to the API server deployed on the LangGraph platform using the custom routes support. The server has two main functions: first, it receives Slack events, packages them into a format that our LangGraph app can understand (chat `messages`), and passes them to our LangGraph app. Second, it receives the LangGraph app's responses, extracts the most recent `message` from the `messages` list, and sends it back to Slack.
+## Architecture
 
-<!-- this is outdated; Modal no longer used. Should replace. -->
-<!-- ![slack_integration](https://github.com/user-attachments/assets/e73f5121-fed1-4cde-9297-3250ea273e1e) -->
-
-### Quickstart setup
-
-1. Install `uv` (optional) and dependencies.
-```shell
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv sync --dev
+```mermaid
+flowchart TD
+    subgraph Slack
+        A[User message]
+    end
+    A -->|Webhook| B[LangGraph Router]
+    B --> C[ReAct Agent]
+    C -->|Thought| D[LangMem Tools]
+    C -->|Action| E[Domain Tools]
+    D -->|Query| F[BigQueryMemoryStore]
+    F --> D
+    D --> C
+    C -->|Reply| G[Slack Bot]
 ```
 
-2. Create a Slack app https://api.slack.com/apps/ and select `From A Manifest`.
+- **LangGraph ReAct Agent** – parses "Thought → Action" traces.
+- **LangMem Tools** – `manage_*` & `search_*` for semantic, episodic, procedural stores.
+- **BigQueryMemoryStore** – async, batched backend for LangMem using BigQuery `VECTOR_SEARCH`.
+- **Domain Tools** – anything your team needs (dbt, Superset, GitHub, JIRA, etc.).
 
-3. Copy the below manifest and paste it into the `Manifest` field.
+---
 
-* Replace `your-app-name` with your app's name and `your-app-description` with your app's description.
-* Replace `your-langgraph-platform-url` with your LangGraph platform URL (if you're testing locally, you can use something like ngrok for tunneling)
-* The scopes gives the app the necessary permissions to read and write messages.
-* The events are what we want to receive from Slack.
+## Quick Start
 
-```JSON
-{
-    "display_information": {
-        "name": "your-app-name"
-    },
-    "features": {
-        "bot_user": {
-            "display_name": "your-app-name",
-            "always_online": false
-        },
-        "assistant_view": {
-            "assistant_description": "your-app-description"
-        }
-    },
-    "oauth_config": {
-        "scopes": {
-            "bot": [
-                "app_mentions:read",
-                "assistant:write",
-                "channels:history",
-                "channels:join",
-                "channels:read",
-                "chat:write",
-                "groups:history",
-                "groups:read",
-                "im:history",
-                "im:write",
-                "mpim:history",
-                "im:read",
-                "chat:write.public"
-            ]
-        }
-    },
-    "settings": {
-        "event_subscriptions": {
-            "request_url": "your-langgraph-platform-url/events/slack",
-            "bot_events": [
-                "app_mention",
-                "message.channels",
-                "message.im",
-                "message.mpim",
-                "assistant_thread_started"
-            ]
-        },
-        "org_deploy_enabled": false,
-        "socket_mode_enabled": false,
-        "token_rotation_enabled": false
-    }
-}
+```bash
+# 1. clone & install
+$ git clone https://github.com/johannescastner/baby-NICER.git
+$ cd baby-NICER
+$ pip install -e .[dev]
+
+# 2. set env vars (example shown for bash)
+export SLACK_BOT_TOKEN="xoxb‑****"
+export SLACK_SIGNING_SECRET="****"
+export OPENAI_API_KEY="sk‑****"   # or another LLM provider
+export GCP_PROJECT="my‑gcp‑project"
+export BQ_DATASET="nicer_memory"
+
+# 3. initialise BigQuery tables
+$ python scripts/init_bigquery.py  # creates three tables & vector index
+
+# 4. run the bot locally
+$ uvicorn baby_nicer.app:app --reload
 ```
 
-4. Got to `OAuth & Permissions` and `Install App to Workspace`.
+Full documentation lives in `docs/`.
 
-5. Copy `SLACK_BOT_TOKEN` and `SLACK_SIGNING_SECRET` to the `.env` file: 
-* `OAuth & Permissions` page will expose the app's `SLACK_BOT_TOKEN` after installation.
-* Go to "Basic Information" and get `SLACK_SIGNING_SECRET`.
-* `SLACK_BOT_TOKEN` is used to authenticate API calls FROM your bot TO Slack.
-* `SLACK_SIGNING_SECRET` is used to verify that incoming requests TO your server are actually FROM Slack.
+---
 
-6. Copy your LangGraph deployment's URL and assistant ID (or graph name) to the `.env` file.
-* The `.env.example` file shows the required environment variables.
-* Example environment variables:
-```shell
-# Slack credentials
-SLACK_SIGNING_SECRET=
-SLACK_BOT_TOKEN=xoxb-...
-# SLACK_BOT_USER_ID= (optional)
+## Configuration
 
-# LangGraph platform instance you're connecting to
-LANGGRAPH_ASSISTANT_ID=
-CONFIG= # Optional
-```
+| Variable              | Description                                   |
+| --------------------- | --------------------------------------------- |
+| `EMBEDDING_MODEL`     | sentence‑transformers name or OpenAI model id |
+| `MEMORY_TABLE_SUFFIX` | customise table names per environment         |
+| `MAX_EPISODE_TOKENS`  | truncate long episodes before embedding       |
+| `SWARM_ENABLED`       | `true/false` – toggle multi‑agent mode        |
 
-7. Deploy your application to the LangGraph platform with custom routes.
+See `config/default.yaml` for all knobs.
 
-The Slack routes are added directly to the API server deployed on the LangGraph platform, using the custom routes support as documented at https://langchain-ai.github.io/langgraph/how-tos/http/custom_routes/.
+---
 
-The integration uses the langgraph_sdk and connects to the current platform routes by setting URL to None, which connects to the loopback server. The Slack Bolt SDK is used to register a slack webhook to handle slack events (new messages, @mentions, etc). When an event is received, it creates a run on the current server and passes in a webhook "/webhooks/<thread_id>" that is triggered when the chatbot completes. Since a relative path is provided, the LangGraph platform knows to call the route on this server itself.
+## Roadmap
 
-8. Add your LangGraph platform URL to `Event Subscriptions` in Slack with `/events/slack` appended.
-* E.g., `https://your-langgraph-platform-url/events/slack` as the request URL. 
-* This is the URL that Slack will send events to.
+- **Q2 2025** – SQL/​dbt agent, Apache Superset agent
+- **Q3 2025** – Swarm supervisor + social‑listening scout
+- **Q4 2025** – Habermas mediator & interactive memory dashboard
 
-## `From Scratch` Slack App Setup
+Community PRs welcome on any milestone 🚀
 
-You can use this setup to customize your Slack app permissions and event subscriptions.
+---
 
-1. Create a Slack app https://api.slack.com/apps/ and select `From Scratch`.
+## Contributing
 
-2. Go to `OAuth & Permissions` and add your desired `Bot Token Scopes`.
-* This gives the app the necessary permissions to read and write messages.
-* Add scopes for the app's functionality, as an example: 
+1. Fork → create feature branch → commit → open PR.
+2. Run `pre‑commit` and `pytest` locally. CI must pass.
+3. For new tools, add docstrings + update `docs/tools.md`.
 
-```
-# Reading Messages
-"app_mentions:read",     # View when the bot is @mentioned
-"channels:read",         # View basic channel info and membership
-"channels:history",      # View messages in public channels
-"groups:read",          # View private channel info and membership
-"groups:history",       # View messages in private channels
-"im:read",             # View direct message info
-"im:history",          # View messages in direct messages
-"mpim:history",        # View messages in group direct messages
+We follow the [Contributor Covenant](https://contributor-covenant.org/version/2/1/code_of_conduct/) – be excellent to each other.
 
-# Writing Messages
-"chat:write",          # Send messages in channels the bot is in
-"chat:write.public",   # Send messages in any public channel
-"im:write",           # Send direct messages to users
+---
 
-# Special Permissions
-"assistant:write",     # Use Slack's built-in AI features
-"channels:join",       # Join public channels automatically
-```
+## Support & Contact
 
-3. Then, go to `OAuth & Permissions` and `Install App to Workspace`. This will expose the app's `SLACK_BOT_TOKEN`. 
+- **Companies** – want a bespoke deployment? Email [johannes@towardspeople.co.uk](mailto\:johannes@towardspeople.co.uk)\*\*.
+- **Developers / Researchers** – join the discussion on [GitHub Issues](https://github.com/johannescastner/baby-NICER/issues) or ping [@JohannesCastner](https://twitter.com/johannescastner).
 
-4. Go to "Basic Information" and get `SLACK_SIGNING_SECRET`.
+---
 
-5. Copy both `SLACK_BOT_TOKEN` and `SLACK_SIGNING_SECRET` to the `.env` file.
-* `SLACK_BOT_TOKEN` is used to authenticate API calls FROM your bot TO Slack.
-* `SLACK_SIGNING_SECRET` is used to verify that incoming requests TO your server are actually FROM Slack.
+## Licence
 
-```shell
-# .env
-SLACK_SIGNING_SECRET=
-SLACK_BOT_TOKEN=xoxb-...
-```
+Apache 2.0 – free to use, fork and modify. Please retain the copyright notice and link back to this repo.
 
-6. Set up your LangGraph deployment with custom routes support.
-
-```shell
-# .env
-LANGGRAPH_ASSISTANT_ID=your_assistant_id
-CONFIG={"your_config": "here"}
-```
-
-7. Deploy your application to the LangGraph platform with custom routes.
-
-The application uses the LangGraph platform's custom routes feature to add Slack integration directly to your deployed application. When deployed, the Slack routes will be available at your LangGraph platform URL.
-
-After deployment, update your Slack app's Event Subscriptions URL to point to your LangGraph platform URL with `/events/slack` appended.
-
-8. In `Event Subscriptions`, add events that you want to receive. As an example: 
-
-```
-"app_mention",        # Notify when bot is @mentioned
-"message.im",         # Notify about direct messages
-"message.mpim"        # Notify about group messages
-"message.channels",   # Get notified of channel messages
-```
-
-9. Chat with the bot in Slack. 
-* The bot responds if you `@mention` it within a channel of which it is a member. 
-* You can also DM the bot. You needn't use `@mention`'s in the bot's DMs. It's clear who you are speaking to.
-
-## Customizing the input and output
-
-By default, the bot assums that the LangGraph deployment uses the `messages` state key.
-
-The request to the LangGraph deployment using the LangGraph SDK is made here in `src/langgraph_slack/server.py`:
-
-```
-result = await LANGGRAPH_CLIENT.runs.create(
-            thread_id=thread_id,
-            assistant_id=config.ASSISTANT_ID,
-            input={
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": _replace_mention(event),
-                    }
-                ]
-            },
-```
-
-And you can see that the output, which we send back to Slack, is extracted from the `messages` list here:
-
-```
-response_message = state_values["messages"][-1]
-```
-
-You can customize either for the specific LangGraph deployment you are using! 
