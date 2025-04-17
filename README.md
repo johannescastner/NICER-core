@@ -102,7 +102,7 @@ We follow the [Contributor Covenant](https://contributor-covenant.org/version/2
 ## Support & Contact
 
 - **Companies** – want a bespoke deployment? Email [johannes@towardspeople.co.uk](mailto\:johannes@towardspeople.co.uk)\*\*.
-- **Developers / Researchers** – join the discussion on [GitHub Issues](https://github.com/johannescastner/baby-NICER/issues) or ping [@towards-people.bsky.social](@towards-people.bsky.social.
+- **Developers / Researchers** – join the discussion on [GitHub Issues](https://github.com/johannescastner/baby-NICER/issues) or ping [@towards-people.bsky.social](@towards-people.bsky.social).
 
 ---
 
