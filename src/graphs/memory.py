@@ -70,6 +70,107 @@ PYDANTIC_MODELS = {
 
 
 class PatchedBigQueryVectorStore(BigQueryVectorStore):
+    def _normalize_page_content(self, content: Any) -> str:
+        if isinstance(content, dict):
+            return json.dumps(content)
+        return str(content)
+    
+    def _create_langchain_documents(
+        self,
+        search_results: List[List[Any]],
+        k: int,
+        num_queries: int,
+        with_embeddings: bool = False,
+    ) -> List[List[List[Any]]]:
+        if len(search_results) == 0:
+            return [[]]
+
+        result_fields = list(search_results[0].keys())  # type: ignore[attr-defined]
+        metadata_fields = [
+            x
+            for x in result_fields
+            if x not in [self.embedding_field, self.content_field, "row_num"]
+        ]
+        documents = []
+        for result in search_results:
+            metadata = {
+                metadata_field: result[metadata_field]
+                for metadata_field in metadata_fields
+            }
+            document = Document(
+                page_content=self._normalize_page_content(result[self.content_field]),  # type: ignore
+                metadata=metadata,
+            )
+            if with_embeddings:
+                document_record = [
+                    document,
+                    metadata["score"],
+                    result[self.embedding_field],  # type: ignore
+                ]
+            else:
+                document_record = [document, metadata["score"]]
+            documents.append(document_record)
+
+        results_docs = [documents[i * k : (i + 1) * k] for i in range(num_queries)]
+        return results_docs
+
+    def get_documents(
+        self,
+        ids: Optional[List[str]] = None,
+        filter: Optional[Union[Dict[str, Any], str]] = None,
+        **kwargs: Any,
+    ) -> List[Document]:
+        """Search documents by their ids or metadata values.
+
+        Args:
+            ids: List of ids of documents to retrieve from the vectorstore.
+            filter: (Optional) A dictionary or a string specifying filter criteria.
+                - If a dictionary is provided, it should map column names to their
+                corresponding values. The method will generate SQL expressions based
+                on the data types defined in `self.table_schema`. The value is enclosed
+                in single quotes unless the column is of type "INTEGER" or "FLOAT", in
+                which case the value is used directly. E.g., `{"str_property": "foo",
+                "int_property": 123}`.
+                - If a string is provided, it is assumed to be a valid SQL WHERE clause.
+        Returns:
+            List of ids from adding the texts into the vectorstore.
+        """
+        from google.cloud import bigquery  # type: ignore[attr-defined]
+
+        if ids and len(ids) > 0:
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ArrayQueryParameter("ids", "STRING", ids),
+                ]
+            )
+            id_expr = f"{self.doc_id_field} IN UNNEST(@ids)"
+        else:
+            job_config = None
+            id_expr = "TRUE"
+
+        where_filter_expr = self._create_filters(filter)
+
+        job = self._bq_client.query(  # type: ignore[union-attr]
+            f"""
+                    SELECT * FROM `{self.full_table_id}`
+                    WHERE {id_expr} AND {where_filter_expr}
+                    """,
+            job_config=job_config,
+        )
+        docs: List[Document] = []
+        for row in job:
+            metadata = {}
+            for field in row.keys():
+                if field not in [
+                    self.embedding_field,
+                    self.content_field,
+                ]:
+                    metadata[field] = row[field]
+            metadata["__id"] = row[self.doc_id_field]
+            doc = Document(page_content=self._normalize_page_content(row[self.content_field]), metadata=metadata)
+            docs.append(doc)
+        return docs
+    
     def add_texts_with_embeddings(
         self,
         texts: List[Union[str, dict]],
@@ -333,21 +434,45 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         doc = docs[0]
         metadata = doc.metadata
         ns = tuple(metadata.get("namespace", "").split("."))
-        content_val = metadata.get(self.content_field)
+        content_val = doc.page_content
         if isinstance(content_val, str) and self.content_model:
             try:
                 metadata[self.content_field] = self.content_model(**json.loads(content_val))
             except Exception:
                 pass
-        return Item(namespace=ns, key=key, value=metadata, created_at=None, updated_at=None)
+        # Pull raw values out of metadata
+        raw_created = doc.metadata.get("created_at")    # may be datetime, str, or None
+        raw_updated = doc.metadata.get("updated_at")    # same
+
+        # Normalize them into real datetime objects
+        def to_dt(x):
+            if isinstance(x, datetime):
+                return x
+            if isinstance(x, str):
+                return datetime.fromisoformat(x)
+            # fallback to “now” if missing or unparseable
+            return datetime.now(timezone.utc)
+
+        created_at = to_dt(raw_created)
+        updated_at = to_dt(raw_updated)
+
+        return Item(namespace=ns, key=key, value=metadata, created_at=created_at, updated_at=updated_at)
 
     async def asearch(self, namespace_prefix: Tuple[str, ...], *, query: Optional[str] = None, filter: Optional[dict[str, Any]] = None, limit: int = 10, offset: int = 0, refresh_ttl: Optional[bool] = None) -> List[SearchItem]:
         logger.info(f"[asearch] Searching in namespace_prefix={namespace_prefix} for query='{query}'")
         if not query:
             return []
         # Serialize query if it's a dictionary
-        if isinstance(query, dict):
-            query = json.dumps(query)
+        if isinstance(query, dict) or self.content_model:
+            try:
+                model_cls = self.content_model
+                if model_cls and isinstance(query, dict):
+                    query_obj = model_cls(**query)
+                    query = json.dumps(query_obj.dict())
+                elif isinstance(query, dict):
+                    query = json.dumps(query)
+            except Exception:
+                query = str(query)
 
         results = self.vectorstore.similarity_search_with_score(
             query=query,
@@ -358,7 +483,32 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         for doc, score in results:
             ns = tuple(doc.metadata.get("namespace", "").split("."))
             key = doc.metadata.get("doc_id", "")
-            items.append(SearchItem(namespace=ns, key=key, value=doc.metadata, score=score))
+            # Pull and deserialize the content
+            raw_page = doc.page_content
+            try:
+                content = json.loads(raw_page)
+            except (TypeError, json.JSONDecodeError):
+                content = raw_page
+            # Merge back into metadata under your content_field
+            metadata = dict(doc.metadata)  # copy so we don’t mutate original
+            metadata[self.content_field] = content
+            # Pull raw values out of metadata
+            raw_created = doc.metadata.get("created_at")    # may be datetime, str, or None
+            raw_updated = doc.metadata.get("updated_at")    # same
+
+            # Normalize them into real datetime objects
+            def to_dt(x):
+                if isinstance(x, datetime):
+                    return x
+                if isinstance(x, str):
+                    return datetime.fromisoformat(x)
+                # fallback to “now” if missing or unparseable
+                return datetime.now(timezone.utc)
+
+            created_at = to_dt(raw_created)
+            updated_at = to_dt(raw_updated)
+
+            items.append(SearchItem(namespace=ns, key=key, created_at=created_at, updated_at=updated_at, value=metadata, score=score))
         return items
 
     async def adelete(self, namespace: Tuple[str, ...], key: str) -> None:
