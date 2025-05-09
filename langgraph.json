@@ -1,0 +1,36 @@
+{
+  "$schema": "https://raw.githubusercontent.com/langchain-ai/langgraph/refs/heads/main/libs/cli/schemas/schema.json",
+  "dependencies": [
+    "."
+  ],
+  "graphs": {
+    "chat": "./src/graphs/agent.py:my_agent"
+  },
+  "http": {
+    "app": "./src/langgraph_slack/server.py:APP"
+  },
+  "auth": {
+    "path": "./src/langgraph_slack/auth.py:auth"
+  },
+  "tools": [
+    {
+      "name": "manage_semantic_memory"
+    },
+    {
+      "name": "search_semantic_memory"
+    },
+    {
+      "name": "manage_episodic_memory"
+    },
+    {
+      "name": "search_episodic_memory"
+    },
+    {
+      "name": "manage_procedural_memory"
+    },
+    {
+      "name": "search_procedural_memory"
+    }
+  ],
+  "python_version": "3.12"
+}
