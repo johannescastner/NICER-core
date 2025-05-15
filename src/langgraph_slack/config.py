@@ -16,6 +16,8 @@ if DEPLOY_MODAL:
     BOT_USER_ID = BOT_USER_ID or "fake-user-id"
 else:
     assert isinstance(BOT_TOKEN, str)
+
+
     # APP_TOKEN = environ["SLACK_APP_TOKEN"]
 
 
@@ -43,3 +45,7 @@ try:
     LOGGER.info("Service account credentials loaded successfully.")
 except Exception as e:
     LOGGER.error(f"Failed to load service account credentials: {e}")
+
+# ───── Language-model defaults ─────
+DEFAULT_MODEL    = environ.get("NICER_MODEL", "openai:o3-mini")
+DEFAULT_TEMPERATURE = float(environ.get("NICER_TEMPERATURE", "0.0"))

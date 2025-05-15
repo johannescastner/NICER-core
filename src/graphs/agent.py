@@ -4,6 +4,7 @@ import logging
 from src.graphs.memory import get_memory_tools
 import asyncio
 logging.basicConfig(level=logging.DEBUG)
+from langgraph_slack.config import DEFAULT_MODEL, DEFAULT_TEMPERATURE
 logger = logging.getLogger(__name__)
 
 async def retrieve_memory_tools():
@@ -17,10 +18,11 @@ system_prompt = "You are baby-NICER, an evolving, modular agentic system under a
 
 # Create the agent using memory tools and keep the variable name `my_agent`
 my_agent = create_react_agent(
-    "openai:o3-mini",
+    model=DEFAULT_MODEL,
     tools=MEMORY_TOOLS,
     debug=True, 
-    prompt=system_prompt
+    prompt=system_prompt,
+    model_parameters={"temperature": DEFAULT_TEMPERATURE}
    )
 # Log what tools were actually registered
 logger.debug("Agent successfully created!")
