@@ -1,3 +1,4 @@
+# src/graphs/memory.py
 from __future__ import annotations
 import uuid
 import google
@@ -27,6 +28,8 @@ from src.langgraph_slack.config import (
     SEMANTIC_TABLE, EPISODIC_TABLE, PROCEDURAL_TABLE,
     CREDENTIALS
 )
+
+NamespaceTemplate = Tuple[str, ...]
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -629,14 +632,29 @@ SCHEMAS = {
 }
 
 #---------------------------------get memory tools--------------------------------
-async def get_memory_tools() -> List:
+async def get_memory_tools(
+    namespace_templates: Dict[str, NamespaceTemplate]
+) -> List:
+    """
+    Create pairs of (manage, search) memory tools for each namespace template.
+
+    Args:
+      namespace_templates: a dict where
+         - key = tool‐base‐name (e.g. "semantic", "episodic", "procedural", or anything you choose)
+         - value = a NamespaceTemplate tuple, e.g.
+             ("metadata", "{object_type}", "{langgraph_auth_user_id}", "{object_name}")
+
+    Returns:
+      A list of all created tools (both manage_* and search_*).
+    """
+    tools: List = []
     semantic_memory_store = BigQueryMemoryStore.from_client(
         bq_client=bq_client,
         dataset_name=DATASET_ID, 
         table_name=SEMANTIC_TABLE, 
         embedding=embedding,
         content_field=CONTENT_FIELDS[SEMANTIC_TABLE],
-        content_model=PYDANTIC_MODELS[CONTENT_FIELDS[SEMANTIC_TABLE]],
+        content_model=PYDANTIC_MODELS[CONTENT_FIELDS[SEMANTIC_TABLE]]
     )
     
 
@@ -646,7 +664,7 @@ async def get_memory_tools() -> List:
         table_name=EPISODIC_TABLE, 
         embedding=embedding,
         content_field=CONTENT_FIELDS[EPISODIC_TABLE],
-        content_model=PYDANTIC_MODELS[CONTENT_FIELDS[EPISODIC_TABLE]],
+        content_model=PYDANTIC_MODELS[CONTENT_FIELDS[EPISODIC_TABLE]]
     )
     
 
@@ -656,46 +674,42 @@ async def get_memory_tools() -> List:
         table_name=PROCEDURAL_TABLE,  
         embedding=embedding,
         content_field=CONTENT_FIELDS[PROCEDURAL_TABLE],
-        content_model=PYDANTIC_MODELS[CONTENT_FIELDS[PROCEDURAL_TABLE]],
+        content_model=PYDANTIC_MODELS[CONTENT_FIELDS[PROCEDURAL_TABLE]]
     )
     
-    semantic_manage_tool = create_manage_memory_tool(
-        namespace=("semantic_memories", "{langgraph_auth_user_id}"),
-        store=semantic_memory_store,
-        name="manage_semantic_memory",
-        schema=Fact
-    )
-    episodic_manage_tool = create_manage_memory_tool(
-        namespace=("episodic_memories", "{langgraph_auth_user_id}"),
-        store=episodic_memory_store,
-        name="manage_episodic_memory",
-        schema=Episode
-    )
-    procedural_manage_tool = create_manage_memory_tool(
-        namespace=("procedural_memories", "{langgraph_auth_user_id}"),
-        store=procedural_memory_store,
-        name="manage_procedural_memory",
-        schema=Procedure
-    )
+    # 2. For each namespace_template, build both a manage‐tool and a search‐tool
+    for base_key, ns_template in namespace_templates.items():
+        # Determine which store to hook up:
+        if base_key == "semantic":
+            store = semantic_memory_store
+            schema_model = Fact
+        elif base_key == "episodic":
+            store = episodic_memory_store
+            schema_model = PYDANTIC_MODELS[CONTENT_FIELDS[EPISODIC_TABLE]]
+        elif base_key == "procedural":
+            store = procedural_memory_store
+            schema_model = PYDANTIC_MODELS[CONTENT_FIELDS[PROCEDURAL_TABLE]]
+        else:
+            # If you have some other base_key (e.g. "www", "dbt_model"), choose
+            # to either re‐use semantic_store or create your own. For now:
+            store = semantic_memory_store
+            schema_model = Fact
 
-    semantic_search_tool = create_search_memory_tool(
-        namespace=("semantic_memories", "{langgraph_auth_user_id}"),
-        store=semantic_memory_store,
-        name="search_semantic_memory"
-    )
-    episodic_search_tool = create_search_memory_tool(
-        namespace=("episodic_memories", "{langgraph_auth_user_id}"),
-        store=episodic_memory_store,
-        name="search_episodic_memory"
-    )
-    procedural_search_tool = create_search_memory_tool(
-        namespace=("procedural_memories", "{langgraph_auth_user_id}"),
-        store=procedural_memory_store,
-        name="search_procedural_memory"
-    )
+        # 2a. Create the “manage” tool
+        manage_tool = create_manage_memory_tool(
+            namespace=ns_template,
+            store=store,
+            name=f"manage_{base_key}_memory",
+            schema=schema_model
+        )
+        tools.append(manage_tool)
 
-    return [
-        semantic_manage_tool, semantic_search_tool,
-        episodic_manage_tool, episodic_search_tool,
-        procedural_manage_tool, procedural_search_tool
-    ]
+        # 2b. Create the corresponding “search” tool
+        search_tool = create_search_memory_tool(
+            namespace=ns_template,
+            store=store,
+            name=f"search_{base_key}_memory"
+        )
+        tools.append(search_tool)
+
+    return tools

@@ -49,3 +49,5 @@ except Exception as e:
 # ───── Language-model defaults ─────
 DEFAULT_MODEL    = environ.get("NICER_MODEL", "openai:o3-mini")
 DEFAULT_TEMPERATURE = float(environ.get("NICER_TEMPERATURE", "0.0"))
+DEFAULT_DATASET     ="linkedin_raw"
+
