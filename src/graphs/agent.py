@@ -44,7 +44,7 @@ logger.debug(f"Agent tools before creation: {[tool.name for tool in MEMORY_TOOLS
 my_agent = create_react_agent(
     model=DEFAULT_MODEL,
     tools=MEMORY_TOOLS,
-    debug=True, 
+    debug=True,
     prompt=BABY_NICER_PROMPT
    )
 # Log what tools were actually registered

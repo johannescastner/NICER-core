@@ -1,27 +1,52 @@
 # src/graphs/memory.py
+"""
+This is where we define the BigQuery memory store,
+which connects the langmem longrun memory system to BigQuery.
+"""
 from __future__ import annotations
+import asyncio
 import uuid
-import google
-import src.langgraph_slack.patch_typing  # must run before any Pydantic model loading
 import logging
 import json
-import asyncio
 from datetime import datetime, timezone
-from typing import Any, Type, Optional, Union, Literal, Tuple, List, Dict, Iterable
-from typing_extensions import TypedDict
-
+from typing import (
+    Any,
+    Type,
+    Optional,
+    Union,
+    Literal,
+    Tuple,
+    List,
+    Dict,
+    Iterable,
+    Sequence,
+    AsyncIterator,
+    Iterator,
+    overload
+)
 from pydantic import BaseModel
+import google
 from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
-
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_google_community.bq_storage_vectorstores.bigquery import BigQueryVectorStore
-from langgraph.store.base import Item, SearchItem
-from langgraph.store.base.batch import AsyncBatchedBaseStore, Op, PutOp, GetOp, SearchOp, ListNamespacesOp, Result
-from langmem import create_manage_memory_tool, create_search_memory_tool
 from langchain_google_community.bq_storage_vectorstores.utils import validate_column_in_bq_schema
+from langgraph.store.base import Item, SearchItem
+from langgraph.store.base.batch import (
+    AsyncBatchedBaseStore,
+    Op,
+    PutOp,
+    GetOp,
+    SearchOp,
+    ListNamespacesOp,
+    Result
+)
+from langmem import create_manage_memory_tool, create_search_memory_tool
+
+
+import src.langgraph_slack.patch_typing  # must run before any Pydantic model loading
 
 from src.langgraph_slack.config import (
     PROJECT_ID, DATASET_ID, LOCATION,
@@ -40,7 +65,7 @@ try:
     bq_client = bigquery.Client(credentials=CREDENTIALS, project=PROJECT_ID, location=LOCATION)
     logger.info("BigQuery client initialized successfully.")
 except Exception as e:
-    logger.error(f"Failed to initialize BigQuery client: {e}")
+    logger.error("Failed to initialize BigQuery client: %s", e, exc_info=True)
 
 CONTENT_FIELDS = {
     SEMANTIC_TABLE: "fact",
@@ -48,18 +73,89 @@ CONTENT_FIELDS = {
     PROCEDURAL_TABLE: "procedure",
 }
 
+def parse_fqn(fqn: str, default_project: str | None = None) -> Tuple[str, ...]:
+    """
+    Accepts 'dataset.table' or 'project.dataset.table'.
+    Returns (project, dataset, table).
+    """
+    parts = fqn.split(".")
+    if len(parts) == 2:
+        if not default_project:
+            raise ValueError("Default project required for <dataset>.<table> form")
+        project, dataset, table = default_project, parts[0], parts[1]
+    elif len(parts) == 3:
+        project, dataset, table = parts
+    else:
+        raise ValueError("FQN must be <dataset>.<table> or <project>.<dataset>.<table>")
+    return (project, dataset, table)
+
+def ns_sem_dataset(project: str, dataset: str) -> Tuple[str, ...]:
+    return ("metadata", project, dataset)
+
+def ns_sem_table(project: str, dataset: str, table: str) -> Tuple[str, ...]:
+    return ("metadata", project, dataset, table)
+
+def ns_sem_column(project: str, dataset: str, table: str, column: str) -> Tuple[str, ...]:
+    return ("metadata", project, dataset, table, column)
+
+def ns_join(parts: Tuple[str, ...]) -> str:
+    """Serialize for storage (STRING namespace column in BQ)."""
+    return ".".join(parts)
+
+def ns_with_bucket(ns: Tuple[str, ...], bucket: str, anchor: str = "episodic") -> Tuple[str, ...]:
+    """
+    Insert a priority bucket *right after* the 'anchor' segment (e.g., 'episodic').
+    Returns a tuple, regardless of input.
+    """
+    try:
+        i = ns.index(anchor)
+        return (*ns[:i+1], bucket, *ns[i+1:])
+    except ValueError:
+        # If anchor isn't present, prepend it (keeps behavior predictable)
+        return (anchor, bucket, *ns)
+
+def ns_sem_for_target(target: str, default_project: str | None = PROJECT_ID) -> tuple[str, ...]:
+    """
+    Accepts: "dataset", "dataset.table", "dataset.table.column",
+             or "project.dataset.table[.column]".
+    Returns the correct semantic namespace tuple.
+    """
+    parts = [p for p in (target or "").split(".") if p]
+    if not parts:
+        raise ValueError("empty target")
+
+    if len(parts) == 1:                    # dataset
+        return ns_sem_dataset(default_project, parts[0])
+    if len(parts) == 2:                    # dataset.table
+        return ns_sem_table(default_project, parts[0], parts[1])
+    if len(parts) == 3:                    # dataset.table.column
+        return ns_sem_column(default_project, parts[0], parts[1], parts[2])
+    if len(parts) == 4:                    # project.dataset.table.column
+        return ns_sem_column(parts[0], parts[1], parts[2], parts[3])
+
+    raise ValueError(f"Unrecognized target format: {target!r}")
+
 class Fact(BaseModel):
+    """
+    satisfying the fact type
+    """
     content: str
     importance: Optional[str] = None
     category: Optional[str] = None
 
 class Episode(BaseModel):
+    """
+    satisfying the episode type
+    """
     observation: Optional[str] = None
     thoughts: Optional[str] = None
     action: Optional[str] = None
     result: Optional[str] = None
 
 class Procedure(BaseModel):
+    """
+    satisfying the procedure type
+    """
     name: Optional[str] = None
     conditions: Optional[str] = None
     steps: Optional[str] = None
@@ -73,11 +169,15 @@ PYDANTIC_MODELS = {
 
 
 class PatchedBigQueryVectorStore(BigQueryVectorStore):
+    """
+    The original BigQueryVectorStore has to be patched
+    so that it allows for struct types
+    """
     def _normalize_page_content(self, content: Any) -> str:
         if isinstance(content, dict):
             return json.dumps(content)
         return str(content)
-    
+
     def _create_langchain_documents(
         self,
         search_results: List[List[Any]],
@@ -101,7 +201,9 @@ class PatchedBigQueryVectorStore(BigQueryVectorStore):
                 for metadata_field in metadata_fields
             }
             document = Document(
-                page_content=self._normalize_page_content(result[self.content_field]),  # type: ignore
+                page_content=self._normalize_page_content(
+                    result[self.content_field]
+                ),
                 metadata=metadata,
             )
             if with_embeddings:
@@ -138,7 +240,6 @@ class PatchedBigQueryVectorStore(BigQueryVectorStore):
         Returns:
             List of ids from adding the texts into the vectorstore.
         """
-        from google.cloud import bigquery  # type: ignore[attr-defined]
 
         if ids and len(ids) > 0:
             job_config = bigquery.QueryJobConfig(
@@ -170,10 +271,13 @@ class PatchedBigQueryVectorStore(BigQueryVectorStore):
                 ]:
                     metadata[field] = row[field]
             metadata["__id"] = row[self.doc_id_field]
-            doc = Document(page_content=self._normalize_page_content(row[self.content_field]), metadata=metadata)
+            doc = Document(
+                page_content=self._normalize_page_content(row[self.content_field]),
+                metadata=metadata
+            )
             docs.append(doc)
         return docs
-    
+
     def add_texts_with_embeddings(
         self,
         texts: List[Union[str, dict]],
@@ -200,7 +304,10 @@ class PatchedBigQueryVectorStore(BigQueryVectorStore):
                     record[self.content_field] = metadata_dict[self.content_field]
                 else:
                     raise ValueError(
-                        f"Expected dict for RECORD column `{self.content_field}`, got: {type(metadata_dict.get(self.content_field))}"
+                        "Expected dict for RECORD column %s, got: %s" % (
+                            self.content_field,
+                            type(metadata_dict.get(self.content_field))
+                        )
                     )
             else:
                 # For non-RECORD fields, handle as before
@@ -216,34 +323,34 @@ class PatchedBigQueryVectorStore(BigQueryVectorStore):
             record.update(metadata_dict)
             values_dict.append(record)
 
-        logger.debug(f"Type of 'fact' field: {type(record[self.content_field])}")
-        logger.debug(f"Content of 'fact' field: {record[self.content_field]}")
+        logger.debug("Type of 'fact' field: %s", type(record[self.content_field]))
+        logger.debug("Content of 'fact' field: %s", record[self.content_field])
         table = self._bq_client.get_table(self.full_table_id)
         try:
             if self.schema is not None:
                 job = self._bq_client.load_table_from_json(values_dict, table, self.schema)
-                logger.debug(f"loaded_table with schema!")
-            else: 
+                logger.debug("loaded_table with schema!")
+            else:
                 job = self._bq_client.load_table_from_json(values_dict, table)
-                logger.debug(f"loaded_table with no schema!")
+                logger.debug("loaded_table with no schema!")
             job.result()  # Wait for the job to complete
         except google.api_core.exceptions.GoogleAPIError as e:
             # Handle errors returned by the Google API
-            print(f"Google API error occurred: {e}")
-            logger.debug(f"Google API error occurred: {e}")
+            print("Google API error occurred: %s", e)
+            logger.debug("Google API error occurred: %s", e)
             raise
         except ValueError as e:
             # Handle value errors, such as schema mismatches
-            print(f"Value error: {e}")
-            logger.debug(f"Value error: {e}")
+            print("Value error: %s", e)
+            logger.debug("Value error: %s", e)
             raise
         except Exception as e:
             # Handle other unexpected exceptions
-            print(f"An unexpected error occurred: {e}")
-            logger.debug(f"An unexpected error occurred: {e}")
+            print("An unexpected error occurred: %s", e)
+            logger.debug("An unexpected error occurred: %s", e)
             raise
         self._validate_bq_table()
-        self._logger.debug(f"Stored {len(ids)} records in BigQuery.")
+        self._logger.debug("Stored %s records in BigQuery.", len(ids))
         self.sync_data()
         return ids
 
@@ -254,10 +361,8 @@ class PatchedBigQueryVectorStore(BigQueryVectorStore):
             if field.name == self.content_field:
                 return field.field_type.upper() == "RECORD"
         return False
-    
+
     def _validate_bq_table(self) -> Any:
-        from google.cloud import bigquery  # type: ignore[attr-defined]
-        from google.cloud.exceptions import NotFound
 
         table_ref = bigquery.TableReference.from_string(self.full_table_id)
 
@@ -265,10 +370,7 @@ class PatchedBigQueryVectorStore(BigQueryVectorStore):
             # Attempt to retrieve the table information
             table = self._bq_client.get_table(table_ref)
         except NotFound:
-            self._logger.debug(
-                f"Couldn't find table {self.full_table_id}. "
-                f"Table will be created once documents are added"
-            )
+            self._logger.debug("Couldn't find table %s", self.full_table_id)
             return
 
         schema = table.schema.copy()
@@ -331,10 +433,13 @@ class PatchedBigQueryVectorStore(BigQueryVectorStore):
                         expected_modes=["NULLABLE", "REQUIRED"],
                     )
 
-            self._logger.debug(f"Table {self.full_table_id} validated")
+            self._logger.debug("Table %s validated", self.full_table_id)
         return table_ref
 
 class BigQueryMemoryStore(AsyncBatchedBaseStore):
+    """
+    This gives persistence of memory directly into Bigquery.
+    """
     def __init__(
         self,
         vectorstore: PatchedBigQueryVectorStore,
@@ -391,28 +496,37 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             return raw.dict()  # Already in the correct format
         else:
             raise ValueError(
-                f"{self.content_field} must be a dict, str, or {self.content_model.__name__} — got {type(raw)}"
+                "%s must be a dict, str, or %s — got {type(raw)}" % (
+                    self.content_field, self.content_model.__name__
+                )
             )
 
-    async def aput(self, namespace: Tuple[str, ...], key: str, value: dict[str, Any], index: Optional[Union[Literal[False], list[str]]] = None, *, ttl: Optional[float] = None) -> None:
-        logger.info(f"[aput] Inserting doc_id={key} into namespace={namespace}")
-        
+    async def aput(
+            self, namespace: Tuple[str, ...],
+            key: str,
+            value: dict[str, Any],
+            index: Optional[Union[Literal[False], list[str]]] = None,
+            *,
+            ttl: Optional[float] = None
+    ) -> None:
+        logger.info("[aput] Inserting doc_id=%s into namespace=%s", key=key, namespace=namespace)
+
         data = {"namespace" : ".".join(namespace), "doc_id" : key}
 
         # Log the entire value being passed to aput
-        logger.debug(f"[aput] initial data: {json.dumps(data, indent=2)}")
-        
+        logger.debug("[aput] initial data: %s", json.dumps(data, indent=2))
+
         # Log the content field name to check if it's what we expect
-        logger.debug(f"[aput] Using content field: {self.content_field}")
-        
+        logger.debug("[aput] Using content field: %s", self.content_field)
+
         # Get the raw content and ensure it's wrapped in the correct model (e.g., Fact)
         raw_content = value.get("content")
-        
+
         # Log the raw content that is being retrieved
-        logger.debug(f"[aput] Raw content retrieved: {raw_content}")
-        
+        logger.debug("[aput] Raw content retrieved: %s", raw_content)
+
         if raw_content is None:
-            logger.error(f"Content for {self.content_field} is None. This is not expected.")
+            logger.error("Content for %s is None. This is not expected.", self.content_field)
             return
 
         # Ensure the content is wrapped into the content model (e.g., Fact)
@@ -420,17 +534,25 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         # Now, prepare the embedding by serializing the transformed content as JSON
         embedding_content = json.dumps(text)
         # Log the normalized text content
-        logger.debug(f"[aput] Normalized content: {text}")
+        logger.debug("[aput] Normalized content: %s", text)
         data[self.content_field] = text
-        logger.debug(f"[aput] Value being inserted: {json.dumps(data, indent=2)}")
-        logger.debug(f"[aput] the type(data[self.content_field]): {type(data[self.content_field])}")
+        logger.debug("[aput] Value being inserted: %s", json.dumps(data, indent=2))
+        logger.debug(
+            "[aput] the type(data[self.content_field]): %s", type(data[self.content_field])
+        )
         # Insert the document into BigQuery (wrapped content)
-        
+
         doc = Document(page_content=embedding_content, metadata=data, id=key)
         self.vectorstore.add_documents([doc])
 
-    async def aget(self, namespace: Tuple[str, ...], key: str, *, refresh_ttl: Optional[bool] = None) -> Optional[Item]:
-        logger.debug(f"[aget] Retrieving doc_id={key} from namespace={namespace}")
+    async def aget(
+            self,
+            namespace: Tuple[str, ...],
+            key: str,
+            *,
+            refresh_ttl: Optional[bool] = None
+    ) -> Optional[Item]:
+        logger.debug("[aget] Retrieving doc_id=%s from namespace=%s", key, namespace)
         docs = self.vectorstore.get_documents(ids=[key])
         if not docs:
             return None
@@ -459,71 +581,138 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         created_at = to_dt(raw_created)
         updated_at = to_dt(raw_updated)
 
-        return Item(namespace=ns, key=key, value=metadata, created_at=created_at, updated_at=updated_at)
+        return Item(
+            namespace=ns,
+            key=key,
+            value=metadata,
+            created_at=created_at,
+            updated_at=updated_at
+        )
 
-    async def asearch(self, namespace_prefix: Tuple[str, ...], *, query: Optional[str] = None, filter: Optional[dict[str, Any]] = None, limit: int = 10, offset: int = 0, refresh_ttl: Optional[bool] = None) -> List[SearchItem]:
-        logger.info(f"[asearch] Searching in namespace_prefix={namespace_prefix} for query='{query}'")
+    # --- Overloads to satisfy both older & newer langgraph versions ---
+    @overload
+    async def asearch(  # current shape (with refresh_ttl)
+        self,
+        namespace_prefix: tuple[str, ...], /,
+        *,
+        query: str | None = None,
+        filter: dict[str, Any] | None = None,
+        limit: int = 10,
+        offset: int = 0,
+        refresh_ttl: bool | None = None,
+    ) -> list[SearchItem]: ...
+    @overload
+    async def asearch(  # older shape (without refresh_ttl)
+        self,
+        namespace_prefix: tuple[str, ...], /,
+        *,
+        query: str | None = None,
+        filter: dict[str, Any] | None = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> list[SearchItem]: ...
+
+    # --- Implementation matches the *newer* signature; extra kw is optional ---
+    async def asearch(
+        self,
+        namespace_prefix: tuple[str, ...], /,
+        *,
+        query: str | None = None,
+        filter: dict[str, Any] | None = None,
+        limit: int = 10,
+        offset: int = 0,
+        refresh_ttl: bool | None = None,   # accepted; not used here
+    ) -> list[SearchItem]:
+        logger.info(
+            "[asearch] ns_prefix=%s, query=%r, limit=%d, offset=%d",
+            namespace_prefix, query, limit, offset
+        )
+
         if not query:
             return []
-        # Serialize query if it's a dictionary
+
+        # If caller gave a dict (or you have a content_model), preserve its shape
         if isinstance(query, dict) or self.content_model:
             try:
                 model_cls = self.content_model
                 if model_cls and isinstance(query, dict):
-                    query_obj = model_cls(**query)
-                    query = json.dumps(query_obj.dict())
+                    query = json.dumps(model_cls(**query).dict())
                 elif isinstance(query, dict):
                     query = json.dumps(query)
             except Exception:
                 query = str(query)
 
-        results = self.vectorstore.similarity_search_with_score(
-            query=query,
-            filter=filter,
-            k=limit + offset
+        # IMPORTANT: pass filter through unchanged; vectorstore does server-side application
+        hits = self.vectorstore.similarity_search_with_score(
+            query=query, filter=filter, k=limit + offset
         )[offset:]
-        items = []
-        for doc, score in results:
-            ns = tuple(doc.metadata.get("namespace", "").split("."))
-            key = doc.metadata.get("doc_id", "")
-            # Pull and deserialize the content
+
+        out: list[SearchItem] = []
+        for doc, score in hits:
+            ns = tuple((doc.metadata.get("namespace") or "").split("."))
+            key = doc.metadata.get("doc_id") or ""
+
+            # Deserialize page_content if it was JSON
             raw_page = doc.page_content
             try:
                 content = json.loads(raw_page)
-            except (TypeError, json.JSONDecodeError):
+            except Exception:
                 content = raw_page
-            # Merge back into metadata under your content_field
-            metadata = dict(doc.metadata)  # copy so we don’t mutate original
-            metadata[self.content_field] = content
-            # Pull raw values out of metadata
-            raw_created = doc.metadata.get("created_at")    # may be datetime, str, or None
-            raw_updated = doc.metadata.get("updated_at")    # same
 
-            # Normalize them into real datetime objects
-            def to_dt(x):
+            md = dict(doc.metadata)
+            md[self.content_field] = content
+
+            # Normalize timestamps defensively
+            def _to_dt(x):
                 if isinstance(x, datetime):
                     return x
                 if isinstance(x, str):
-                    return datetime.fromisoformat(x)
-                # fallback to “now” if missing or unparseable
+                    try:
+                        return datetime.fromisoformat(x)
+                    except Exception:
+                        pass
                 return datetime.now(timezone.utc)
 
-            created_at = to_dt(raw_created)
-            updated_at = to_dt(raw_updated)
+            created_at = _to_dt(doc.metadata.get("created_at"))
+            updated_at = _to_dt(doc.metadata.get("updated_at"))
 
-            items.append(SearchItem(namespace=ns, key=key, created_at=created_at, updated_at=updated_at, value=metadata, score=score))
-        return items
+            out.append(
+                SearchItem(
+                    namespace=ns,
+                    key=key,
+                    value=md,
+                    score=float(score),
+                    created_at=created_at,
+                    updated_at=updated_at,
+                )
+            )
+        return out
 
     async def adelete(self, namespace: Tuple[str, ...], key: str) -> None:
         logger.info(f"[adelete] Deleting doc_id={key} from namespace={namespace}")
         await self.vectorstore.adelete(ids=[key])
 
     def mget(self, keys: Sequence[str]) -> List[Optional[dict]]:
-        return self.vectorstore.get_documents(ids=keys)
-    
+        """
+        Synchronous multi-get. BigQueryVectorStore only exposes a synchronous
+        get_documents() API, so we call it directly here.
+        """
+        return self.vectorstore.get_documents(ids=list(keys))
+
     async def amget(self, keys: Sequence[str]) -> List[Optional[dict]]:
-        return await self.vectorstore.get_documents(ids=keys)
-    
+        """
+        Async-friendly multi-get.
+
+        The underlying BigQueryVectorStore is synchronous, so we offload the
+        blocking call to a worker thread when running inside an event loop.
+        This keeps the Store API consistent for callers and avoids any
+        un-awaited coroutine warnings.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self.vectorstore.get_documents, list(keys)
+        )
+
     def mset(self, key_value_pairs: Sequence[Tuple[str, dict]]) -> None:
         documents = [
             Document(page_content=value.get(self.content_field), metadata={**value, "doc_id": key})
@@ -539,22 +728,58 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         await self.vectorstore.add_documents(documents)
 
     def mdelete(self, keys: Sequence[str]) -> None:
-        self.vectorstore.adelete(ids=keys)
+        """
+        Synchronous delete.
+
+        Prefer a synchronous `delete()` method on the underlying vectorstore.
+        If only an async `adelete()` is available, run it to completion in a
+        one-shot event loop so callers do not get a `coroutine was never awaited`
+        warning.
+        """
+        delete = getattr(self.vectorstore, "delete", None)
+        if callable(delete):
+            delete(ids=list(keys))
+            return
+
+        adelete = getattr(self.vectorstore, "adelete", None)
+        if adelete is None:
+            raise NotImplementedError("Vector store does not support delete/adelete")
+
+        asyncio.run(adelete(ids=list(keys)))
 
     async def amdelete(self, keys: Sequence[str]) -> None:
-        await self.vectorstore.adelete(ids=keys)
+        """
+        Async delete wrapper.
+
+        If the underlying vectorstore exposes `adelete`, await it directly;
+        otherwise fall back to running the sync `delete()` in a worker thread.
+        """
+        adelete = getattr(self.vectorstore, "adelete", None)
+        if callable(adelete):
+            await adelete(ids=list(keys))  # type: ignore[misc]
+            return
+
+        delete = getattr(self.vectorstore, "delete", None)
+        if not callable(delete):
+            raise NotImplementedError("Vector store does not support delete/adelete")
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, delete, list(keys))
 
     def yield_keys(self, prefix: Optional[str] = None) -> Iterator[str]:
+        "yields keys"
         return self.vectorstore.yield_keys(prefix=prefix)
-    
+
     async def ayield_keys(self, prefix: Optional[str] = None) -> AsyncIterator[str]:
+        "yields keys"
         async for key in self.vectorstore.yield_keys(prefix=prefix):
             yield key
-    
-    async def abatch(self, operations: Iterable[Op]) -> List[Result]:
-        logger.info(f"[abatch] Executing {len(list(operations))} batch operations")
-        results = []
-        for op in operations:
+
+    async def abatch(self, ops: Iterable[Op]) -> List[Result]:
+        ops_list = list(ops)
+        logger.info("[abatch] Executing %s batch operations", len(ops_list))
+        results: List[Result] = []
+        for op in ops_list:
             if isinstance(op, PutOp):
                 await self.aput(op.namespace, op.key, op.value, index=op.index, ttl=op.ttl)
                 results.append(None)
@@ -656,7 +881,7 @@ async def get_memory_tools(
         content_field=CONTENT_FIELDS[SEMANTIC_TABLE],
         content_model=PYDANTIC_MODELS[CONTENT_FIELDS[SEMANTIC_TABLE]]
     )
-    
+
 
     episodic_memory_store = BigQueryMemoryStore.from_client(
         bq_client=bq_client,
@@ -666,7 +891,7 @@ async def get_memory_tools(
         content_field=CONTENT_FIELDS[EPISODIC_TABLE],
         content_model=PYDANTIC_MODELS[CONTENT_FIELDS[EPISODIC_TABLE]]
     )
-    
+
 
     procedural_memory_store = BigQueryMemoryStore.from_client(
         bq_client=bq_client,
@@ -676,7 +901,7 @@ async def get_memory_tools(
         content_field=CONTENT_FIELDS[PROCEDURAL_TABLE],
         content_model=PYDANTIC_MODELS[CONTENT_FIELDS[PROCEDURAL_TABLE]]
     )
-    
+
     # 2. For each namespace_template, build both a manage‐tool and a search‐tool
     for base_key, ns_template in namespace_templates.items():
         # Determine which store to hook up:

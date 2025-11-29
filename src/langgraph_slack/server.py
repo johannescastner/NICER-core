@@ -1,3 +1,5 @@
+# src/langgraph_slack/server.py
+"""This is the slack server interface"""
 import src.langgraph_slack.patch_typing  # must run before any Pydantic model loading
 import asyncio
 import logging
@@ -12,6 +14,8 @@ from langgraph_sdk import get_client
 from slack_bolt.adapter.fastapi.async_handler import AsyncSlackRequestHandler
 from slack_bolt.async_app import AsyncApp
 from langgraph_slack import config
+# Ambient HTTP endpoints (closed-source)
+from pro.http.ambient import router as ambient_router
 
 LOGGER = logging.getLogger(__name__)
 LANGGRAPH_CLIENT = get_client(url=config.LANGGRAPH_URL)
@@ -40,6 +44,9 @@ class SlackMessageData(TypedDict):
 
 
 async def worker():
+    """
+    The worker function for the background task.
+    """
     LOGGER.info("Background worker started.")
     while True:
         task = None
@@ -48,13 +55,19 @@ async def worker():
             if task is None:
                 LOGGER.info("Worker received sentinel, exiting.")
                 break
-            LOGGER.info(f"Worker got a new task: {task}")
+            LOGGER.info(
+                "Worker got a new task: %s",
+                task
+            )
             await _process_task(task)
         except asyncio.CancelledError:
             LOGGER.info("Worker task was cancelled.")
             break
         except Exception as exc:
-            LOGGER.exception(f"Error in worker: {exc}")
+            LOGGER.exception(
+                "Error in worker: %s",
+                exc
+            )
         finally:
             if task is not None:
                 TASK_QUEUE.task_done()
@@ -77,21 +90,49 @@ async def _process_task(task: dict):
             LOGGER.info("Skipping non-mention message")
             return
 
-        # Add the langgraph_auth_user_id to the GRAPH_CONFIG
+        # Add the langgraph_auth_user_id to the GRAPH_CONFIG in the configurable field
         user_id = event["user"]
-        updated_graph_config = {**GRAPH_CONFIG, "langgraph_auth_user_id": user_id}
+        updated_graph_config = {**GRAPH_CONFIG}
+        if "configurable" not in updated_graph_config:
+            updated_graph_config["configurable"] = {}
+        updated_graph_config["configurable"]["langgraph_auth_user_id"] = user_id
 
         # Log the message content being sent to LangGraph
-        LOGGER.debug(f"Processed message for LangGraph: {text_with_names}")
+        LOGGER.debug(
+            "Processed message for LangGraph: %s",
+            text_with_names
+        )
 
         # Log the event and user info
-        LOGGER.debug(f"Event info: {event}")
-        LOGGER.debug(f"User info: {event['user']}")
+        LOGGER.debug(
+            "Event info: %s",
+            event
+        )
+        LOGGER.debug(
+            "User info: %s",
+            event['user']
+        )
 
         LOGGER.info(
-            f"[{channel_id}].[{thread_id}] sending message to LangGraph: "
-            f"with webhook {webhook}: {text_with_names}"
+            """
+            [%s].[%s] sending message to LangGraph: ",
+            with webhook %s: %s
+            """,
+            channel_id,
+            thread_id,
+            webhook,
+            text_with_names
         )
+
+        # 🚨 CRITICAL FIX: Add conversation context for SummarizationNode and cost tracking
+        # Generate conversation_id from thread_id for consistency
+        conversation_id = f"slack_{thread_id}"
+
+        # 🎯 CONVERSATION LOGGING IS NOW HANDLED BY THE GLOBAL SWARM GRAPH
+        # The server is only responsible for initiating the graph execution.
+        # All logging, including human and agent turns, is managed within the
+        # swarm_graph's orchestrated workflow to ensure consistency and
+        # capture of rich metadata like embeddings and sentiment.
 
         result = await LANGGRAPH_CLIENT.runs.create(
             thread_id=thread_id,
@@ -102,7 +143,15 @@ async def _process_task(task: dict):
                         "role": "user",
                         "content": text_with_names,
                     }
-                ]
+                ],
+                # 🚨 Add conversation context required by SQL graph
+                "context": {
+                    "slack_user_id": event["user"],
+                    "channel_id": channel_id,
+                    "thread_id": thread_id,
+                    "thread_ts": event.get("thread_ts") or event["ts"],
+                },  # Required for LangMem SummarizationNode
+                "conversation_id": conversation_id,  # For cost tracking correlation
             },
             config=updated_graph_config,
             metadata={
@@ -115,15 +164,23 @@ async def _process_task(task: dict):
                 "thread_ts": event.get("thread_ts"),
                 "event_ts": event["ts"],
                 "channel_type": event.get("channel_type"),
+                # 🚨 CRITICAL: Add conversation context to metadata for correlation
+                "conversation_id": conversation_id
             },
             multitask_strategy="interrupt",
             if_not_exists="create",
             webhook=webhook,
         )
-        LOGGER.debug(f"LangGraph run: {result}")
+        LOGGER.debug(
+            "LangGraph run: %s",
+            result
+        )
 
     elif event_type == "callback":
-        LOGGER.info(f"Processing LangGraph callback: {event['thread_id']}")
+        LOGGER.info(
+            "Processing LangGraph callback: %s",
+            event['thread_id']
+        )
         state_values = event["values"]
         response_message = state_values["messages"][-1]
         thread_ts = event["metadata"].get("thread_ts") or event["metadata"].get(
@@ -135,6 +192,11 @@ async def _process_task(task: dict):
                 "Channel ID not found in event metadata and not set in environment"
             )
 
+        # 🎯 CONVERSATION LOGGING IS NOW HANDLED BY THE GLOBAL SWARM GRAPH
+        # The server is only responsible for delivering the final message to Slack.
+        # The agent's response has already been logged by the `log_agent_turn`
+        # node within the global graph.
+
         await APP_HANDLER.app.client.chat_postMessage(
             channel=channel_id,
             thread_ts=thread_ts,
@@ -145,20 +207,33 @@ async def _process_task(task: dict):
             },
         )
         LOGGER.info(
-            f"[{channel_id}].[{thread_ts}] sent message to Slack for callback {event['thread_id']}"
+            "[%s].[%s] sent message to Slack for callback %s", 
+            channel_id,
+            thread_ts,
+            event['thread_id']
         )
     else:
         raise ValueError(f"Unknown event type: {event_type}")
 
 
-async def handle_message(event: SlackMessageData, say: Callable, ack: Callable):
+async def handle_message(
+        event: SlackMessageData,
+        say: Callable,
+        ack: Callable
+):
+    """
+    Handle incoming Slack messages.
+    """
     LOGGER.info("Enqueuing handle_message task...")
     nouser = not event.get("user")
     ismention = await _is_mention(event)
     userisbot = event.get("bot_id") == config.BOT_USER_ID
     isdm = _is_dm(event)
     if nouser or userisbot or not (ismention or isdm):
-        LOGGER.info(f"Ignoring message not directed at the bot: {event}")
+        LOGGER.info(
+            "Ignoring message not directed at the bot: %s",
+            event
+        )
         return
 
     TASK_QUEUE.put_nowait({"type": "slack_message", "event": event})
@@ -166,7 +241,13 @@ async def handle_message(event: SlackMessageData, say: Callable, ack: Callable):
 
 
 async def just_ack(ack: Callable[..., Awaitable], event):
-    LOGGER.info(f"Acknowledging {event.get('type')} event")
+    """
+    simple helper
+    """
+    LOGGER.info(
+        "Acknowledging %s event", 
+        event.get('type') or event.get('subtype')
+    )
     await ack()
 
 
@@ -182,6 +263,9 @@ APP_HANDLER.app.event("app_mention")(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    defines the lifespan for the app
+    """
     LOGGER.info("App is starting up. Creating background worker...")
     loop = asyncio.get_running_loop()
     worker_task = loop.create_task(worker())
@@ -199,15 +283,21 @@ async def verify_slack(req: Request):
     Handle Slack's URL verification challenge.
     """
     data = await req.json()
-    
+
     # Respond to Slack verification challenge
     if "challenge" in data:
         return {"challenge": data["challenge"]}
 
     return {"detail": "Unauthorized"}, 401
 
+# Mount ambient endpoints (for cron / webhooks driving background SQL coverage)
+APP.include_router(ambient_router)
+
 @APP.post("/events/slack")
 async def slack_endpoint(req: Request):
+    """
+    Handle Slack events.
+    """
     return await APP_HANDLER.handle(req)
 
 
@@ -230,9 +320,14 @@ def _clean_markdown(text: str) -> str:
 
 @APP.post("/callbacks/{thread_id}")
 async def webhook_callback(req: Request):
+    """
+    Handle LangGraph webhook callbacks.
+    """
     body = await req.json()
     LOGGER.info(
-        f"Received webhook callback for {req.path_params['thread_id']}/{body['thread_id']}"
+        "Received webhook callback for %s/%s",
+        req.path_params['thread_id'],
+        body['thread_id']
     )
     TASK_QUEUE.put_nowait({"type": "callback", "event": body})
     return {"status": "success"}
@@ -264,7 +359,9 @@ async def _fetch_thread_history(
     Fetch all messages in a Slack thread, following pagination if needed.
     """
     LOGGER.info(
-        f"Fetching thread history for channel={channel_id}, thread_ts={thread_ts}"
+        "Fetching thread history for channel=%s, thread_ts=%s", 
+        channel_id,
+        thread_ts
     )
     all_messages = []
     cursor = None
@@ -291,7 +388,10 @@ async def _fetch_thread_history(
                 break
             cursor = response["response_metadata"]["next_cursor"]
         except Exception as exc:
-            LOGGER.exception(f"Error fetching thread messages: {exc}")
+            LOGGER.exception(
+                "Error fetching thread messages: %s",
+                exc
+            )
             break
 
     return all_messages
@@ -305,7 +405,11 @@ async def _fetch_user_names(user_ids: set[str]) -> dict[str, str]:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for uid, result in zip(uncached_ids, results):
             if isinstance(result, Exception):
-                LOGGER.warning(f"Failed to fetch user info for {uid}: {result}")
+                LOGGER.warning(
+                    "Failed to fetch user info for %s: %s",
+                    uid,
+                    result
+                )
                 continue
             user_obj = result.get("user", {})
             profile = user_obj.get("profile", {})
