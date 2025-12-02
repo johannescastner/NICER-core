@@ -791,8 +791,51 @@ class ConversationLogger:
             data["error_details"] = json.dumps(data["error_details"])
         else:
             data["error_details"] = None
-        # nuanced_emotions stays as a dict – BigQuery JSON column handles it directly.
 
+        # nuanced_emotions: BigQuery JSON column.
+        # The streaming API expects a JSON *literal* (usually a string),
+        # not a RECORD/STRUCT. So we:
+        #   - keep None as None
+        #   - validate string values as JSON
+        #   - json.dumps() any dict/list into a JSON string
+        ne = data.get("nuanced_emotions")
+        try:
+            if ne is None:
+                data["nuanced_emotions"] = None
+                logger.debug(
+                    "ConversationLogger._store_turn nuanced_emotions is None "
+                    "for turn_id=%s",
+                    data.get("turn_id"),
+                )
+            elif isinstance(ne, str):
+                # ensure it’s valid JSON; if not, we’ll drop it below
+                json.loads(ne)
+                data["nuanced_emotions"] = ne
+                logger.debug(
+                    "ConversationLogger._store_turn nuanced_emotions (str) sample=%s",
+                    ne[:500],
+                )
+            else:
+                # dict / list / other JSON-serialisable type
+                json_str = json.dumps(ne, default=_sanitize_for_json)  # reuse sanitizer
+                data["nuanced_emotions"] = json_str
+                logger.debug(
+                    "ConversationLogger._store_turn nuanced_emotions (obj) type=%s sample=%s",
+                    type(ne),
+                    json_str[:500],
+                )
+        except Exception as exc:
+            # If anything goes wrong, don’t block the graph – just drop the field.
+            logger.warning(
+                "ConversationLogger._store_turn: failed to serialise nuanced_emotions; "
+                "dropping field for turn_id=%s: %s",
+                data.get("turn_id"),
+                exc,
+                exc_info=True,
+            )
+            data["nuanced_emotions"] = None
+
+        # Store via PM (off the event loop)
         table_id = (
             f"{self.project_id}.{self.dataset_id}.conversation_turns"
             if self.project_id and self.dataset_id

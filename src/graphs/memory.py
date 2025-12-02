@@ -5,6 +5,7 @@ which connects the langmem longrun memory system to BigQuery.
 """
 from __future__ import annotations
 import asyncio
+import concurrent.futures
 import uuid
 import logging
 import json
@@ -512,38 +513,32 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         logger.info("[aput] Inserting doc_id=%s into namespace=%s", key=key, namespace=namespace)
 
         data = {"namespace" : ".".join(namespace), "doc_id" : key}
-
-        # Log the entire value being passed to aput
         logger.debug("[aput] initial data: %s", json.dumps(data, indent=2))
-
-        # Log the content field name to check if it's what we expect
         logger.debug("[aput] Using content field: %s", self.content_field)
 
-        # Get the raw content and ensure it's wrapped in the correct model (e.g., Fact)
         raw_content = value.get("content")
-
-        # Log the raw content that is being retrieved
         logger.debug("[aput] Raw content retrieved: %s", raw_content)
 
         if raw_content is None:
             logger.error("Content for %s is None. This is not expected.", self.content_field)
             return
 
-        # Ensure the content is wrapped into the content model (e.g., Fact)
         text = self._normalize_structured_field(raw_content)
-        # Now, prepare the embedding by serializing the transformed content as JSON
         embedding_content = json.dumps(text)
-        # Log the normalized text content
         logger.debug("[aput] Normalized content: %s", text)
         data[self.content_field] = text
         logger.debug("[aput] Value being inserted: %s", json.dumps(data, indent=2))
-        logger.debug(
-            "[aput] the type(data[self.content_field]): %s", type(data[self.content_field])
-        )
-        # Insert the document into BigQuery (wrapped content)
+        logger.debug("[aput] the type(data[self.content_field]): %s", type(data[self.content_field]))
 
         doc = Document(page_content=embedding_content, metadata=data, id=key)
-        self.vectorstore.add_documents([doc])
+
+        # IMPORTANT: offload the blocking BigQuery call to a worker thread
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            self.vectorstore.add_documents,
+            [doc],
+        )
 
     async def aget(
             self,
@@ -553,7 +548,13 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             refresh_ttl: Optional[bool] = None
     ) -> Optional[Item]:
         logger.debug("[aget] Retrieving doc_id=%s from namespace=%s", key, namespace)
-        docs = self.vectorstore.get_documents(ids=[key])
+
+        loop = asyncio.get_running_loop()
+        docs = await loop.run_in_executor(
+            None,
+            self.vectorstore.get_documents,
+            [key],
+        )
         if not docs:
             return None
         doc = docs[0]
@@ -565,17 +566,15 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
                 metadata[self.content_field] = self.content_model(**json.loads(content_val))
             except Exception:
                 pass
-        # Pull raw values out of metadata
-        raw_created = doc.metadata.get("created_at")    # may be datetime, str, or None
-        raw_updated = doc.metadata.get("updated_at")    # same
 
-        # Normalize them into real datetime objects
+        raw_created = doc.metadata.get("created_at")
+        raw_updated = doc.metadata.get("updated_at")
+
         def to_dt(x):
             if isinstance(x, datetime):
                 return x
             if isinstance(x, str):
                 return datetime.fromisoformat(x)
-            # fallback to “now” if missing or unparseable
             return datetime.now(timezone.utc)
 
         created_at = to_dt(raw_created)
@@ -588,7 +587,6 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             created_at=created_at,
             updated_at=updated_at
         )
-
     # --- Overloads to satisfy both older & newer langgraph versions ---
     @overload
     async def asearch(  # current shape (with refresh_ttl)
@@ -642,10 +640,15 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             except Exception:
                 query = str(query)
 
-        # IMPORTANT: pass filter through unchanged; vectorstore does server-side application
-        hits = self.vectorstore.similarity_search_with_score(
-            query=query, filter=filter, k=limit + offset
-        )[offset:]
+        loop = asyncio.get_running_loop()
+        # Offload vectorstore similarity search to avoid blocking
+        hits = await loop.run_in_executor(
+            None,
+            lambda: self.vectorstore.similarity_search_with_score(
+                query=query, filter=filter, k=limit + offset
+            ),
+        )
+        hits = hits[offset:]
 
         out: list[SearchItem] = []
         for doc, score in hits:
@@ -688,6 +691,52 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             )
         return out
 
+    def search(
+        self,
+        namespace_prefix: tuple[str, ...], /,
+        *,
+        query: str | None = None,
+        filter: dict[str, Any] | None = None,
+        limit: int = 10,
+        offset: int = 0,
+        # accept refresh_ttl if the base class ever passes it through
+        refresh_ttl: bool | None = None,
+    ) -> list[SearchItem]:
+        """
+        Synchronous search wrapper.
+
+        Some callers (e.g. sync tool paths) expect `search` to be *sync*.
+        We resolve the async `asearch` coroutine here so nobody ever ends up
+        with an un-awaited `BigQueryMemoryStore.asearch` object.
+        """
+        async def _runner() -> list[SearchItem]:
+            return await self.asearch(
+                namespace_prefix,
+                query=query,
+                filter=filter,
+                limit=limit,
+                offset=offset,
+                refresh_ttl=refresh_ttl,
+            )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No running loop: safe to create one and run to completion
+            return asyncio.run(_runner())
+
+        # Already in an event loop: hop to a worker thread with its own loop
+        def _thread_runner() -> list[SearchItem]:
+            new_loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(new_loop)
+                return new_loop.run_until_complete(_runner())
+            finally:
+                new_loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            return ex.submit(_thread_runner).result()
+
     async def adelete(self, namespace: Tuple[str, ...], key: str) -> None:
         logger.info(f"[adelete] Deleting doc_id={key} from namespace={namespace}")
         await self.vectorstore.adelete(ids=[key])
@@ -720,12 +769,30 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         ]
         self.vectorstore.add_documents(documents)
 
-    async def amset(self, key_value_pairs: Sequence[Tuple[str, dict]]) -> None:
+    async def amset(
+            self,
+            key_value_pairs: Sequence[Tuple[str, dict]]
+    ) -> None:
+        """
+        Async-friendly multi-set.
+
+        BigQueryVectorStore.add_documents is synchronous, so we offload it to
+        a worker thread to avoid blocking the event loop.
+        """
         documents = [
-            Document(page_content=value.get(self.content_field), metadata={**value, "doc_id": key})
+            Document(
+                page_content=value.get(self.content_field),
+                metadata={**value, "doc_id": key}
+            )
             for key, value in key_value_pairs
         ]
-        await self.vectorstore.add_documents(documents)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            self.vectorstore.add_documents,
+            documents
+        )
+
 
     def mdelete(self, keys: Sequence[str]) -> None:
         """
@@ -745,7 +812,25 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         if adelete is None:
             raise NotImplementedError("Vector store does not support delete/adelete")
 
-        asyncio.run(adelete(ids=list(keys)))
+        # If we're in a plain sync context, just run the coroutine to completion.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            asyncio.run(adelete(ids=list(keys)))
+            return
+
+        # If we're *already* in an event loop, hop to a worker thread that owns
+        # its own loop so we don't try to nest event loops and explode.
+        def _runner() -> None:
+            loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(adelete(ids=list(keys)))
+            finally:
+                loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            ex.submit(_runner).result()
 
     async def amdelete(self, keys: Sequence[str]) -> None:
         """
