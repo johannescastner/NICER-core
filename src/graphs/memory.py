@@ -328,12 +328,10 @@ class PatchedBigQueryVectorStore(BigQueryVectorStore):
         logger.debug("Content of 'fact' field: %s", record[self.content_field])
         table = self._bq_client.get_table(self.full_table_id)
         try:
-            if self.schema is not None:
-                job = self._bq_client.load_table_from_json(values_dict, table, self.schema)
-                logger.debug("loaded_table with schema!")
-            else:
-                job = self._bq_client.load_table_from_json(values_dict, table)
-                logger.debug("loaded_table with no schema!")
+
+            # Schema enforcement happens at table definition time; load just sends rows.
+            job = self._bq_client.load_table_from_json(values_dict, table)
+            logger.debug("Loaded %d row(s) into %s", len(values_dict), self.full_table_id)
             job.result()  # Wait for the job to complete
         except google.api_core.exceptions.GoogleAPIError as e:
             # Handle errors returned by the Google API
@@ -448,7 +446,20 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         content_model: Optional[Type[BaseModel]] = None,
         schema: Optional[List[bigquery.SchemaField]] = None,
     ):
-        super().__init__()
+        # AsyncBatchedBaseStore expects to be constructed inside a running
+        # event loop. When we build this store in a worker thread (via
+        # asyncio.to_thread) there is no running loop, so `super().__init__()`
+        # would raise `RuntimeError: no running event loop`.
+        #
+        # We catch that here and provide the attributes that the base class'
+        # destructor expects so shutdown is clean. Our implementation of
+        # `abatch` does not rely on the base-class batching machinery.
+        try:
+            super().__init__()
+        except RuntimeError:
+            self._loop = None
+            self._task = None
+
         self.vectorstore = vectorstore
         self.content_field = content_field
         self.content_model = content_model
@@ -457,18 +468,17 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
     @classmethod
     def from_client(
         cls,
-        bq_client: bigquery.Client,
         dataset_name: str,
         table_name: str,
-        embedding: Embeddings,
         content_field: str,
         content_model: Optional[Type[BaseModel]] = None,
         schema: Optional[List[bigquery.SchemaField]] = None,
         **kwargs,
-    ) -> PatchedBigQueryVectorStore:
+    ) -> "BigQueryMemoryStore":
         vectorstore = PatchedBigQueryVectorStore(
             embedding=embedding,
             project_id=bq_client.project,
+            doc_id_field="doc_id",
             dataset_name=dataset_name,
             table_name=table_name,
             content_field=content_field,
@@ -477,8 +487,6 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             **kwargs,
         )
         object.__setattr__(vectorstore, "_bq_client", bq_client)
-        if schema is not None:
-            vectorstore.schema = schema  # Assign schema to vectorstore
         return cls(
             vectorstore=vectorstore,
             content_field=content_field,
@@ -493,25 +501,32 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         elif isinstance(raw, str) and self.content_model:
             # If it's a string, wrap it into the content model
             return {"content":raw}
-        elif isinstance(raw, self.content_model):
+        elif self.content_model is not None and isinstance(raw, self.content_model):
             return raw.dict()  # Already in the correct format
         else:
             raise ValueError(
-                "%s must be a dict, str, or %s — got {type(raw)}" % (
-                    self.content_field, self.content_model.__name__
+                "%s must be a dict, str, or %s — got: %s"
+                % (
+                    self.content_field,
+                    self.content_model.__name__ if self.content_model else "BaseModel",
+                    type(raw),
                 )
             )
 
     async def aput(
-            self, namespace: Tuple[str, ...],
-            key: str,
-            value: dict[str, Any],
-            index: Optional[Union[Literal[False], list[str]]] = None,
-            *,
-            ttl: Optional[float] = None
+        self,
+        namespace: Tuple[str, ...],
+        key: str,
+        value: dict[str, Any],
+        index: Optional[Union[Literal[False], list[str]]] = None,
+        *,
+        ttl: Optional[float] = None,
     ) -> None:
-        logger.info("[aput] Inserting doc_id=%s into namespace=%s", key=key, namespace=namespace)
-
+        logger.info(
+            "[aput] Inserting doc_id=%s into namespace=%s",
+            key,
+            ".".join(namespace),
+        )
         data = {"namespace" : ".".join(namespace), "doc_id" : key}
         logger.debug("[aput] initial data: %s", json.dumps(data, indent=2))
         logger.debug("[aput] Using content field: %s", self.content_field)
@@ -887,15 +902,6 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
                 raise NotImplementedError(f"Unsupported op: {op}")
         return results
 
-
-CONTENT_FIELDS = {
-    SEMANTIC_TABLE: "fact",
-    EPISODIC_TABLE: "episode",
-    PROCEDURAL_TABLE: "procedure",
-}
-
-
-
 #----------------------SCHEMAS------------------------------------------------
 # Define the desired schemas for each table
 # Define the desired schemas for each table
@@ -941,6 +947,31 @@ SCHEMAS = {
 ]
 }
 
+async def _build_store_in_thread(
+    *,
+    table_name: str,
+    content_field: str,
+    model: Type[BaseModel],
+    schema: List[bigquery.SchemaField]
+) -> "BigQueryMemoryStore":
+    """
+    Build a BigQueryMemoryStore in a worker thread so that the synchronous
+    BigQuery dataset/table validation runs off the main event loop (and
+    doesn't trip LangGraph dev's blocking-call detector).
+    """
+
+    def _builder() -> "BigQueryMemoryStore":
+        return BigQueryMemoryStore.from_client(
+            dataset_name=DATASET_ID,
+            table_name=table_name,
+            content_field=content_field,
+            content_model=model,
+            schema=schema,
+        )
+
+    # run in default ThreadPoolExecutor
+    return await asyncio.to_thread(_builder)
+
 #---------------------------------get memory tools--------------------------------
 async def get_memory_tools(
     namespace_templates: Dict[str, NamespaceTemplate]
@@ -958,35 +989,34 @@ async def get_memory_tools(
       A list of all created tools (both manage_* and search_*).
     """
     tools: List = []
-    semantic_memory_store = BigQueryMemoryStore.from_client(
-        bq_client=bq_client,
-        dataset_name=DATASET_ID, 
-        table_name=SEMANTIC_TABLE, 
-        embedding=embedding,
-        content_field=CONTENT_FIELDS[SEMANTIC_TABLE],
-        content_model=PYDANTIC_MODELS[CONTENT_FIELDS[SEMANTIC_TABLE]]
+
+    # Build all three stores in worker threads so that the synchronous
+    # BigQuery API calls (dataset/table validation) do not block the
+    # main asyncio event loop under LangGraph dev.
+    (
+        semantic_memory_store,
+        episodic_memory_store,
+        procedural_memory_store,
+    ) = await asyncio.gather(
+        _build_store_in_thread(
+            table_name=SEMANTIC_TABLE,
+            content_field=CONTENT_FIELDS[SEMANTIC_TABLE],
+            model=PYDANTIC_MODELS[CONTENT_FIELDS[SEMANTIC_TABLE]],
+            schema=SCHEMAS[SEMANTIC_TABLE],
+        ),
+        _build_store_in_thread(
+            table_name=EPISODIC_TABLE,
+            content_field=CONTENT_FIELDS[EPISODIC_TABLE],
+            model=PYDANTIC_MODELS[CONTENT_FIELDS[EPISODIC_TABLE]],
+            schema=SCHEMAS[EPISODIC_TABLE],
+        ),
+        _build_store_in_thread(
+            table_name=PROCEDURAL_TABLE,
+            content_field=CONTENT_FIELDS[PROCEDURAL_TABLE],
+            model=PYDANTIC_MODELS[CONTENT_FIELDS[PROCEDURAL_TABLE]],
+            schema=SCHEMAS[PROCEDURAL_TABLE],
+        ),
     )
-
-
-    episodic_memory_store = BigQueryMemoryStore.from_client(
-        bq_client=bq_client,
-        dataset_name=DATASET_ID, 
-        table_name=EPISODIC_TABLE, 
-        embedding=embedding,
-        content_field=CONTENT_FIELDS[EPISODIC_TABLE],
-        content_model=PYDANTIC_MODELS[CONTENT_FIELDS[EPISODIC_TABLE]]
-    )
-
-
-    procedural_memory_store = BigQueryMemoryStore.from_client(
-        bq_client=bq_client,
-        dataset_name=DATASET_ID, 
-        table_name=PROCEDURAL_TABLE,  
-        embedding=embedding,
-        content_field=CONTENT_FIELDS[PROCEDURAL_TABLE],
-        content_model=PYDANTIC_MODELS[CONTENT_FIELDS[PROCEDURAL_TABLE]]
-    )
-
     # 2. For each namespace_template, build both a manage‐tool and a search‐tool
     for base_key, ns_template in namespace_templates.items():
         # Determine which store to hook up:
