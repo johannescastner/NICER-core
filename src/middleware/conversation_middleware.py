@@ -37,6 +37,23 @@ def get_conversation_logger() -> ConversationLogger:
     without using a module-level mutable global + global statement.
     """
     return ConversationLogger()
+ 
+def _dict_role(m: dict) -> str | None:
+    # Support common shapes: {"role": "user"}, {"type": "human"}, etc.
+    role = m.get("role") or m.get("type")
+    if isinstance(role, str):
+        role_lc = role.lower()
+        if role_lc in ("user", "human"):
+            return "human"
+        if role_lc in ("assistant", "ai"):
+            return "ai"
+        if role_lc == "tool":
+            return "tool"
+    return None
+
+def _dict_name(m: dict) -> str | None:
+    v = m.get("name")
+    return v if isinstance(v, str) else None
 
 def _as_text(content: Any) -> str:
     if isinstance(content, str):
@@ -73,7 +90,7 @@ async def _log_turn_middleware(
         turn_number = int(state.get("turn_number", 0))
         messages = state.get("messages", [])
 
-        if not messages:
+        if not messages or not isinstance(messages, list):
             return state
 
         # ---- Validate turn_type early ----------------------------------------
@@ -118,6 +135,12 @@ async def _log_turn_middleware(
             message_to_log = next(
                 (m for m in reversed(messages) if isinstance(m, HumanMessage)),
                 None,
+            ) or next(
+                (
+                    m for m in reversed(messages)
+                    if isinstance(m, dict) and _dict_role(m) == "human"
+                ),
+                None,
             )
             speaker = "human"
             agent_name = None  # No agent for human turns
@@ -135,12 +158,19 @@ async def _log_turn_middleware(
                 (m for m in reversed(messages)
                  if getattr(m, "type", None) in ("ai", "tool")),
                 None,
+            ) or next(
+                (
+                    m for m in reversed(messages)
+                    if isinstance(m, dict) and _dict_role(m) in ("ai", "tool")
+                ),
+                None,
             )
 
             speaker = "assistant"
             # Prefer the message's .name; fall back to state/config; then default.
             agent_name = (
                 (getattr(message_to_log, "name", None) if message_to_log else None)
+                or (_dict_name(message_to_log) if isinstance(message_to_log, dict) else None)
                 or state.get("active_agent")
                 or configurable.get("active_agent")
                 or "unknown_agent"
@@ -148,7 +178,7 @@ async def _log_turn_middleware(
 
         if not message_to_log:
             msg_types = [
-                getattr(m, "type", type(m).__name__)
+                (m.get("type") if isinstance(m, dict) else getattr(m, "type", type(m).__name__))
                 for m in messages
             ]
             # For human turns, this is suspicious → keep as warning.
@@ -166,20 +196,51 @@ async def _log_turn_middleware(
         # ---- User/context metadata -------------------------------------------
         user_id = configurable.get("langgraph_auth_user_id", "unknown")
 
+        # Best-effort exposure of any pending prompt-token estimate so that
+        # ConversationLogger / downstream analytics can inspect it.
+        #
+        # Primary source: state["context"]["pending_prompt_tokens"]
+        # Fallback:       config["configurable"]["pending_prompt_tokens"]
+        pending_prompt_tokens: Optional[int] = None
+
+        ctx_obj = state.get("context") or {}
+        if isinstance(ctx_obj, dict):
+            try:
+                v = ctx_obj.get("pending_prompt_tokens")
+                if isinstance(v, (int, float)):
+                    pending_prompt_tokens = int(v)
+            except (TypeError, ValueError):
+                pending_prompt_tokens = None
+
+        if pending_prompt_tokens is None:
+            try:
+                v = configurable.get("pending_prompt_tokens")
+                if isinstance(v, (int, float)):
+                    pending_prompt_tokens = int(v)
+            except (AttributeError, TypeError, ValueError):
+                pending_prompt_tokens = None
+
         metadata = {
             "user_id": user_id,
             "agent_name": agent_name,
             "conversation_context": state.get("context", {}),
             "message_count": len(messages),
             "config_context": configurable,
+            # May be None if no agent has provided an estimate for this turn.
+            "pending_prompt_tokens": pending_prompt_tokens,
         }
+        # Extract content safely for dict-shaped messages too.
+        if isinstance(message_to_log, dict):
+            raw_content = message_to_log.get("content", "")
+        else:
+            raw_content = getattr(message_to_log, "content", "")
 
         # ---- Log the turn (non-blocking to convo path) -----------------------
         conv_logger = get_conversation_logger()
         await conv_logger.log_turn(
             conversation_id=conversation_id,
             speaker=speaker,
-            content=_as_text(getattr(message_to_log, "content", "")),
+            content=_as_text(raw_content),
             message_type=(
                 "tool_call"
                 if isinstance(message_to_log, ToolMessage)

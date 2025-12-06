@@ -35,6 +35,29 @@ from src.langgraph_slack.config import (
 
 # Set up logging
 logger = logging.getLogger(__name__)
+ 
+# ---------------- Tone analysis token caps ----------------
+# HF text-classification/sentiment pipelines accept `truncation=True`
+# and `max_length` to control tokenizer truncation. RoBERTa-family
+# checkpoints typically support up to ~512 tokens. We default lower
+# because tone signal usually saturates early, and shorter caps reduce
+# latency and memory pressure.
+_TONE_MAX_LENGTH_ENV = "CONVERSATION_TONE_MAX_TOKENS"
+_DEFAULT_TONE_MAX_LENGTH = 256
+_MIN_TONE_MAX_LENGTH = 32
+_MAX_TONE_MAX_LENGTH = 512
+
+def _get_tone_max_length_from_env() -> int:
+    raw = os.getenv(_TONE_MAX_LENGTH_ENV, str(_DEFAULT_TONE_MAX_LENGTH))
+    try:
+        val = int(raw)
+    except Exception:
+        val = _DEFAULT_TONE_MAX_LENGTH
+    if val < _MIN_TONE_MAX_LENGTH:
+        return _MIN_TONE_MAX_LENGTH
+    if val > _MAX_TONE_MAX_LENGTH:
+        return _MAX_TONE_MAX_LENGTH
+    return val
 
 def _sanitize_for_json(value: Any) -> Any:
     """
@@ -152,6 +175,11 @@ class ConversationLogger:
 
         # Persistence Manager (injected or global factory)
         self.pm = pm or get_persistence_manager()
+ 
+        # Tone analysis token cap (configurable)
+        self._tone_max_length: int = _get_tone_max_length_from_env()
+        logger.info("ConversationLogger tone max_length=%s (env=%s)",
+                    self._tone_max_length, _TONE_MAX_LENGTH_ENV)
 
         # --- HF cache root (managed via config) ---
         # In Cloud, path is ephemeral; in self-hosted, point to a mounted volume.
@@ -325,7 +353,8 @@ class ConversationLogger:
         if not content or not content.strip():
             return tone
 
-        # 1) Truncate for model stability
+        # 1) Truncate for model stability (char cap as a first-pass guard).
+        # Token-level safety is enforced by passing truncation/max_length to pipelines.
         text = content[:2000] if len(content) > 2000 else content
         # NOTE: classifiers might be None; we treat that as "no-op" and keep defaults.
 
@@ -334,7 +363,11 @@ class ConversationLogger:
             # Sentiment (defensive parse)
             # ---------------------------
             if self._sentiment_classifier:
-                s_res = self._sentiment_classifier(text)
+                s_res = self._sentiment_classifier(
+                    text,
+                    truncation=True,
+                    max_length=self._tone_max_length,
+                )
                 # HF shapes: [ {label, score} ]  OR  [ [ {label, score}, ... ] ]
                 candidates = []
                 if isinstance(s_res, list) and s_res:
@@ -360,7 +393,12 @@ class ConversationLogger:
             # Formality (defensive parse)
             # ---------------------------
             if self._formality_classifier:
-                f_res = self._formality_classifier(text)
+                f_res = self._formality_classifier(
+                    text,
+                    truncation=True,
+                    max_length=self._tone_max_length,
+                )
+
                 candidates = []
                 if isinstance(f_res, list) and f_res:
                     first = f_res[0]
@@ -381,7 +419,12 @@ class ConversationLogger:
             # Nuanced emotions (scores map + thresholded labels)
             # ---------------------------------------
             if self._emotion_classifier:
-                e_res = self._emotion_classifier(text)
+                e_res = self._emotion_classifier(
+                    text,
+                    truncation=True,
+                    max_length=self._tone_max_length,
+                )
+
                 # Expect: [ [ {label, score}, ... ] ] OR [ {label, score}, ... ]
                 emotions_all = []
                 if isinstance(e_res, list) and e_res:
