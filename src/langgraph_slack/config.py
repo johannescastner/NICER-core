@@ -7,6 +7,7 @@ import os
 import base64
 import json
 import importlib
+import re
 from os import environ
 from google.oauth2 import service_account
 from .deepseek_utils import (
@@ -66,6 +67,146 @@ except Exception as e:
     )
     SERVICE_ACCOUNT_INFO = {}
     CREDENTIALS = None
+
+# Best-effort derive the SA email from embedded credentials.
+# This is useful for provisioning scripts that need to grant Secret Manager access
+# to the runtime identity without forcing clients to repeat themselves.
+SERVICE_ACCOUNT_EMAIL = (
+    SERVICE_ACCOUNT_INFO.get("client_email")
+    if isinstance(SERVICE_ACCOUNT_INFO, dict)
+    else None
+)
+
+# ───────────────────── Superset Configuration ─────────────────────
+
+# Service account used by the Superset Cloud Run service at runtime.
+# If not explicitly set, fall back to the embedded SA email.
+SUPERSET_RUN_SERVICE_ACCOUNT = (
+    environ.get("SUPERSET_RUN_SERVICE_ACCOUNT")
+    or SERVICE_ACCOUNT_EMAIL
+    or ""
+)
+ 
+# ───────────────────── Superset Configuration ─────────────────────
+#
+# We treat Superset as a sibling service to the LangGraph deployment.
+# The agent will use a Superset tool to create/update virtual datasets
+# and charts, returning URLs when a visual answer is best.
+#
+# Superset architecture (high level):
+#   - Metadata DB (Postgres/MySQL)
+#   - Cache/Results backend (often Redis)
+#   - SQL engines (BigQuery, etc.) accessed via SQLAlchemy
+#
+# This module only reads env; provisioning is handled by an external script.
+#
+# References:
+#   Superset uses a separate metadata DB and optional caching/async components.
+# [oai_citation:1‡Superset](https://superset.apache.org/developer_portal/...
+# contributing/resources/?utm_source=chatgpt.com)
+
+def _slugify(value: str) -> str:
+    value = value.strip().lower()
+    value = re.sub(r"[^a-z0-9]+", "-", value)
+    return value.strip("-") or "tenant"
+
+# Enable/disable Superset integration at runtime
+SUPERSET_ENABLED = (environ.get("SUPERSET_ENABLED", "true").lower() == "true")
+
+# Tenant + region
+# IMPORTANT:
+#  - GCP_LOCATION here is your BigQuery location (EU/US multi-region label).
+#  - Cloud Run/Cloud SQL/Redis require a *region* like europe-west1.
+#
+# If you don't supply SUPERSET_REGION explicitly, we fall back to:
+#   GCP_REGION -> SUPERSET_REGION -> europe-west1
+#
+GCP_REGION = environ.get("GCP_REGION", "europe-west1")  # optional, if you start standardizing this
+
+SUPERSET_TENANT = environ.get("SUPERSET_TENANT") or _slugify(COMPANY)
+SUPERSET_REGION = (
+    environ.get("SUPERSET_REGION")
+    or GCP_REGION
+    or "europe-west1"
+)
+
+# URL of the Superset instance (set after deploy)
+SUPERSET_URL = environ.get("SUPERSET_URL", "")
+
+ 
+# Secret Manager secret IDs (used by provisioning script).
+# These are names/IDs, not secret values.
+SUPERSET_SECRET_KEY_SECRET_NAME = environ.get(
+    "SUPERSET_SECRET_KEY_SECRET_NAME",
+    f"superset-secret-key--{SUPERSET_TENANT}",
+)
+SUPERSET_SQL_PASSWORD_SECRET_NAME = environ.get(
+    "SUPERSET_SQL_PASSWORD_SECRET_NAME",
+    f"superset-sql-password--{SUPERSET_TENANT}",
+)
+SUPERSET_ADMIN_PASSWORD_SECRET_NAME = environ.get(
+    "SUPERSET_ADMIN_PASSWORD_SECRET_NAME",
+    f"superset-admin-password--{SUPERSET_TENANT}",
+)
+
+# Core Superset secret key (required by Superset)
+# In production, generate a strong random key and store in Secret Manager.
+SUPERSET_SECRET_KEY = environ.get("SUPERSET_SECRET_KEY", "")
+
+# Admin bootstrap creds for first-time init
+SUPERSET_ADMIN_USERNAME = environ.get("SUPERSET_ADMIN_USERNAME", "admin")
+SUPERSET_ADMIN_PASSWORD = environ.get("SUPERSET_ADMIN_PASSWORD", "")
+SUPERSET_ADMIN_EMAIL = environ.get("SUPERSET_ADMIN_EMAIL", "")
+
+# ---------- Cloud SQL (metadata) ----------
+SUPERSET_SQL_INSTANCE_NAME = environ.get(
+    "SUPERSET_SQL_INSTANCE_NAME",
+    f"superset-{SUPERSET_TENANT}",
+)
+SUPERSET_SQL_DB = environ.get("SUPERSET_SQL_DB", "superset")
+SUPERSET_SQL_USER = environ.get("SUPERSET_SQL_USER", "superset")
+SUPERSET_SQL_PASSWORD = environ.get("SUPERSET_SQL_PASSWORD", "")
+
+# ---------- Redis ----------
+# Name is for provisioning; host/port are for runtime wiring.
+SUPERSET_REDIS_NAME = environ.get(
+    "SUPERSET_REDIS_NAME",
+    f"superset-redis-{SUPERSET_TENANT}",
+)
+SUPERSET_REDIS_HOST = environ.get("SUPERSET_REDIS_HOST", "")
+SUPERSET_REDIS_PORT = int(environ.get("SUPERSET_REDIS_PORT", "6379"))
+
+# ---------- Image / Service naming ----------
+SUPERSET_IMAGE_NAME = environ.get(
+    "SUPERSET_IMAGE_NAME",
+    f"superset-{SUPERSET_TENANT}",
+)
+SUPERSET_CLOUDRUN_SERVICE_NAME = environ.get(
+    "SUPERSET_CLOUDRUN_SERVICE_NAME",
+    f"superset-{SUPERSET_TENANT}",
+)
+
+# Optional: BigQuery database id to use inside Superset for tool defaults
+# This is a Superset-internal id that your tool can override per call.
+SUPERSET_BQ_DATABASE_ID = (
+    int(environ["SUPERSET_BQ_DATABASE_ID"])
+    if environ.get("SUPERSET_BQ_DATABASE_ID")
+    else None
+)
+
+# Minimal validation helpers (non-fatal)
+def superset_config_ok() -> bool:
+    """
+    SECRET_KEY is mandatory for Superset to boot correctly.
+    """
+    if not SUPERSET_ENABLED:
+        return False
+    if not SUPERSET_SECRET_KEY:
+        LOGGER.warning("SUPERSET_SECRET_KEY not set.")
+    if not PROJECT_ID or PROJECT_ID == "default_project_id":
+        LOGGER.warning("GCP_PROJECT_ID not set for Superset provisioning.")
+    return True
+
 
 # ───── Model Provider Configuration ─────
 # Easy switching between OpenAI and DeepSeek models
@@ -292,3 +433,13 @@ except Exception:
 # Treat non-positive as "no cap"
 CONVERSATION_MAX_CONTENT_CHARS = _cap_val if _cap_val > 0 else None
 LOGGER.info("Conversation content cap: %s", CONVERSATION_MAX_CONTENT_CHARS)
+
+# Superset logging snapshot for debugging
+LOGGER.info(
+    "Superset enabled=%s tenant=%s region=%s url_set=%s redis_host_set=%s",
+    SUPERSET_ENABLED,
+    SUPERSET_TENANT,
+    SUPERSET_REGION,
+    bool(SUPERSET_URL),
+    bool(SUPERSET_REDIS_HOST),
+)

@@ -6,6 +6,7 @@ which connects the langmem longrun memory system to BigQuery.
 from __future__ import annotations
 import asyncio
 import concurrent.futures
+from collections.abc import Iterable as IterableABC
 import uuid
 import logging
 import json
@@ -34,7 +35,15 @@ from langchain_core.embeddings import Embeddings
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_google_community.bq_storage_vectorstores.bigquery import BigQueryVectorStore
 from langchain_google_community.bq_storage_vectorstores.utils import validate_column_in_bq_schema
-from langgraph.store.base import Item, SearchItem
+from langgraph.store.base import (
+    BaseStore,
+    Item,
+    SearchItem,
+    NamespacePath,
+    NOT_PROVIDED,
+    NotProvided,
+    _validate_namespace,
+)
 from langgraph.store.base.batch import (
     AsyncBatchedBaseStore,
     Op,
@@ -439,6 +448,10 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
     """
     This gives persistence of memory directly into Bigquery.
     """
+    # We don't currently implement TTL semantics end-to-end in BigQuery.
+    # Keep this False so BaseStore.put enforces correctness.
+    supports_ttl: bool = False
+
     def __init__(
         self,
         vectorstore: PatchedBigQueryVectorStore,
@@ -457,8 +470,12 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         try:
             super().__init__()
         except RuntimeError:
-            self._loop = None
-            self._task = None
+            # We intentionally do not rely on AsyncBatchedBaseStore's
+            # background queue here. This store may be constructed in a
+            # worker thread with no running loop.
+            self._loop = None  # type: ignore[assignment]
+            self._task = None  # type: ignore[assignment]
+            self._aqueue = None  # type: ignore[assignment]
 
         self.vectorstore = vectorstore
         self.content_field = content_field
@@ -520,8 +537,11 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         value: dict[str, Any],
         index: Optional[Union[Literal[False], list[str]]] = None,
         *,
-        ttl: Optional[float] = None,
+        ttl: float | None | NotProvided = NOT_PROVIDED,
     ) -> None:
+        # Validate namespace consistently with BaseStore expectations
+        _validate_namespace(namespace)
+
         logger.info(
             "[aput] Inserting doc_id=%s into namespace=%s",
             key,
@@ -753,8 +773,19 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             return ex.submit(_thread_runner).result()
 
     async def adelete(self, namespace: Tuple[str, ...], key: str) -> None:
-        logger.info(f"[adelete] Deleting doc_id={key} from namespace={namespace}")
-        await self.vectorstore.adelete(ids=[key])
+        logger.info("[adelete] Deleting doc_id=%s from namespace=%s", key, namespace)
+
+        adelete = getattr(self.vectorstore, "adelete", None)
+        if callable(adelete):
+            await adelete(ids=[key])  # type: ignore[misc]
+            return
+
+        delete = getattr(self.vectorstore, "delete", None)
+        if not callable(delete):
+            raise NotImplementedError("Vector store does not support delete/adelete")
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, delete, [key])
 
     def mget(self, keys: Sequence[str]) -> List[Optional[dict]]:
         """
@@ -871,9 +902,85 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         return self.vectorstore.yield_keys(prefix=prefix)
 
     async def ayield_keys(self, prefix: Optional[str] = None) -> AsyncIterator[str]:
-        "yields keys"
-        async for key in self.vectorstore.yield_keys(prefix=prefix):
+        """
+        Async adapter for yield_keys.
+        BigQueryVectorStore.yield_keys is synchronous; offload collection.
+        """
+        loop = asyncio.get_running_loop()
+        keys = await loop.run_in_executor(
+            None, lambda: list(self.vectorstore.yield_keys(prefix=prefix))
+        )
+        for key in keys:
             yield key
+
+    # ---------------------------------------------------------------------
+    # Sync API: override AsyncBatchedBaseStore wrappers.
+    #
+    # We cannot rely on AsyncBatchedBaseStore._loop because this store may be
+    # constructed in a worker thread (no running loop). These overrides ensure
+    # callers never hit run_coroutine_threadsafe(..., None).
+    # ---------------------------------------------------------------------
+
+    def batch(self, ops: IterableABC[Op]) -> list[Result]:
+        async def _runner() -> list[Result]:
+            return await self.abatch(ops)
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(_runner())
+
+        def _thread_runner() -> list[Result]:
+            new_loop = asyncio.new_event_loop()
+            try:
+                asyncio.set_event_loop(new_loop)
+                return new_loop.run_until_complete(_runner())
+            finally:
+                new_loop.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            return ex.submit(_thread_runner).result()
+
+    def get(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        *,
+        refresh_ttl: bool | None = None,
+    ) -> Item | None:
+        return BaseStore.get(self, namespace, key, refresh_ttl=refresh_ttl)
+
+    def put(
+        self,
+        namespace: tuple[str, ...],
+        key: str,
+        value: dict[str, Any],
+        index: Literal[False] | list[str] | None = None,
+        *,
+        ttl: float | None | NotProvided = NOT_PROVIDED,
+    ) -> None:
+        return BaseStore.put(self, namespace, key, value, index=index, ttl=ttl)
+
+    def delete(self, namespace: tuple[str, ...], key: str) -> None:
+        return BaseStore.delete(self, namespace, key)
+
+    def list_namespaces(
+        self,
+        *,
+        prefix: NamespacePath | None = None,
+        suffix: NamespacePath | None = None,
+        max_depth: int | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[tuple[str, ...]]:
+        return BaseStore.list_namespaces(
+            self,
+            prefix=prefix,
+            suffix=suffix,
+            max_depth=max_depth,
+            limit=limit,
+            offset=offset,
+        )
 
     async def abatch(self, ops: Iterable[Op]) -> List[Result]:
         ops_list = list(ops)
