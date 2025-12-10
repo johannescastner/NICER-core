@@ -1,6 +1,7 @@
 """
 this is where globals are defined and configured.
 """
+
 # src/langgraph_slack/config.py
 import logging
 import os
@@ -86,7 +87,7 @@ SUPERSET_RUN_SERVICE_ACCOUNT = (
     or SERVICE_ACCOUNT_EMAIL
     or ""
 )
- 
+
 # ───────────────────── Superset Configuration ─────────────────────
 #
 # We treat Superset as a sibling service to the LangGraph deployment.
@@ -133,9 +134,25 @@ SUPERSET_REGION = (
 # URL of the Superset instance (set after deploy)
 SUPERSET_URL = environ.get("SUPERSET_URL", "")
 
- 
 # Secret Manager secret IDs (used by provisioning script).
 # These are names/IDs, not secret values.
+# Google OAuth secret IDs (used by provisioning script)
+# These map to container env vars GOOGLE_KEY/GOOGLE_SECRET per Superset docs.
+SUPERSET_GOOGLE_KEY_SECRET_NAME = environ.get(
+    "SUPERSET_GOOGLE_KEY_SECRET_NAME",
+    f"superset-google-key--{SUPERSET_TENANT}",
+)
+SUPERSET_GOOGLE_SECRET_SECRET_NAME = environ.get(
+    "SUPERSET_GOOGLE_SECRET_SECRET_NAME",
+    f"superset-google-secret--{SUPERSET_TENANT}",
+)
+
+# Optional hosted-domain restriction for Google OAuth
+SUPERSET_OAUTH_AUTH_DOMAIN = environ.get("SUPERSET_OAUTH_AUTH_DOMAIN", "")
+
+# Auth mode runtime toggle (db|google)
+SUPERSET_AUTH_TYPE = (environ.get("SUPERSET_AUTH_TYPE", "db") or "db").lower().strip()
+
 SUPERSET_SECRET_KEY_SECRET_NAME = environ.get(
     "SUPERSET_SECRET_KEY_SECRET_NAME",
     f"superset-secret-key--{SUPERSET_TENANT}",
@@ -179,11 +196,11 @@ SUPERSET_REDIS_PORT = int(environ.get("SUPERSET_REDIS_PORT", "6379"))
 # ---------- Image / Service naming ----------
 SUPERSET_IMAGE_NAME = environ.get(
     "SUPERSET_IMAGE_NAME",
-    f"superset-{SUPERSET_TENANT}",
+    f"collectiwise-{SUPERSET_TENANT}",
 )
 SUPERSET_CLOUDRUN_SERVICE_NAME = environ.get(
     "SUPERSET_CLOUDRUN_SERVICE_NAME",
-    f"superset-{SUPERSET_TENANT}",
+    f"collectiwise-{SUPERSET_TENANT}",
 )
 
 # Optional: BigQuery database id to use inside Superset for tool defaults
@@ -205,6 +222,13 @@ def superset_config_ok() -> bool:
         LOGGER.warning("SUPERSET_SECRET_KEY not set.")
     if not PROJECT_ID or PROJECT_ID == "default_project_id":
         LOGGER.warning("GCP_PROJECT_ID not set for Superset provisioning.")
+
+    if SUPERSET_AUTH_TYPE == "google":
+        if not SUPERSET_GOOGLE_KEY_SECRET_NAME:
+            LOGGER.warning("SUPERSET_GOOGLE_KEY_SECRET_NAME not set.")
+        if not SUPERSET_GOOGLE_SECRET_SECRET_NAME:
+            LOGGER.warning("SUPERSET_GOOGLE_SECRET_SECRET_NAME not set.")
+
     return True
 
 
