@@ -77,7 +77,14 @@ SERVICE_ACCOUNT_EMAIL = (
     if isinstance(SERVICE_ACCOUNT_INFO, dict)
     else None
 )
-
+if SERVICE_ACCOUNT_EMAIL:
+    LOGGER.info("Derived service account email from GCP_SERVICE_ACCOUNT_BASE64: %s",
+                SERVICE_ACCOUNT_EMAIL)
+else:
+    LOGGER.warning(
+        "SERVICE_ACCOUNT_EMAIL could not be derived from GCP_SERVICE_ACCOUNT_BASE64; "
+        "Superset deployment will fail if this is required."
+    )
 # ───────────────────── Superset Configuration ─────────────────────
 
 # Service account used by the Superset Cloud Run service at runtime.
