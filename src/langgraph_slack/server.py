@@ -4,9 +4,11 @@ import src.langgraph_slack.patch_typing  # must run before any Pydantic model lo
 import asyncio
 from fastapi.middleware.cors import CORSMiddleware
 import logging
+import os
 import re
 import json
 import uuid
+from urllib.parse import urlparse
 from typing import Awaitable, Callable
 from typing_extensions import TypedDict
 from contextlib import asynccontextmanager
@@ -24,11 +26,35 @@ GRAPH_CONFIG = (
     json.loads(config.CONFIG) if isinstance(config.CONFIG, str) else config.CONFIG
 )
 
-ALLOWED_ORIGINS = [
+def _origin_from_url(url: str | None) -> str | None:
+    """Return 'scheme://host[:port]' from a URL, or None if invalid/empty."""
+    if not url:
+        return None
+    try:
+        u = urlparse(url)
+        if not u.scheme or not u.netloc:
+            return None
+        return f"{u.scheme}://{u.netloc}"
+    except Exception:
+        return None
+
+ALLOWED_ORIGINS: list[str] = [
     "https://smith.langchain.com",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
+
+# Optional: auto-allow whatever DEPLOYMENT_URL is (useful in Cloud Run / dev)
+_deployment_origin = _origin_from_url(getattr(config, "DEPLOYMENT_URL", None))
+if _deployment_origin and _deployment_origin not in ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS.append(_deployment_origin)
+
+# Allow dynamic Cloudflare tunnel origins for `langgraph dev --tunnel`.
+# You can override this via env if you ever want to tighten/expand it.
+ALLOW_ORIGIN_REGEX = os.getenv(
+    "ALLOW_ORIGIN_REGEX",
+    r"^https://[a-z0-9-]+\.trycloudflare\.com$",
+)
 
 USER_NAME_CACHE: dict[str, str] = {}
 TASK_QUEUE: asyncio.Queue = asyncio.Queue()
@@ -274,19 +300,24 @@ async def lifespan(app: FastAPI):
     defines the lifespan for the app
     """
     LOGGER.info("App is starting up. Creating background worker...")
-    loop = asyncio.get_running_loop()
-    worker_task = loop.create_task(worker())
-    yield
-    LOGGER.info("App is shutting down. Stopping background worker...")
-    await TASK_QUEUE.put(None)  # Send sentinel to worker
-    await worker_task  # Wait for the worker to exit
-
+    worker_task = asyncio.create_task(worker(), name="slack_background_worker")
+    try:
+        yield
+    finally:
+        LOGGER.info("App is shutting down. Stopping background worker...")
+        await TASK_QUEUE.put(None)  # Send sentinel to worker
+        try:
+            await worker_task  # Wait for the worker to exit
+        except asyncio.CancelledError:
+            # During reload/shutdown, cancellation is normal.
+            pass
 
 APP = FastAPI(lifespan=lifespan)
 
 APP.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOW_ORIGIN_REGEX,
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,

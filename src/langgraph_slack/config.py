@@ -6,6 +6,7 @@ this is where globals are defined and configured.
 import logging
 import os
 import base64
+from typing import Optional
 import json
 import importlib
 import re
@@ -420,18 +421,22 @@ def switch_provider(provider, model_type="chat"):
         DEFAULT_MODEL
     )
 
+
 # LangSmith configuration ------------------------------------------------------
-# LangSmith configuration ------------------------------------------------------
-# IMPORTANT:
-# - In managed runtimes (LangGraph Cloud), let the LangSmith SDK read the injected key
-#   (e.g. LANGCHAIN_API_KEY) by NOT passing api_key explicitly.
-# - In local DEV, keep supporting explicit LANGSMITH_API_KEY for backwards compatibility.
-LANGSMITH_API_KEY = environ.get("LANGSMITH_API_KEY") if ENVIRONMENT == "DEV" else None
-LANGSMITH_PROJECT = (
-    environ.get("LANGSMITH_PROJECT")
-    or environ.get("LANGCHAIN_PROJECT")
-    or "baby-NICER-61"
-)
+#
+# DEV: you likely run against your personal LangSmith account -> key required.
+# PROD (LangGraph Cloud / managed): do NOT override; let the SDK/platform resolve.
+#
+# Note: langsmith-sdk commonly uses env-driven auth; avoid forcing a specific env
+# name in production when the platform injects its own.  [oai_citation:1‡GitHub](https://github.com/langchain-ai/langsmith-sdk/issues/699)
+if ENVIRONMENT == "DEV":
+    LANGSMITH_API_KEY: Optional[str] = (
+        environ.get("LANGSMITH_API_KEY") or environ.get("LANGCHAIN_API_KEY")
+    )
+else:
+    LANGSMITH_API_KEY = None
+
+LANGSMITH_PROJECT = environ.get("LANGSMITH_PROJECT", "baby-NICER-61")
 WRITE_METADATA = True
 # ───── Hugging Face / Transformers cache configuration ─────
 # Prefer explicit per-library cache envs when present. Otherwise, derive from HF_HOME.
