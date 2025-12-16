@@ -2,7 +2,7 @@
 """This is the slack server interface"""
 import src.langgraph_slack.patch_typing  # must run before any Pydantic model loading
 import asyncio
-from fastapi.middleware.cors import CORSMiddleware
+import contextlib
 import logging
 import os
 import re
@@ -19,6 +19,7 @@ from slack_bolt.async_app import AsyncApp
 from langgraph_slack import config
 # Ambient HTTP endpoints (closed-source)
 from pro.http.ambient import router as ambient_router
+from pro.persistence import close_persistence_manager
 
 LOGGER = logging.getLogger(__name__)
 LANGGRAPH_CLIENT = get_client(url=config.LANGGRAPH_URL)
@@ -293,36 +294,66 @@ APP_HANDLER.app.event("app_mention")(
     lazy=[],
 )
 
+def _log_task_result(task: asyncio.Task) -> None:
+    """Ensure background task exceptions don't get swallowed."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        LOGGER.exception("Background worker crashed", exc_info=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     defines the lifespan for the app
     """
+    worker_task: asyncio.Task | None = None
     LOGGER.info("App is starting up. Creating background worker...")
-    worker_task = asyncio.create_task(worker(), name="slack_background_worker")
     try:
+        # Everything before the first `yield` is "startup".
+        # If anything fails here, asynccontextmanager otherwise surfaces only
+        # "RuntimeError: generator didn't yield" without the root cause.
+        worker_task = asyncio.create_task(worker(), name="slack_background_worker")
+        worker_task.add_done_callback(_log_task_result)
         yield
+    except Exception:
+        # This is the money line: you'll now see the real startup exception.
+        LOGGER.exception("❌ Lifespan failed (startup or runtime) before/around yield", exc_info=True)
+        raise
     finally:
         LOGGER.info("App is shutting down. Stopping background worker...")
-        await TASK_QUEUE.put(None)  # Send sentinel to worker
+        # Stop worker
         try:
-            await worker_task  # Wait for the worker to exit
-        except asyncio.CancelledError:
-            # During reload/shutdown, cancellation is normal.
-            pass
+            await TASK_QUEUE.put(None)  # sentinel
+        except Exception:
+            LOGGER.exception("Failed to enqueue worker sentinel", exc_info=True)
+
+        if worker_task is not None:
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                LOGGER.exception("Worker raised during shutdown", exc_info=True)
+
+        # Close persistence (moved off atexit; safe to no-op if never created)
+        try:
+            close_persistence_manager()
+        except Exception:
+            LOGGER.exception("Failed to close persistence manager on shutdown", exc_info=True)
 
 APP = FastAPI(lifespan=lifespan)
 
-APP.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=ALLOW_ORIGIN_REGEX,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=True,
-    max_age=600,
-)
+@APP.middleware("http")
+async def _log_origin(request: Request, call_next):
+    origin = request.headers.get("origin")
+    if origin:
+        LOGGER.info("HTTP Origin=%s %s %s", origin, request.method, request.url.path)
+    return await call_next(request)
+
+# NOTE: Studio/Agent-Server CORS is controlled by langgraph.json -> http.cors.
+# This middleware only affects routes served by this FastAPI app.
 @APP.post("/")
 async def verify_slack(req: Request):
     """
