@@ -2,6 +2,7 @@
 """This is the slack server interface"""
 import src.langgraph_slack.patch_typing  # must run before any Pydantic model loading
 import asyncio
+from fastapi.middleware.cors import CORSMiddleware
 import logging
 import re
 import json
@@ -22,6 +23,12 @@ LANGGRAPH_CLIENT = get_client(url=config.LANGGRAPH_URL)
 GRAPH_CONFIG = (
     json.loads(config.CONFIG) if isinstance(config.CONFIG, str) else config.CONFIG
 )
+
+ALLOWED_ORIGINS = [
+    "https://smith.langchain.com",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
 
 USER_NAME_CACHE: dict[str, str] = {}
 TASK_QUEUE: asyncio.Queue = asyncio.Queue()
@@ -277,6 +284,14 @@ async def lifespan(app: FastAPI):
 
 APP = FastAPI(lifespan=lifespan)
 
+APP.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+    max_age=600,
+)
 @APP.post("/")
 async def verify_slack(req: Request):
     """

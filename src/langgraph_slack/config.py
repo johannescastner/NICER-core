@@ -17,7 +17,7 @@ from .deepseek_utils import (
     BackoffConfig,
 )
 LOGGER = logging.getLogger(__name__)
-
+ENVIRONMENT = (environ.get("ENVIRONMENT", "PROD") or "PROD").upper()
 if DEPLOY_MODAL := environ.get("DEPLOY_MODAL"):
     DEPLOY_MODAL = DEPLOY_MODAL.lower() == "true"
 BOT_USER_ID = environ.get("SLACK_BOT_USER_ID")
@@ -421,8 +421,17 @@ def switch_provider(provider, model_type="chat"):
     )
 
 # LangSmith configuration ------------------------------------------------------
-LANGSMITH_API_KEY = environ.get("LANGSMITH_API_KEY")
-LANGSMITH_PROJECT = environ.get("LANGSMITH_PROJECT", "baby-NICER-61")
+# LangSmith configuration ------------------------------------------------------
+# IMPORTANT:
+# - In managed runtimes (LangGraph Cloud), let the LangSmith SDK read the injected key
+#   (e.g. LANGCHAIN_API_KEY) by NOT passing api_key explicitly.
+# - In local DEV, keep supporting explicit LANGSMITH_API_KEY for backwards compatibility.
+LANGSMITH_API_KEY = environ.get("LANGSMITH_API_KEY") if ENVIRONMENT == "DEV" else None
+LANGSMITH_PROJECT = (
+    environ.get("LANGSMITH_PROJECT")
+    or environ.get("LANGCHAIN_PROJECT")
+    or "baby-NICER-61"
+)
 WRITE_METADATA = True
 # ───── Hugging Face / Transformers cache configuration ─────
 # Prefer explicit per-library cache envs when present. Otherwise, derive from HF_HOME.
