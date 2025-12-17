@@ -198,29 +198,14 @@ class ConversationLogger:
         # Thread-safety for lazy initialisation
         self._embed_lock = threading.Lock()
         self._pipeline_lock = threading.Lock()
-        # background warmup task (optional best-effort)
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self._warmup_models())
-        except RuntimeError:
-            # no running loop (e.g., sync startup) – warm up in a thread quietly
-            threading.Thread(target=lambda: asyncio.run(self._warmup_models()),
-                             name="convlog-warmup", daemon=True).start()
 
-        logger.info("ConversationLogger initialized for project %s",
-                    self.project_id
-        )
-        # Opportunistic background warmup to shave first-turn latency.
+        # ✅ BLOCKING WARMUP: Load all models during initialization
+        # This prevents the first turn from timing out while downloading models
+        logger.info("🔄 Loading HuggingFace models (this may take a few minutes on first run)...")
+        self._warmup_models_sync()
+        logger.info("✅ All models loaded and ready")
 
-        if os.getenv("CONV_LOGGER_WARMUP", "1") == "1":
-            try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self._warmup_async())
-            except RuntimeError:
-                threading.Thread(
-                    target=lambda: asyncio.run(self._warmup_async()),
-                    daemon=True
-                ).start()
+        logger.info("ConversationLogger initialized for project %s", self.project_id)
 
     # -------- Lazy constructors (first-use load, then reuse) --------
     def _ensure_embedding_model(self) -> SentenceTransformer:
@@ -237,7 +222,7 @@ class ConversationLogger:
                             self._embedding_model = SentenceTransformer(
                                 "sentence-transformers/all-MiniLM-L6-v2"
                             )
-                        logger.info("✅ SBERT embedding model ready (lazy)")
+                        logger.info("✅ SBERT embedding model ready")
                     except Exception as e:
                         logger.warning("⚠️ Failed to init embedding model: %s", e, exc_info=True)
                         raise
@@ -261,7 +246,7 @@ class ConversationLogger:
                         return_all_scores=True,
                         **pipe_kwargs,
                     )
-                    logger.info("✅ Sentiment pipeline ready (lazy)")
+                    logger.info("✅ Sentiment pipeline ready")
                 except Exception as e:
                     logger.warning("⚠️ Sentiment pipeline load failed: %s", e, exc_info=True)
             if self._formality_classifier is None:
@@ -272,7 +257,7 @@ class ConversationLogger:
                         return_all_scores=True,
                         **pipe_kwargs,
                     )
-                    logger.info("✅ Formality pipeline ready (lazy)")
+                    logger.info("✅ Formality pipeline ready")
                 except Exception as e:
                     logger.warning("⚠️ Formality pipeline load failed: %s", e, exc_info=True)
             if self._emotion_classifier is None:
@@ -283,22 +268,46 @@ class ConversationLogger:
                         return_all_scores=True,
                         **pipe_kwargs,
                     )
-                    logger.info("✅ Emotion pipeline ready (lazy)")
+                    logger.info("✅ Emotion pipeline ready")
                 except Exception as e:
                     logger.warning("⚠️ Emotion pipeline load failed: %s", e, exc_info=True)
 
-    async def _warmup_models(self) -> None:
+    def _warmup_models_sync(self) -> None:
         """
-        Non-blocking warmup: spin the HF pipelines and SBERT once to populate caches.
+        ✅ SYNCHRONOUS MODEL WARMUP
+        
+        Loads all HuggingFace models during initialization.
+        This blocks __init__ but ensures the first turn never times out.
+        
+        Models loaded (total ~1.5GB on first run):
+        1. sentence-transformers/all-MiniLM-L6-v2 (~90MB)
+        2. cardiffnlp/twitter-roberta-base-sentiment-latest (~500MB)
+        3. s-nlp/roberta-base-formality-ranker (~500MB)
+        4. SamLowe/roberta-base-go_emotions (~500MB)
         """
         try:
-            await asyncio.to_thread(self._ensure_tone_pipelines)
-            await asyncio.to_thread(self._ensure_embedding_model)
-            # tiny dry-run to ensure model weights are loaded into memory
-            _ = await asyncio.to_thread(self.generate_embedding, "warmup")
-            logger.info("🔋 ConversationLogger warm-up complete")
+            # Load all 3 tone analysis pipelines
+            logger.info("📥 Loading tone analysis pipelines...")
+            self._ensure_tone_pipelines()
+            
+            # Load embedding model
+            logger.info("📥 Loading embedding model...")
+            self._ensure_embedding_model()
+            
+            # Dry-run to ensure model weights are fully loaded into memory
+            logger.info("🔄 Running warmup inference...")
+            _ = self.generate_embedding("warmup test sentence for model initialization")
+            
+            logger.info("🔋 ConversationLogger warmup complete - all models ready")
         except Exception as e:
-            logger.debug("Warm-up skipped/failed: %s", e)
+            logger.error("❌ Model warmup failed: %s", e, exc_info=True)
+            raise
+
+    async def _warmup_models(self) -> None:
+        """
+        Async variant (kept for compatibility but now just wraps sync version).
+        """
+        await asyncio.to_thread(self._warmup_models_sync)
 
     def analyze_turn_tone(
             self,
@@ -488,13 +497,8 @@ class ConversationLogger:
             return []
 
     async def _warmup_async(self) -> None:
-        """Pre-initialize embedding model and HF pipelines."""
-        try:
-            await asyncio.to_thread(self._ensure_tone_pipelines)
-            await asyncio.to_thread(self._ensure_embedding_model)
-            logger.info("✅ ConversationLogger warmup complete")
-        except Exception as exc:
-            logger.debug("Warmup skipped/failed: %s", exc, exc_info=True)
+        """Pre-initialize embedding model and HF pipelines (async wrapper)."""
+        await asyncio.to_thread(self._warmup_models_sync)
 
     async def log_turn(
             self,
@@ -555,6 +559,7 @@ class ConversationLogger:
                 max_chars
             )
         # 🎯 APPLY TONE ANALYSIS (off the event loop)
+        # Models are already loaded during __init__, so this is fast
         tone_analysis = await asyncio.to_thread(
             self.analyze_turn_tone,
             safe_content,
@@ -745,7 +750,7 @@ class ConversationLogger:
         """
         Conversation lifecycle hook (currently a no-op).
 
-        TODO: When we formalise “conversation sessions” at the swarm level,
+        TODO: When we formalise "conversation sessions" at the swarm level,
         this is where we should:
           • Persist a lifecycle row (conversation_id, start_time, end_time, status).
           • Apply the 5-minute idle handoff rule:
@@ -753,7 +758,7 @@ class ConversationLogger:
                   (or any future specialist), mark the old conversation as
                   ended and start a new conversation_id for the new agent.
                 - Likewise when control is handed back to chat_pro.
-          • Allow explicit “end” signals from UX (e.g. user clicks “End session”).
+          • Allow explicit "end" signals from UX (e.g. user clicks "End session").
         
         For now, logging remains purely turn-based and status is inferred
         from turns/metrics.
@@ -787,7 +792,7 @@ class ConversationLogger:
             conversation_id: str
     ) -> Dict[str, Any]:
         """
-        Delegate “summary view” construction to PM (which already implements it).
+        Delegate "summary view" construction to PM (which already implements it).
         This keeps the logger focused on building artifacts, not querying stores.
         """
         return await self.pm.get_conversation_summary(conversation_id)
@@ -851,7 +856,7 @@ class ConversationLogger:
                     data.get("turn_id"),
                 )
             elif isinstance(ne, str):
-                # ensure it’s valid JSON; if not, we’ll drop it below
+                # ensure it's valid JSON; if not, we'll drop it below
                 json.loads(ne)
                 data["nuanced_emotions"] = ne
                 logger.debug(
@@ -868,7 +873,7 @@ class ConversationLogger:
                     json_str[:500],
                 )
         except Exception as exc:
-            # If anything goes wrong, don’t block the graph – just drop the field.
+            # If anything goes wrong, don't block the graph – just drop the field.
             logger.warning(
                 "ConversationLogger._store_turn: failed to serialise nuanced_emotions; "
                 "dropping field for turn_id=%s: %s",
