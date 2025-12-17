@@ -4,7 +4,7 @@ This is where authentication lives
 import logging
 import os
 import ipaddress
-from typing import Any, Mapping, Optional
+from typing import Any, Optional
 from langgraph_sdk import Auth
 
 # Configure logging
@@ -114,9 +114,20 @@ async def authenticate(request, path, headers, method):
     dbg = _collect_debug(headers, request, path=path, method=method)
     logger.info("auth.authenticate called", extra=dbg)
 
-    # Always allow CORS preflight
+    # ─────────────────────────────────────────────────────────────
+    # 0) ALWAYS allow CORS preflight first (before any other checks)
+    # ─────────────────────────────────────────────────────────────
     if method in (b"OPTIONS", "OPTIONS"):
+        logger.info("auth: CORS preflight allowed", extra=dbg)
         return {"identity": "cors-preflight", "permissions": ["read", "write"]}
+
+    # ─────────────────────────────────────────────────────────────
+    # 0.5) DEV MODE: Allow everything immediately in DEV
+    # This MUST come before any denials so DEV never blocks
+    # ─────────────────────────────────────────────────────────────
+    if environment == "DEV":
+        logger.info("auth: DEV mode - allowing all requests", extra=dbg)
+        return {"identity": "dev-user", "permissions": ["read", "write"]}
 
     # Normalize common fields
     user_agent = _hget(headers, "user-agent")
@@ -125,17 +136,16 @@ async def authenticate(request, path, headers, method):
         or _hget(headers, "Origin")
     )
     ua_s = _to_str(user_agent)
-    origin_s = origin if origin in STUDIO_ORIGINS else _to_str(origin)
+    origin_s = _to_str(origin)  # Always convert to string for comparison
+    
+    # Log origin for CORS debugging
+    logger.info(f"auth: Checking origin={origin_s!r} ua={ua_s[:50]!r}", extra=dbg)
 
     # ─────────────────────────────────────────────────────────────
-    # 1) PROD FIX: allow internal/queue calls (loopback/private IP)
-    # Many deployments have internal worker/queue components calling the
-    # API over 127.0.0.1 / private network and they won't have Slackbot UA
-    # or Studio Origin headers.
+    # 1) PROD: allow internal/queue calls (loopback/private IP)
     # ─────────────────────────────────────────────────────────────
     client_ip = dbg.get("client_ip") or ""
     xff = _to_str(_hget(headers, "x-forwarded-for"))
-    # x-forwarded-for may contain a chain: "client, proxy1, proxy2"
     xff_first = (xff.split(",")[0].strip() if xff else "")
 
     if _is_private_or_loopback_ip(client_ip) or _is_private_or_loopback_ip(xff_first):
@@ -143,24 +153,15 @@ async def authenticate(request, path, headers, method):
         return {"identity": "internal", "permissions": ["read", "write"]}
 
     # ─────────────────────────────────────────────────────────────
-    # 2) Allow LangSmith Studio by Origin (you already do this)
-    # Note: LangGraph supports Studio access even with custom auth; you can
-    # disable that via disable_studio_auth if you want.  [oai_citation:1‡LangChain Docs](https://docs.langchain.com/langsmith/set-up-custom-auth)
+    # 2) Allow LangSmith Studio by Origin
+    # Check BOTH the raw origin and the string-normalized version
     # ─────────────────────────────────────────────────────────────
-    if origin in STUDIO_ORIGINS:
-        logger.info("auth: Studio origin allowed", extra=dbg)
+    if origin in STUDIO_ORIGINS or origin_s in STUDIO_ORIGINS or origin_s == "https://smith.langchain.com":
+        logger.info(f"auth: Studio origin allowed (origin={origin_s!r})", extra=dbg)
         return {"identity": "studio-user", "permissions": ["read", "write"]}
 
     # ─────────────────────────────────────────────────────────────
-    # 3) DEV convenience: allow everything (but log it explicitly)
-    # ─────────────────────────────────────────────────────────────
-    if environment == "DEV":
-        logger.info("auth: DEV mode allow", extra=dbg)
-        return {"identity": "dev-user", "permissions": ["read", "write"]}
-
-    # ─────────────────────────────────────────────────────────────
-    # 4) PROD external policy:
-    #    - Slackbot UA path OR (optionally) shared API key header.
+    # 3) PROD external policy: Slackbot UA OR API key
     # ─────────────────────────────────────────────────────────────
     if ua_s.startswith("Slackbot"):
         logger.info("auth: Slackbot UA allowed", extra=dbg)
@@ -173,13 +174,11 @@ async def authenticate(request, path, headers, method):
         return {"identity": "api-key", "permissions": ["read", "write"]}
 
     # ─────────────────────────────────────────────────────────────
-    # 5) Deny with a *stack trace* + a clean 401.
-    # LangGraph custom auth supports raising an HTTPException for denial.  [oai_citation:2‡LangChain Docs](https://docs.langchain.com/langsmith/set-up-custom-auth)
+    # 4) Deny with detailed logging
     # ─────────────────────────────────────────────────────────────
-    try:
-        raise PermissionError("Auth denied")
-    except PermissionError:
-        logger.exception("auth: DENY", extra=dbg)
+    logger.error(
+        f"auth: DENY - origin={origin_s!r} ua={ua_s[:100]!r} client_ip={client_ip!r}",
+        extra=dbg
+    )
 
     raise auth.exceptions.HTTPException(status_code=401, detail="Unauthorized")
-
