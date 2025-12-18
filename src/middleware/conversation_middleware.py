@@ -24,19 +24,9 @@ from langchain_core.messages import (
 )
 from langchain_core.runnables import RunnableConfig
 
-from src.logging.conversation_logger import ConversationLogger
+from src.logging import get_conversation_logger
 
 _logger = logging.getLogger(__name__)
-
-@lru_cache(maxsize=1)
-def get_conversation_logger() -> ConversationLogger:
-    """
-    Get a process-wide ConversationLogger instance.
-
-    lru_cache gives us lazy, thread-safe singleton semantics
-    without using a module-level mutable global + global statement.
-    """
-    return ConversationLogger()
  
 def _dict_role(m: dict) -> str | None:
     # Support common shapes: {"role": "user"}, {"type": "human"}, etc.
