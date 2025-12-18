@@ -1,3 +1,4 @@
+# src/langgraph_slack/auth.py
 """
 This is where authentication lives
 """
@@ -110,6 +111,9 @@ async def authenticate(request, path, headers, method):
     """
     authentication function for langgraph
     """
+    # 🔥 DIAGNOSTIC: Print to console (bypasses logging config issues)
+    print(f"🔥 AUTH CALLED: method={_to_str(method)} path={_to_str(path)}")
+    
     dbg = _collect_debug(headers, request, path=path, method=method)
     logger.info("auth.authenticate called", extra=dbg)
 
@@ -117,6 +121,7 @@ async def authenticate(request, path, headers, method):
     # 0) ALWAYS allow CORS preflight first (before any other checks)
     # ─────────────────────────────────────────────────────────────
     if method in (b"OPTIONS", "OPTIONS"):
+        print(f"🔥 AUTH: Allowing CORS preflight")
         logger.info("auth: CORS preflight allowed", extra=dbg)
         return {"identity": "cors-preflight", "permissions": ["read", "write"]}
 
@@ -125,6 +130,7 @@ async def authenticate(request, path, headers, method):
     # This MUST come before any denials so DEV never blocks
     # ─────────────────────────────────────────────────────────────
     if environment == "DEV":
+        print(f"🔥 AUTH: DEV mode - allowing all requests")
         logger.info("auth: DEV mode - allowing all requests", extra=dbg)
         return {"identity": "dev-user", "permissions": ["read", "write"]}
 
@@ -137,6 +143,8 @@ async def authenticate(request, path, headers, method):
     ua_s = _to_str(user_agent)
     origin_s = _to_str(origin)  # Always convert to string for comparison
     
+    print(f"🔥 AUTH: Checking origin={origin_s!r} ua={ua_s[:50]!r}")
+    
     # Log origin for CORS debugging
     logger.info(f"auth: Checking origin={origin_s!r} ua={ua_s[:50]!r}", extra=dbg)
 
@@ -148,6 +156,7 @@ async def authenticate(request, path, headers, method):
     xff_first = (xff.split(",")[0].strip() if xff else "")
 
     if _is_private_or_loopback_ip(client_ip) or _is_private_or_loopback_ip(xff_first):
+        print(f"🔥 AUTH: Allowing internal request (client_ip={client_ip})")
         logger.info("auth: internal request allowed (loopback/private)", extra=dbg)
         return {"identity": "internal", "permissions": ["read", "write"]}
 
@@ -156,6 +165,7 @@ async def authenticate(request, path, headers, method):
     # Check BOTH the raw origin and the string-normalized version
     # ─────────────────────────────────────────────────────────────
     if origin in STUDIO_ORIGINS or origin_s in STUDIO_ORIGINS or origin_s == "https://smith.langchain.com":
+        print(f"🔥 AUTH: Allowing Studio origin (origin={origin_s!r})")
         logger.info(f"auth: Studio origin allowed (origin={origin_s!r})", extra=dbg)
         return {"identity": "studio-user", "permissions": ["read", "write"]}
 
@@ -163,18 +173,21 @@ async def authenticate(request, path, headers, method):
     # 3) PROD external policy: Slackbot UA OR API key
     # ─────────────────────────────────────────────────────────────
     if ua_s.startswith("Slackbot"):
+        print(f"🔥 AUTH: Allowing Slackbot")
         logger.info("auth: Slackbot UA allowed", extra=dbg)
         return {"identity": "slackbot", "permissions": ["read", "write"]}
 
     expected = os.getenv("LANGGRAPH_API_KEY", "").strip()
     presented = _to_str(_hget(headers, "x-api-key") or _hget(headers, "X-Api-Key")).strip()
     if expected and presented and presented == expected:
+        print(f"🔥 AUTH: Allowing x-api-key")
         logger.info("auth: x-api-key allowed", extra=dbg)
         return {"identity": "api-key", "permissions": ["read", "write"]}
 
     # ─────────────────────────────────────────────────────────────
     # 4) Deny with detailed logging
     # ─────────────────────────────────────────────────────────────
+    print(f"🔥 AUTH: DENYING - origin={origin_s!r} ua={ua_s[:100]!r} client_ip={client_ip!r}")
     logger.error(
         f"auth: DENY - origin={origin_s!r} ua={ua_s[:100]!r} client_ip={client_ip!r}",
         extra=dbg
