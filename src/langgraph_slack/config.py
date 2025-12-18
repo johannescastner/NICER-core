@@ -21,7 +21,8 @@ from .deepseek_utils import (
 LOGGER = logging.getLogger(__name__)
 
 ENVIRONMENT = (environ.get("ENVIRONMENT", "PROD") or "PROD").upper()
-
+LOGGER.info("🔍 MPLCONFIGDIR env var: %s", os.environ.get("MPLCONFIGDIR"))
+LOGGER.info("🔍 MPLBACKEND env var: %s", os.environ.get("MPLBACKEND"))
 if DEPLOY_MODAL := environ.get("DEPLOY_MODAL"):
     DEPLOY_MODAL = DEPLOY_MODAL.lower() == "true"
 
