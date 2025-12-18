@@ -6,6 +6,8 @@ This module is now persistence-agnostic. It focuses on:
 1) building per-turn artifacts (tone analysis, embeddings),
 2) assembling structured payloads,
 3) delegating all storage/search/summary ops to the Persistence Manager (PM).
+
+✅ PARALLEL MODEL LOADING: Models download in background, server starts immediately
 """
 import json
 import asyncio
@@ -36,13 +38,8 @@ from src.langgraph_slack.config import (
 
 # Set up logging
 logger = logging.getLogger(__name__)
- 
+
 # ---------------- Tone analysis token caps ----------------
-# HF text-classification/sentiment pipelines accept `truncation=True`
-# and `max_length` to control tokenizer truncation. RoBERTa-family
-# checkpoints typically support up to ~512 tokens. We default lower
-# because tone signal usually saturates early, and shorter caps reduce
-# latency and memory pressure.
 _TONE_MAX_LENGTH_ENV = "CONVERSATION_TONE_MAX_TOKENS"
 _DEFAULT_TONE_MAX_LENGTH = 256
 _MIN_TONE_MAX_LENGTH = 32
@@ -52,7 +49,7 @@ def _get_tone_max_length_from_env() -> int:
     raw = os.getenv(_TONE_MAX_LENGTH_ENV, str(_DEFAULT_TONE_MAX_LENGTH))
     try:
         val = int(raw)
-    except Exception:
+    except (ValueError, TypeError):
         val = _DEFAULT_TONE_MAX_LENGTH
     if val < _MIN_TONE_MAX_LENGTH:
         return _MIN_TONE_MAX_LENGTH
@@ -63,11 +60,6 @@ def _get_tone_max_length_from_env() -> int:
 def _sanitize_for_json(value: Any) -> Any:
     """
     Best-effort sanitizer to make arbitrary nested structures JSON-safe.
-
-    - Leaves primitives as-is
-    - Converts datetimes to ISO strings
-    - Recurses into mappings/sequences
-    - Falls back to repr(...) for objects that can't be json-dumped
     """
     if value is None:
         return None
@@ -86,7 +78,7 @@ def _sanitize_for_json(value: Any) -> Any:
     try:
         json.dumps(value)
         return value
-    except TypeError:
+    except (TypeError, ValueError, OverflowError):
         return repr(value)
 
 @dataclass
@@ -107,30 +99,26 @@ class ConversationTurn:
     memory_token_length: Optional[int] = None
     full_context_content: Optional[str] = None
     # 🎯 UNIVERSAL TONE ANALYSIS: Applied to every turn regardless of agent
-    agent_name: Optional[str] = None  # Which agent spoke (if assistant)
-    sentiment_score: Optional[float] = None  # 0.0-1.0 (1.0 = very positive)
-    sentiment_label: Optional[str] = None  # POSITIVE, NEGATIVE, NEUTRAL
-    sentiment_confidence: Optional[float] = None  # Model confidence
-    formality_score: Optional[float] = None  # 0.0-1.0 (1.0 = very formal)
-    formality_label: Optional[str] = None  # FORMAL, INFORMAL
-    formality_confidence: Optional[float] = None  # Model confidence
-    professional_score: Optional[float] = None  # 0.0-1.0 (1.0 = very professional)
-    professional_label: Optional[str] = None  # PROFESSIONAL, CASUAL, INAPPROPRIATE
-    nuanced_emotions: Optional[Dict[str, Any]] = None  # Structured emotion analysis
+    agent_name: Optional[str] = None
+    sentiment_score: Optional[float] = None
+    sentiment_label: Optional[str] = None
+    sentiment_confidence: Optional[float] = None
+    formality_score: Optional[float] = None
+    formality_label: Optional[str] = None
+    formality_confidence: Optional[float] = None
+    professional_score: Optional[float] = None
+    professional_label: Optional[str] = None
+    nuanced_emotions: Optional[Dict[str, Any]] = None
 
-    thumbs_up: Optional[bool] = None  # User reaction tracking
-    thumbs_down: Optional[bool] = None  # User reaction tracking
+    thumbs_up: Optional[bool] = None
+    thumbs_down: Optional[bool] = None
     # LangSmith Feedback Scores for DSPy Metrics
-    langsmith_feedback_score: Optional[float] = None  # 0.0-1.0 from LangSmith evaluators
-    feedback_type: Optional[str] = None  # "positive", "negative", "neutral"
-    evaluation_details: Optional[str] = None  # JSON with detailed evaluation results
+    langsmith_feedback_score: Optional[float] = None
+    feedback_type: Optional[str] = None
+    evaluation_details: Optional[str] = None
 
     def to_row(self) -> Dict[str, Any]:
-        """
-        Build a BigQuery-ready row dict without deep-copying problematic
-        objects (e.g. uvloop.Loop, PGStore instances) that might live in
-        metadata / error_details / nuanced_emotions.
-        """
+        """Build a BigQuery-ready row dict."""
         data: Dict[str, Any] = {}
         for f in fields(self):
             value = getattr(self, f.name)
@@ -147,16 +135,16 @@ class ConversationMetadata:
     start_time: str
     end_time: Optional[str]
     participants: List[str]
-    conversation_type: str  # 'metadata_learning', 'testing', 'evaluation'
-    focus_area: str  # 'semantic_memory', 'ego_networks', etc.
+    conversation_type: str
+    focus_area: str
     total_turns: int
-    status: str  # 'active', 'completed', 'error'
+    status: str
     langsmith_session_id: Optional[str] = None
 
 
 class ConversationLogger:
     """
-    Comprehensive conversation logging (persistence-agnostic).
+    Comprehensive conversation logging with parallel model loading.
     """
     def __init__(
             self,
@@ -165,51 +153,47 @@ class ConversationLogger:
             langsmith_project: str = LANGSMITH_PROJECT,
             pm=None
     ):
-        """
-        Initialize the conversation logger.
-        NOTE: project_id/dataset_id/langsmith_project are no-ops here and kept only for
-        backwards compatibility with call-sites; PM owns all persistence config.
-        """
+        """Initialize the conversation logger with background model loading."""
         self.project_id = project_id
         self.dataset_id = dataset_id
         self.langsmith_project = langsmith_project
 
-        # Persistence Manager (injected or global factory)
+        # Persistence Manager
         self.pm = pm or get_persistence_manager()
- 
-        # Tone analysis token cap (configurable)
+
+        # Tone analysis token cap
         self._tone_max_length: int = _get_tone_max_length_from_env()
         logger.info("ConversationLogger tone max_length=%s (env=%s)",
                     self._tone_max_length, _TONE_MAX_LENGTH_ENV)
 
-        # --- HF cache root (managed via config) ---
-        # In Cloud, path is ephemeral; in self-hosted, point to a mounted volume.
+        # HF cache root
         self._hf_cache_dir = HF_CACHE_DIR
         if self._hf_cache_dir:
             try:
                 os.makedirs(self._hf_cache_dir, exist_ok=True)
-            except Exception as e:
+            except OSError as e:
                 logger.warning("HF cache dir %s not creatable: %s", self._hf_cache_dir, e)
 
-        # Lazy, process-lifetime caches (instantiate on first use)
+        # Lazy model caches
         self._embedding_model: Optional[SentenceTransformer] = None
         self._sentiment_classifier = None
         self._formality_classifier = None
         self._emotion_classifier = None
-        # Thread-safety for lazy initialisation
+
+        # Thread-safety
         self._embed_lock = threading.Lock()
         self._pipeline_lock = threading.Lock()
 
-        # ✅ BLOCKING WARMUP: Load all models during initialization
-        # This prevents the first turn from timing out while downloading models
-        logger.info("🔄 Loading HuggingFace models (this may take a few minutes on first run)...")
-        self._warmup_models_sync()
-        logger.info("✅ All models loaded and ready")
+        # ✅ PARALLEL BACKGROUND LOADING
+        self._models_ready = threading.Event()
+        self._loading_error: Optional[Exception] = None
+        logger.info("🚀 Starting background model loading (non-blocking)...")
+        self._start_background_loading()
 
         logger.info("ConversationLogger initialized for project %s", self.project_id)
 
-    # -------- Lazy constructors (first-use load, then reuse) --------
     def _ensure_embedding_model(self) -> SentenceTransformer:
+        """Lazy-load embedding model."""
         if self._embedding_model is None:
             with self._embed_lock:
                 if self._embedding_model is None:
@@ -224,14 +208,16 @@ class ConversationLogger:
                                 "sentence-transformers/all-MiniLM-L6-v2"
                             )
                         logger.info("✅ SBERT embedding model ready")
-                    except Exception as e:
+                    except (OSError, RuntimeError, ImportError) as e:
                         logger.warning("⚠️ Failed to init embedding model: %s", e, exc_info=True)
                         raise
         return self._embedding_model
 
     def _ensure_tone_pipelines(self) -> None:
+        """Lazy-load tone analysis pipelines."""
         if self._sentiment_classifier and self._formality_classifier and self._emotion_classifier:
             return
+
         with self._pipeline_lock:
             pipe_kwargs = {}
             if self._hf_cache_dir:
@@ -239,6 +225,7 @@ class ConversationLogger:
                     "model_kwargs": {"cache_dir": self._hf_cache_dir},
                     "tokenizer_kwargs": {"cache_dir": self._hf_cache_dir},
                 }
+            
             if self._sentiment_classifier is None:
                 try:
                     self._sentiment_classifier = pipeline(
@@ -248,8 +235,9 @@ class ConversationLogger:
                         **pipe_kwargs,
                     )
                     logger.info("✅ Sentiment pipeline ready")
-                except Exception as e:
+                except (OSError, RuntimeError, ImportError, ValueError) as e:
                     logger.warning("⚠️ Sentiment pipeline load failed: %s", e, exc_info=True)
+            
             if self._formality_classifier is None:
                 try:
                     self._formality_classifier = pipeline(
@@ -259,83 +247,104 @@ class ConversationLogger:
                         **pipe_kwargs,
                     )
                     logger.info("✅ Formality pipeline ready")
-                except Exception as e:
+                except (OSError, RuntimeError, ImportError, ValueError) as e:
                     logger.warning("⚠️ Formality pipeline load failed: %s", e, exc_info=True)
+            
             if self._emotion_classifier is None:
                 try:
                     self._emotion_classifier = pipeline(
                         "text-classification",
-                        model="SamLowe/roberta-base-go_emotions",  # multi-label
+                        model="SamLowe/roberta-base-go_emotions",
                         return_all_scores=True,
                         **pipe_kwargs,
                     )
                     logger.info("✅ Emotion pipeline ready")
-                except Exception as e:
+                except (OSError, RuntimeError, ImportError, ValueError) as e:
                     logger.warning("⚠️ Emotion pipeline load failed: %s", e, exc_info=True)
 
-    def _warmup_models_sync(self) -> None:
+    def _start_background_loading(self) -> None:
         """
-        ✅ SYNCHRONOUS MODEL WARMUP WITH GCS CACHING
-        
-        Uses GCS to cache models across deployments:
-        1. Check GCS cache → Download from GCS (30 sec)
-        2. If not in GCS → Download from HuggingFace (5-10 min) → Upload to GCS
-        3. Next deployment uses cached version (30 sec)
-        
-        Models loaded (total ~1.5GB):
-        1. sentence-transformers/all-MiniLM-L6-v2 (~90MB)
-        2. cardiffnlp/twitter-roberta-base-sentiment-latest (~500MB)
-        3. s-nlp/roberta-base-formality-ranker (~500MB)
-        4. SamLowe/roberta-base-go_emotions (~500MB)
-        
-        Set env var: HF_MODEL_CACHE_BUCKET=your-bucket-name
+        Start model loading in background thread (non-blocking).
+        Server starts immediately while models download in parallel.
         """
-        # Get GCS cache manager
-        gcs_cache = get_model_cache()
-        
-        models_to_cache = [
-            "cardiffnlp/twitter-roberta-base-sentiment-latest",
-            "s-nlp/roberta-base-formality-ranker",
-            "SamLowe/roberta-base-go_emotions",
-            "sentence-transformers/all-MiniLM-L6-v2",
-        ]
-        
-        try:
-            # Pre-download from GCS if available
-            if gcs_cache:
-                logger.info("📦 Checking GCS cache for models...")
-                for model_name in models_to_cache:
-                    gcs_cache.ensure_model_cached(model_name)
-            
-            # Load all 3 tone analysis pipelines
-            logger.info("📥 Loading tone analysis pipelines...")
-            self._ensure_tone_pipelines()
-            
-            # Load embedding model
-            logger.info("📥 Loading embedding model...")
-            self._ensure_embedding_model()
-            
-            # Dry-run to ensure model weights are fully loaded into memory
-            logger.info("🔄 Running warmup inference...")
-            _ = self.generate_embedding("warmup test sentence for model initialization")
-            
-            logger.info("🔋 ConversationLogger warmup complete - all models ready")
-            
-            # Upload to GCS for future deployments (background, non-blocking)
-            if gcs_cache:
-                logger.info("📤 Caching models to GCS for future deployments...")
-                for model_name in models_to_cache:
-                    gcs_cache.cache_model_after_download(model_name)
+        def _load_models_background():
+            try:
+                logger.info("📦 Background: Checking GCS cache...")
+                gcs_cache = get_model_cache()
                 
-        except Exception as e:
-            logger.error("❌ Model warmup failed: %s", e, exc_info=True)
-            raise
+                models_to_cache = [
+                    "cardiffnlp/twitter-roberta-base-sentiment-latest",
+                    "s-nlp/roberta-base-formality-ranker",
+                    "SamLowe/roberta-base-go_emotions",
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                ]
 
-    async def _warmup_models(self) -> None:
+                # Pre-download from GCS if available
+                if gcs_cache:
+                    logger.info("📥 Background: Downloading from GCS cache...")
+                    for model_name in models_to_cache:
+                        try:
+                            gcs_cache.ensure_model_cached(model_name)
+                        except (OSError, RuntimeError) as e:
+                            logger.warning("⚠️ GCS cache check failed for %s: %s", model_name, e)
+
+                # Load all models
+                logger.info("📥 Background: Loading tone analysis pipelines...")
+                self._ensure_tone_pipelines()
+
+                logger.info("📥 Background: Loading embedding model...")
+                self._ensure_embedding_model()
+
+                # Warmup inference
+                logger.info("🔄 Background: Running warmup inference...")
+                _ = self.generate_embedding("warmup test sentence")
+                
+                logger.info("✅ Background: All models loaded and ready!")
+                
+                # Upload to GCS for future deployments (non-blocking)
+                if gcs_cache:
+                    logger.info("📤 Background: Caching models to GCS...")
+                    for model_name in models_to_cache:
+                        try:
+                            gcs_cache.cache_model_after_download(model_name)
+                        except (OSError, RuntimeError) as e:
+                            logger.warning("⚠️ Failed to cache %s to GCS: %s", model_name, e)
+
+                # Signal completion
+                self._models_ready.set()
+
+            except (OSError, RuntimeError, ImportError) as e:
+                logger.error("❌ Background model loading failed: %s", e, exc_info=True)
+                self._loading_error = e
+                self._models_ready.set()  # Unblock waiters even on error
+
+        # Start in daemon thread
+        thread = threading.Thread(target=_load_models_background, daemon=True, name="ModelLoader")
+        thread.start()
+
+    def _wait_for_models(self, timeout: float = 600.0) -> bool:
         """
-        Async variant (kept for compatibility but now just wraps sync version).
+        Wait for background model loading to complete.
+        
+        Args:
+            timeout: Max seconds to wait (default: 10 minutes)
+            
+        Returns:
+            True if models loaded successfully, False on timeout/error
         """
-        await asyncio.to_thread(self._warmup_models_sync)
+        logger.info("⏳ Waiting for models to load (timeout=%.1fs)...", timeout)
+        ready = self._models_ready.wait(timeout=timeout)
+
+        if not ready:
+            logger.error("❌ Model loading timed out after %.1fs", timeout)
+            return False
+
+        if self._loading_error:
+            logger.error("❌ Model loading failed: %s", self._loading_error)
+            return False
+
+        logger.info("✅ Models ready!")
+        return True
 
     def analyze_turn_tone(
             self,
@@ -345,33 +354,27 @@ class ConversationLogger:
     ) -> Dict[str, Any]:
         """
         🎯 Unified tone analysis for ANY turn (human or any agent).
-
-        - Works regardless of which agent produced the message.
-        - Records `agent_name` only when `speaker == "assistant"` (aligns with BQ schema).
-        - Truncates long content defensively.
-        - Supports both return shapes from HF pipelines
-        (single dict OR list of dicts via return_all_scores=True).
-
-        Returns a dict shaped for BigQuery:
-        {
-            "agent_name": str|None,
-            "sentiment_score": float|None,
-            "sentiment_label": str|None,
-            "sentiment_confidence": float|None,
-            "formality_score": float|None,
-            "formality_label": str|None,
-            "formality_confidence": float|None,
-            "professional_score": float|None,
-            "professional_label": str|None,
-            "nuanced_emotions": {
-                "primary_emotion": str|None, "primary_confidence": float|None,
-                "secondary_emotion": str|None, "secondary_confidence": float|None,
-                "tertiary_emotion": str|None, "tertiary_confidence": float|None,
-                "all_emotions": str|None  # JSON string of {label: score}
-            } | None
-        }
+        Waits for background model loading to complete before analysis.
         """
-        # Ensure tone pipelines are available; if any fail, analysis gracefully no-ops.
+        # ✅ WAIT FOR MODELS: Block here if models still loading
+        if not self._models_ready.is_set():
+            logger.info("⏳ First turn - waiting for models to finish loading...")
+            if not self._wait_for_models():
+                logger.warning("⚠️ Models unavailable, skipping tone analysis")
+                return {
+                    "agent_name": agent_name if speaker and speaker.lower() == "assistant" else None,
+                    "sentiment_score": None,
+                    "sentiment_label": None,
+                    "sentiment_confidence": None,
+                    "formality_score": None,
+                    "formality_label": None,
+                    "formality_confidence": None,
+                    "professional_score": None,
+                    "professional_label": None,
+                    "nuanced_emotions": None,
+                }
+
+        # Ensure tone pipelines are available
         self._ensure_tone_pipelines()
         spk = (speaker or "").strip().lower()
         tone = {
@@ -390,29 +393,25 @@ class ConversationLogger:
         if not content or not content.strip():
             return tone
 
-        # 1) Truncate for model stability (char cap as a first-pass guard).
-        # Token-level safety is enforced by passing truncation/max_length to pipelines.
+        # Truncate for model stability
         text = content[:2000] if len(content) > 2000 else content
-        # NOTE: classifiers might be None; we treat that as "no-op" and keep defaults.
 
         try:
-            # ---------------------------
-            # Sentiment (defensive parse)
-            # ---------------------------
+            # Sentiment analysis
             if self._sentiment_classifier:
                 s_res = self._sentiment_classifier(
                     text,
                     truncation=True,
                     max_length=self._tone_max_length,
                 )
-                # HF shapes: [ {label, score} ]  OR  [ [ {label, score}, ... ] ]
                 candidates = []
                 if isinstance(s_res, list) and s_res:
                     first = s_res[0]
-                    if isinstance(first, list):          # return_all_scores=True
+                    if isinstance(first, list):
                         candidates = first
-                    elif isinstance(first, dict):        # default pipeline output
+                    elif isinstance(first, dict):
                         candidates = [first]
+
                 if candidates:
                     best = max(candidates, key=lambda x: x.get("score", 0.0))
                     lbl = str(best.get("label", "")).upper()
@@ -423,19 +422,16 @@ class ConversationLogger:
                         tone["sentiment_score"] = conf
                     elif lbl == "NEGATIVE":
                         tone["sentiment_score"] = 1.0 - conf
-                    else:  # NEUTRAL/OTHER
+                    else:
                         tone["sentiment_score"] = 0.5
 
-            # ---------------------------
-            # Formality (defensive parse)
-            # ---------------------------
+            # Formality analysis
             if self._formality_classifier:
                 f_res = self._formality_classifier(
                     text,
                     truncation=True,
                     max_length=self._tone_max_length,
                 )
-
                 candidates = []
                 if isinstance(f_res, list) and f_res:
                     first = f_res[0]
@@ -443,26 +439,22 @@ class ConversationLogger:
                         candidates = first
                     elif isinstance(first, dict):
                         candidates = [first]
+                
                 if candidates:
                     best = max(candidates, key=lambda x: x.get("score", 0.0))
-                    lbl_raw = str(best.get("label", ""))
-                    lbl = lbl_raw.upper()
+                    lbl = str(best.get("label", "")).upper()
                     conf = float(best.get("score", 0.0))
                     tone["formality_label"] = lbl
                     tone["formality_confidence"] = conf
                     tone["formality_score"] = conf if lbl == "FORMAL" else (1.0 - conf)
 
-            # ---------------------------------------
-            # Nuanced emotions (scores map + thresholded labels)
-            # ---------------------------------------
+            # Emotion analysis
             if self._emotion_classifier:
                 e_res = self._emotion_classifier(
                     text,
                     truncation=True,
                     max_length=self._tone_max_length,
                 )
-
-                # Expect: [ [ {label, score}, ... ] ] OR [ {label, score}, ... ]
                 emotions_all = []
                 if isinstance(e_res, list) and e_res:
                     first = e_res[0]
@@ -479,7 +471,6 @@ class ConversationLogger:
                         key=lambda x: x.get("score", 0.0),
                         reverse=True
                     )
-                    # GoEmotions is multi-label; keep thresholded labels + full score map.
                     threshold = 0.3
                     scores_map = {
                         str(e.get("label")): float(e.get("score", 0.0))
@@ -491,12 +482,10 @@ class ConversationLogger:
                     tone["nuanced_emotions"] = {
                         "labels_above_threshold": labels_above,
                         "threshold": threshold,
-                        "scores": scores_map  # BigQuery JSON column
+                        "scores": scores_map
                     }
 
-            # -------------------------------------------------------
-            # Professionalism heuristic (requires both signals)
-            # -------------------------------------------------------
+            # Professionalism heuristic
             if tone["formality_score"] is not None and tone["sentiment_score"] is not None:
                 prof = (tone["formality_score"] * 0.7) + (tone["sentiment_score"] * 0.3)
                 tone["professional_score"] = prof
@@ -506,27 +495,30 @@ class ConversationLogger:
                     "INAPPROPRIATE"
                 )
 
-        except Exception as exc:
+        except (RuntimeError, ValueError, TypeError) as exc:
             logger.warning("⚠️ Tone analysis failed: %s", exc)
 
         return tone
 
     def generate_embedding(self, text: str) -> List[float]:
-        """Generate semantic embedding for text using same model as memory system."""
+        """
+        Generate semantic embedding for text.
+        Waits for background model loading to complete.
+        """
+        # ✅ WAIT FOR MODELS: Block here if models still loading
+        if not self._models_ready.is_set():
+            logger.info("⏳ Waiting for embedding model to finish loading...")
+            if not self._wait_for_models():
+                logger.warning("⚠️ Embedding model unavailable, returning empty embedding")
+                return []
+        
         try:
             model = self._ensure_embedding_model()
             embedding = model.encode(text, normalize_embeddings=True)
             return embedding.tolist()
-        except Exception as e:
-            logger.error(
-                "Failed to generate embedding: %s",
-                e
-            )
+        except (RuntimeError, ValueError, OSError) as e:
+            logger.error("Failed to generate embedding: %s", e)
             return []
-
-    async def _warmup_async(self) -> None:
-        """Pre-initialize embedding model and HF pipelines (async wrapper)."""
-        await asyncio.to_thread(self._warmup_models_sync)
 
     async def log_turn(
             self,
@@ -543,29 +535,26 @@ class ConversationLogger:
             *,
             turn_number: int,
     ) -> str:
-        """
-        🎯 AGENT-INDEPENDENT TURN LOGGING
-
-        Logs any turn from any agent with consistent tone analysis.
-        Automatically normalizes speaker values and extracts agent identity.
-        """
+        """Log a conversation turn with tone analysis."""
         turn_id = str(uuid.uuid4())
 
-        # ── Global safety cap for stored content & embeddings ────────────────
+        # Content safety cap
         content = content or ""
         try:
             max_chars = int(
                 CONVERSATION_MAX_CONTENT_CHARS
             ) if CONVERSATION_MAX_CONTENT_CHARS else None
-        except Exception:
+        except (ValueError, TypeError):
             max_chars = None
+
         original_chars = len(content)
         safe_content = (
             content[:max_chars]
             if (isinstance(content, str) and max_chars and original_chars > max_chars)
             else content
         )
-        # annotate truncation in metadata (without schema changes)
+
+        # Annotate truncation
         meta = dict(metadata or {})
         if original_chars != len(safe_content):
             try:
@@ -576,7 +565,7 @@ class ConversationLogger:
                     "stored_chars": len(safe_content),
                     "max_chars": max_chars,
                 })
-            except Exception:
+            except (KeyError, TypeError):
                 meta["content_original_chars"] = original_chars
                 meta["content_stored_chars"] = len(safe_content)
                 meta["content_max_chars"] = max_chars
@@ -586,8 +575,8 @@ class ConversationLogger:
                 len(safe_content),
                 max_chars
             )
-        # 🎯 APPLY TONE ANALYSIS (off the event loop)
-        # Models are already loaded during __init__, so this is fast
+
+        # Apply tone analysis (off event loop)
         tone_analysis = await asyncio.to_thread(
             self.analyze_turn_tone,
             safe_content,
@@ -595,18 +584,18 @@ class ConversationLogger:
             agent_name
         )
 
-        # Generate embedding for semantic search (off the event loop)
+        # Generate embedding
         embedding = await asyncio.to_thread(
             self.generate_embedding,
             safe_content,
         )
 
-        # Use graph-provided turn_number (LangGraph thread state = source of truth)
+        # Validate turn_number
         if not isinstance(turn_number, int) or turn_number < 1:
             logger.warning("Invalid turn_number %r; defaulting to 1", turn_number)
             turn_number = 1
 
-        # Create turn object with tone analysis
+        # Create turn object
         turn = ConversationTurn(
             conversation_id=conversation_id,
             turn_id=turn_id,
@@ -618,11 +607,9 @@ class ConversationLogger:
             metadata=meta or {},
             embedding=embedding,
             langsmith_trace_id=langsmith_trace_id,
-            error_details=error_details or {},  # Never NULL - empty dict for successful turns
-            # Context tracking
+            error_details=error_details or {},
             memory_token_length=memory_token_length,
             full_context_content=full_context_content,
-            # 🎯 TONE ANALYSIS: Applied to every turn regardless of agent
             agent_name=tone_analysis.get("agent_name"),
             sentiment_score=tone_analysis.get("sentiment_score"),
             sentiment_label=tone_analysis.get("sentiment_label"),
@@ -633,19 +620,17 @@ class ConversationLogger:
             professional_score=tone_analysis.get("professional_score"),
             professional_label=tone_analysis.get("professional_label"),
             nuanced_emotions=tone_analysis.get("nuanced_emotions"),
-
-            thumbs_up=None,  # Will be set by user reactions
-            thumbs_down=None,  # Will be set by user reactions
-            # LangSmith feedback scoring - provide defaults to prevent NULL validation errors
-            langsmith_feedback_score=0.5,  # Default neutral score
-            feedback_type="neutral",  # Default feedback type
-            evaluation_details="{}"  # Empty JSON object instead of NULL
+            thumbs_up=None,
+            thumbs_down=None,
+            langsmith_feedback_score=0.5,
+            feedback_type="neutral",
+            evaluation_details="{}"
         )
 
-        # Store via PM (dedup on turn_id)
+        # Store turn
         await self._store_turn(turn)
 
-        # Optionally store associated LangSmith trace (when present)
+        # Store LangSmith trace
         if langsmith_trace_id:
             try:
                 md = meta or {}
@@ -659,15 +644,10 @@ class ConversationLogger:
                     turn_number=turn_number,
                     source="conversation_logger",
                 )
-            except Exception as e:
+            except (OSError, RuntimeError, ValueError) as e:
                 logger.warning("⚠️ Failed to store LangSmith trace for turn %s: %s", turn_id, e)
 
-
-        logger.debug(
-            "Logged turn %s for conversation %s",
-            turn_id,
-            conversation_id,
-            )
+        logger.debug("Logged turn %s for conversation %s", turn_id, conversation_id)
         return turn_id
 
     async def log_error(
@@ -698,11 +678,9 @@ class ConversationLogger:
         try:
             ls = get_langsmith_integration()
             run_id = ls.get_last_trace_id() or conversation_id
-        except Exception:
+        except (RuntimeError, ValueError, KeyError):
             run_id = conversation_id
 
-        # Offload blocking PM call from the event loop.
-        # Best-effort only: failures here must not break callers.
         try:
             await asyncio.to_thread(
                 self.pm.log_cognitive_error,
@@ -712,7 +690,7 @@ class ConversationLogger:
                 error_message=error_message,
                 operation_context=error_data,
             )
-        except Exception as exc:  # noqa: BLE001
+        except (OSError, RuntimeError, ValueError) as exc:
             logger.warning(
                 "Failed to persist cognitive error for conversation %s: %s",
                 conversation_id,
@@ -749,7 +727,6 @@ class ConversationLogger:
             "metadata": json.dumps(metadata) if metadata else None
         }
 
-        # Store via PM (off the event loop)
         table_id = (
             f"{self.project_id}.{self.dataset_id}.conversation_metrics"
             if self.project_id and self.dataset_id
@@ -775,22 +752,7 @@ class ConversationLogger:
             conversation_id: str,
             status: str = "completed"
     ):
-        """
-        Conversation lifecycle hook (currently a no-op).
-
-        TODO: When we formalise "conversation sessions" at the swarm level,
-        this is where we should:
-          • Persist a lifecycle row (conversation_id, start_time, end_time, status).
-          • Apply the 5-minute idle handoff rule:
-                - When control is handed from chat_pro → ReflectiveSqlAgent
-                  (or any future specialist), mark the old conversation as
-                  ended and start a new conversation_id for the new agent.
-                - Likewise when control is handed back to chat_pro.
-          • Allow explicit "end" signals from UX (e.g. user clicks "End session").
-        
-        For now, logging remains purely turn-based and status is inferred
-        from turns/metrics.
-        """
+        """Conversation lifecycle hook (currently a no-op)."""
         return
 
     async def search_conversations(
@@ -800,10 +762,7 @@ class ConversationLogger:
             conversation_type: Optional[str] = None,
             focus_area: Optional[str] = None
     ) -> List[Dict[str, Any]]:
-        """
-        Delegate semantic search to the PM. (PM can implement vector search
-        against stored turn embeddings and any additional filters.)
-        """
+        """Delegate semantic search to PM."""
         if hasattr(self.pm, "search_conversations"):
             return await self.pm.search_conversations(
                 query=query,
@@ -819,10 +778,7 @@ class ConversationLogger:
             self,
             conversation_id: str
     ) -> Dict[str, Any]:
-        """
-        Delegate "summary view" construction to PM (which already implements it).
-        This keeps the logger focused on building artifacts, not querying stores.
-        """
+        """Delegate summary construction to PM."""
         return await self.pm.get_conversation_summary(conversation_id)
 
     async def _store_conversation_metadata(
@@ -853,11 +809,9 @@ class ConversationLogger:
             turn: ConversationTurn
     ):
         """Store a conversation turn via PM."""
-        # Avoid dataclasses.asdict here – it deep-copies nested structures and
-        # blows up on objects without __reduce__ (e.g. uvloop.loop.Loop).
         data = turn.to_row()
 
-        # metadata / error_details are stored as STRING columns; JSON-encode them.
+        # JSON-encode metadata and error_details
         if data.get("metadata"):
             data["metadata"] = json.dumps(data["metadata"])
         else:
@@ -868,40 +822,31 @@ class ConversationLogger:
         else:
             data["error_details"] = None
 
-        # nuanced_emotions: BigQuery JSON column.
-        # The streaming API expects a JSON *literal* (usually a string),
-        # not a RECORD/STRUCT. So we:
-        #   - keep None as None
-        #   - validate string values as JSON
-        #   - json.dumps() any dict/list into a JSON string
+        # Handle nuanced_emotions JSON column
         ne = data.get("nuanced_emotions")
         try:
             if ne is None:
                 data["nuanced_emotions"] = None
                 logger.debug(
-                    "ConversationLogger._store_turn nuanced_emotions is None "
-                    "for turn_id=%s",
+                    "ConversationLogger._store_turn nuanced_emotions is None for turn_id=%s",
                     data.get("turn_id"),
                 )
             elif isinstance(ne, str):
-                # ensure it's valid JSON; if not, we'll drop it below
-                json.loads(ne)
+                json.loads(ne)  # Validate
                 data["nuanced_emotions"] = ne
                 logger.debug(
                     "ConversationLogger._store_turn nuanced_emotions (str) sample=%s",
                     ne[:500],
                 )
             else:
-                # dict / list / other JSON-serialisable type
-                json_str = json.dumps(ne, default=_sanitize_for_json)  # reuse sanitizer
+                json_str = json.dumps(ne, default=_sanitize_for_json)
                 data["nuanced_emotions"] = json_str
                 logger.debug(
                     "ConversationLogger._store_turn nuanced_emotions (obj) type=%s sample=%s",
                     type(ne),
                     json_str[:500],
                 )
-        except Exception as exc:
-            # If anything goes wrong, don't block the graph – just drop the field.
+        except (ValueError, TypeError, OverflowError) as exc:
             logger.warning(
                 "ConversationLogger._store_turn: failed to serialise nuanced_emotions; "
                 "dropping field for turn_id=%s: %s",
@@ -911,7 +856,7 @@ class ConversationLogger:
             )
             data["nuanced_emotions"] = None
 
-        # Store via PM (off the event loop)
+        # Store via PM
         table_id = (
             f"{self.project_id}.{self.dataset_id}.conversation_turns"
             if self.project_id and self.dataset_id
@@ -923,3 +868,4 @@ class ConversationLogger:
             [data],
             [data["turn_id"]],
         )
+
