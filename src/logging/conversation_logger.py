@@ -26,6 +26,7 @@ from transformers import pipeline
 from sentence_transformers import SentenceTransformer
 from pro.persistence import get_persistence_manager
 from pro.monitoring.langsmith_integration import get_langsmith_integration
+from pro.utils.gcs_model_cache import get_model_cache
 from src.langgraph_slack.config import (
     PROJECT_ID,
     LANGSMITH_PROJECT,
@@ -274,18 +275,38 @@ class ConversationLogger:
 
     def _warmup_models_sync(self) -> None:
         """
-        ✅ SYNCHRONOUS MODEL WARMUP
+        ✅ SYNCHRONOUS MODEL WARMUP WITH GCS CACHING
         
-        Loads all HuggingFace models during initialization.
-        This blocks __init__ but ensures the first turn never times out.
+        Uses GCS to cache models across deployments:
+        1. Check GCS cache → Download from GCS (30 sec)
+        2. If not in GCS → Download from HuggingFace (5-10 min) → Upload to GCS
+        3. Next deployment uses cached version (30 sec)
         
-        Models loaded (total ~1.5GB on first run):
+        Models loaded (total ~1.5GB):
         1. sentence-transformers/all-MiniLM-L6-v2 (~90MB)
         2. cardiffnlp/twitter-roberta-base-sentiment-latest (~500MB)
         3. s-nlp/roberta-base-formality-ranker (~500MB)
         4. SamLowe/roberta-base-go_emotions (~500MB)
+        
+        Set env var: HF_MODEL_CACHE_BUCKET=your-bucket-name
         """
+        # Get GCS cache manager
+        gcs_cache = get_model_cache()
+        
+        models_to_cache = [
+            "cardiffnlp/twitter-roberta-base-sentiment-latest",
+            "s-nlp/roberta-base-formality-ranker",
+            "SamLowe/roberta-base-go_emotions",
+            "sentence-transformers/all-MiniLM-L6-v2",
+        ]
+        
         try:
+            # Pre-download from GCS if available
+            if gcs_cache:
+                logger.info("📦 Checking GCS cache for models...")
+                for model_name in models_to_cache:
+                    gcs_cache.ensure_model_cached(model_name)
+            
             # Load all 3 tone analysis pipelines
             logger.info("📥 Loading tone analysis pipelines...")
             self._ensure_tone_pipelines()
@@ -299,6 +320,13 @@ class ConversationLogger:
             _ = self.generate_embedding("warmup test sentence for model initialization")
             
             logger.info("🔋 ConversationLogger warmup complete - all models ready")
+            
+            # Upload to GCS for future deployments (background, non-blocking)
+            if gcs_cache:
+                logger.info("📤 Caching models to GCS for future deployments...")
+                for model_name in models_to_cache:
+                    gcs_cache.cache_model_after_download(model_name)
+                
         except Exception as e:
             logger.error("❌ Model warmup failed: %s", e, exc_info=True)
             raise
