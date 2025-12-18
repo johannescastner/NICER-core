@@ -7,41 +7,43 @@ before any other imports that might trigger matplotlib loading.
 """
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ✅ MATPLOTLIB OPTIMIZATION - MUST BE FIRST!
-# This prevents matplotlib from scanning ALL system fonts at import time,
-# which saves ~4 minutes on every worker startup.
+# ALL IMPORTS AT THE TOP
 # ═══════════════════════════════════════════════════════════════════════════════
 import os
 import sys
 
-# Disable matplotlib font scanning and set minimal configuration
+# Set matplotlib environment variables BEFORE importing matplotlib
 os.environ.setdefault('MPLCONFIGDIR', '/tmp/matplotlib')
-os.environ.setdefault('MPLBACKEND', 'Agg')  # Non-interactive backend
+os.environ.setdefault('MPLBACKEND', 'Agg')
 
-# Pre-configure matplotlib BEFORE it gets imported by any dependency
-try:
-    import matplotlib
-    matplotlib.use('Agg', force=True)  # Non-interactive backend
-    # Limit font scanning to a single known font family
-    matplotlib.rcParams['font.family'] = 'DejaVu Sans'
-    matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans']
-    # Disable font manager refresh
-    matplotlib.rcParams['font.manager'] = None
-    print("✅ Matplotlib optimized (font scanning disabled)")
-except ImportError:
-    # Matplotlib not installed - that's fine
-    pass
+# Import matplotlib immediately after setting environment
+import matplotlib
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# NOW SAFE TO IMPORT OTHER MODULES
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# Import remaining modules
 import json
 import base64
 import logging
 from os import environ
 from google.oauth2 import service_account
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# MATPLOTLIB OPTIMIZATION - Configure immediately after imports
+# This prevents matplotlib from scanning ALL system fonts at import time,
+# which saves ~4 minutes on every worker startup.
+# ═══════════════════════════════════════════════════════════════════════════════
+try:
+    matplotlib.use('Agg', force=True)  # Non-interactive backend
+    # Limit font scanning to a single known font family
+    matplotlib.rcParams['font.family'] = 'DejaVu Sans'
+    matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans']
+    print("✅ Matplotlib optimized (font scanning disabled)")
+except Exception as e:
+    # Log but don't crash if matplotlib configuration fails
+    print(f"⚠️ Matplotlib configuration warning: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOGGING SETUP
+# ═══════════════════════════════════════════════════════════════════════════════
 LOGGER = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════════════════
