@@ -7,7 +7,7 @@ This module is now persistence-agnostic. It focuses on:
 2) assembling structured payloads,
 3) delegating all storage/search/summary ops to the Persistence Manager (PM).
 
-✅ PARALLEL MODEL LOADING: Models download in background, server starts immediately
+✅ CLOUD RUN JOB INTEGRATION: Models download in separate job with dedicated resources
 """
 import json
 import asyncio
@@ -142,9 +142,192 @@ class ConversationMetadata:
     langsmith_session_id: Optional[str] = None
 
 
+# ============================================================================
+# CLOUD RUN JOB INTEGRATION
+# ============================================================================
+
+def trigger_model_download_job() -> bool:
+    """
+    Trigger Cloud Run Job to download models to GCS.
+    
+    This is completely non-blocking - returns immediately after triggering.
+    The job runs separately with dedicated resources (8GB RAM, 4 CPUs, 30+ min timeout).
+    
+    Returns:
+        True if job triggered successfully, False otherwise
+    """
+    try:
+        # Get configuration
+        project_id = os.getenv("GCP_PROJECT_ID")
+        region = os.getenv("GCP_REGION", "europe-west1")
+        job_name = "model-downloader"
+        
+        if not project_id:
+            logger.warning("⚠️  GCP_PROJECT_ID not set, cannot trigger model download job")
+            return False
+        
+        logger.info(f"🚀 Triggering Cloud Run Job: {job_name}")
+        
+        # Import here to avoid loading heavy dependencies on startup
+        from google.cloud import run_v2
+        
+        # Initialize Cloud Run Jobs client
+        client = run_v2.JobsClient()
+        
+        # Build job path
+        job_path = f"projects/{project_id}/locations/{region}/jobs/{job_name}"
+        
+        # Trigger job execution (async - returns immediately)
+        request = run_v2.RunJobRequest(name=job_path)
+        operation = client.run_job(request=request)
+        
+        logger.info(f"✅ Model download job triggered successfully")
+        logger.info(f"   Operation: {operation.name}")
+        logger.info(f"   Check status: https://console.cloud.google.com/run/jobs/{region}/{job_name}")
+        logger.info("📥 Models will download in background (won't block deployment)")
+        
+        return True
+        
+    except Exception as e:
+        logger.warning(f"⚠️  Failed to trigger model download job: {e}")
+        logger.warning("   This is non-critical - models will load on-demand")
+        # Don't fail the deployment - this is an optional optimization
+        return False
+
+
+def check_models_in_gcs() -> tuple[int, int]:
+    """
+    Check how many models are already in GCS.
+    
+    Returns:
+        Tuple of (models_in_gcs, total_models)
+    """
+    try:
+        cache = get_model_cache()
+        if not cache:
+            logger.info("⚠️  GCS cache not available")
+            return (0, 0)
+        
+        models = [
+            "cardiffnlp/twitter-roberta-base-sentiment-latest",
+            "SamLowe/roberta-base-go_emotions",
+            "s-nlp/roberta-base-formality-ranker",
+            "sentence-transformers/all-MiniLM-L6-v2",
+        ]
+        
+        # Check each model
+        models_in_gcs = 0
+        for model in models:
+            if cache.check_model_exists_in_gcs(model):
+                models_in_gcs += 1
+        
+        return (models_in_gcs, len(models))
+        
+    except Exception as e:
+        logger.warning(f"⚠️  Failed to check models in GCS: {e}")
+        return (0, 0)
+
+
+def download_models_from_gcs_background(models: List[str], cache):
+    """
+    Download models from GCS in background thread.
+    
+    This is fast (30 seconds total) and won't block deployment.
+    """
+    import time
+    
+    def _download():
+        for model in models:
+            try:
+                logger.info(f"📥 Downloading {model} from GCS...")
+                start = time.time()
+                
+                if cache.download_from_gcs(model):
+                    elapsed = time.time() - start
+                    logger.info(f"✅ Downloaded {model} in {elapsed:.1f}s")
+                else:
+                    logger.warning(f"⚠️  Failed to download {model} from GCS")
+                    
+            except Exception as e:
+                logger.warning(f"⚠️  Error downloading {model}: {e}")
+    
+    # Start download in daemon thread (won't block shutdown)
+    thread = threading.Thread(target=_download, daemon=True, name="GCSModelDownloader")
+    thread.start()
+    logger.info("🚀 Started GCS model download in background")
+
+
+def initialize_model_cache_strategy():
+    """
+    Initialize model caching strategy.
+    
+    Strategy:
+    1. Check if models are in GCS
+    2. If all present: Download from GCS (fast, 30s total)
+    3. If missing: Trigger Cloud Run Job to download from HuggingFace
+    
+    This ensures:
+    - Deployment NEVER times out (job runs separately)
+    - Models are ready for next deployment
+    - Fast startup when models are cached
+    """
+    try:
+        cache = get_model_cache()
+        if not cache:
+            logger.info("⚠️  GCS cache not available, models will load on-demand")
+            return
+        
+        # Check which models are in GCS
+        models_in_gcs, total_models = check_models_in_gcs()
+        
+        logger.info(f"📦 Model cache status: {models_in_gcs}/{total_models} models in GCS")
+        
+        if models_in_gcs == total_models:
+            # All models in GCS - download them (fast!)
+            logger.info("✅ All models found in GCS cache")
+            logger.info("📥 Downloading models from GCS in background...")
+            
+            models = [
+                "cardiffnlp/twitter-roberta-base-sentiment-latest",
+                "SamLowe/roberta-base-go_emotions",
+                "s-nlp/roberta-base-formality-ranker",
+                "sentence-transformers/all-MiniLM-L6-v2",
+            ]
+            
+            download_models_from_gcs_background(models, cache)
+            
+        elif models_in_gcs > 0:
+            # Some models cached
+            logger.info(f"⚠️  Partial cache: {models_in_gcs}/{total_models} models in GCS")
+            logger.info("🚀 Triggering Cloud Run Job to download missing models...")
+            trigger_model_download_job()
+            
+        else:
+            # No models cached
+            logger.info("📥 No models in GCS cache (first deployment)")
+            logger.info("🚀 Triggering Cloud Run Job to download from HuggingFace...")
+            
+            if trigger_model_download_job():
+                logger.info("✅ Job triggered - models will be ready for next deployment")
+                logger.info("   Estimated time: 10-20 minutes (runs in background)")
+            else:
+                logger.warning("⚠️  Job trigger failed - models will load on-demand")
+        
+    except Exception as e:
+        logger.error(f"❌ Error in initialize_model_cache_strategy: {e}", exc_info=True)
+        logger.info("⚠️  Continuing startup - models will load on-demand")
+
+
+# ============================================================================
+# CONVERSATION LOGGER CLASS
+# ============================================================================
+
 class ConversationLogger:
     """
-    Comprehensive conversation logging with parallel model loading.
+    Comprehensive conversation logging with Cloud Run Job integration.
+    
+    Models are downloaded asynchronously in a separate Cloud Run Job,
+    ensuring fast deployment and no timeout issues.
     """
     def __init__(
             self,
@@ -153,7 +336,7 @@ class ConversationLogger:
             langsmith_project: str = LANGSMITH_PROJECT,
             pm=None
     ):
-        """Initialize the conversation logger with background model loading."""
+        """Initialize the conversation logger with Cloud Run Job integration."""
         self.project_id = project_id
         self.dataset_id = dataset_id
         self.langsmith_project = langsmith_project
@@ -184,20 +367,29 @@ class ConversationLogger:
         self._embed_lock = threading.Lock()
         self._pipeline_lock = threading.Lock()
 
-        # ✅ PARALLEL BACKGROUND LOADING
-        self._models_ready = threading.Event()
-        self._loading_error: Optional[Exception] = None
-        logger.info("🚀 Starting background model loading (non-blocking)...")
-        self._start_background_loading()
+        # ✅ CLOUD RUN JOB INTEGRATION
+        logger.info("🚀 Initializing model cache strategy...")
+        initialize_model_cache_strategy()
 
         logger.info("ConversationLogger initialized for project %s", self.project_id)
 
     def _ensure_embedding_model(self) -> SentenceTransformer:
-        """Lazy-load embedding model."""
+        """
+        Lazy-load embedding model.
+        
+        If model is in GCS, it will be downloaded quickly.
+        Otherwise, it will be downloaded from HuggingFace on first use.
+        """
         if self._embedding_model is None:
             with self._embed_lock:
                 if self._embedding_model is None:
                     try:
+                        # Check GCS cache first
+                        cache = get_model_cache()
+                        if cache:
+                            cache.ensure_model_cached("sentence-transformers/all-MiniLM-L6-v2")
+                        
+                        # Load model (uses local cache if available)
                         if self._hf_cache_dir:
                             self._embedding_model = SentenceTransformer(
                                 "sentence-transformers/all-MiniLM-L6-v2",
@@ -208,13 +400,23 @@ class ConversationLogger:
                                 "sentence-transformers/all-MiniLM-L6-v2"
                             )
                         logger.info("✅ SBERT embedding model ready")
+                        
+                        # Cache to GCS for next deployment
+                        if cache:
+                            cache.cache_model_after_download("sentence-transformers/all-MiniLM-L6-v2")
+                            
                     except (OSError, RuntimeError, ImportError) as e:
                         logger.warning("⚠️ Failed to init embedding model: %s", e, exc_info=True)
                         raise
         return self._embedding_model
 
     def _ensure_tone_pipelines(self) -> None:
-        """Lazy-load tone analysis pipelines."""
+        """
+        Lazy-load tone analysis pipelines.
+        
+        If models are in GCS, they will be downloaded quickly.
+        Otherwise, they will be downloaded from HuggingFace on first use.
+        """
         if self._sentiment_classifier and self._formality_classifier and self._emotion_classifier:
             return
 
@@ -226,125 +428,67 @@ class ConversationLogger:
                     "tokenizer_kwargs": {"cache_dir": self._hf_cache_dir},
                 }
             
+            cache = get_model_cache()
+            
             if self._sentiment_classifier is None:
                 try:
+                    model_name = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+                    if cache:
+                        cache.ensure_model_cached(model_name)
+                    
                     self._sentiment_classifier = pipeline(
                         "sentiment-analysis",
-                        model="cardiffnlp/twitter-roberta-base-sentiment-latest",
+                        model=model_name,
                         return_all_scores=True,
                         **pipe_kwargs,
                     )
                     logger.info("✅ Sentiment pipeline ready")
+                    
+                    if cache:
+                        cache.cache_model_after_download(model_name)
+                        
                 except (OSError, RuntimeError, ImportError, ValueError) as e:
                     logger.warning("⚠️ Sentiment pipeline load failed: %s", e, exc_info=True)
             
             if self._formality_classifier is None:
                 try:
+                    model_name = "s-nlp/roberta-base-formality-ranker"
+                    if cache:
+                        cache.ensure_model_cached(model_name)
+                    
                     self._formality_classifier = pipeline(
                         "text-classification",
-                        model="s-nlp/roberta-base-formality-ranker",
+                        model=model_name,
                         return_all_scores=True,
                         **pipe_kwargs,
                     )
                     logger.info("✅ Formality pipeline ready")
+                    
+                    if cache:
+                        cache.cache_model_after_download(model_name)
+                        
                 except (OSError, RuntimeError, ImportError, ValueError) as e:
                     logger.warning("⚠️ Formality pipeline load failed: %s", e, exc_info=True)
             
             if self._emotion_classifier is None:
                 try:
+                    model_name = "SamLowe/roberta-base-go_emotions"
+                    if cache:
+                        cache.ensure_model_cached(model_name)
+                    
                     self._emotion_classifier = pipeline(
                         "text-classification",
-                        model="SamLowe/roberta-base-go_emotions",
+                        model=model_name,
                         return_all_scores=True,
                         **pipe_kwargs,
                     )
                     logger.info("✅ Emotion pipeline ready")
+                    
+                    if cache:
+                        cache.cache_model_after_download(model_name)
+                        
                 except (OSError, RuntimeError, ImportError, ValueError) as e:
                     logger.warning("⚠️ Emotion pipeline load failed: %s", e, exc_info=True)
-
-    def _start_background_loading(self) -> None:
-        """
-        Start model loading in background thread (non-blocking).
-        Server starts immediately while models download in parallel.
-        """
-        def _load_models_background():
-            try:
-                logger.info("📦 Background: Checking GCS cache...")
-                gcs_cache = get_model_cache()
-                
-                models_to_cache = [
-                    "cardiffnlp/twitter-roberta-base-sentiment-latest",
-                    "s-nlp/roberta-base-formality-ranker",
-                    "SamLowe/roberta-base-go_emotions",
-                    "sentence-transformers/all-MiniLM-L6-v2",
-                ]
-
-                # Pre-download from GCS if available
-                if gcs_cache:
-                    logger.info("📥 Background: Downloading from GCS cache...")
-                    for model_name in models_to_cache:
-                        try:
-                            gcs_cache.ensure_model_cached(model_name)
-                        except (OSError, RuntimeError) as e:
-                            logger.warning("⚠️ GCS cache check failed for %s: %s", model_name, e)
-
-                # Load all models
-                logger.info("📥 Background: Loading tone analysis pipelines...")
-                self._ensure_tone_pipelines()
-
-                logger.info("📥 Background: Loading embedding model...")
-                self._ensure_embedding_model()
-
-                # Warmup inference
-                logger.info("🔄 Background: Running warmup inference...")
-                _ = self.generate_embedding("warmup test sentence")
-                
-                logger.info("✅ Background: All models loaded and ready!")
-                
-                # Upload to GCS for future deployments (non-blocking)
-                if gcs_cache:
-                    logger.info("📤 Background: Caching models to GCS...")
-                    for model_name in models_to_cache:
-                        try:
-                            gcs_cache.cache_model_after_download(model_name)
-                        except (OSError, RuntimeError) as e:
-                            logger.warning("⚠️ Failed to cache %s to GCS: %s", model_name, e)
-
-                # Signal completion
-                self._models_ready.set()
-
-            except (OSError, RuntimeError, ImportError) as e:
-                logger.error("❌ Background model loading failed: %s", e, exc_info=True)
-                self._loading_error = e
-                self._models_ready.set()  # Unblock waiters even on error
-
-        # Start in daemon thread
-        thread = threading.Thread(target=_load_models_background, daemon=True, name="ModelLoader")
-        thread.start()
-
-    def _wait_for_models(self, timeout: float = 600.0) -> bool:
-        """
-        Wait for background model loading to complete.
-        
-        Args:
-            timeout: Max seconds to wait (default: 10 minutes)
-            
-        Returns:
-            True if models loaded successfully, False on timeout/error
-        """
-        logger.info("⏳ Waiting for models to load (timeout=%.1fs)...", timeout)
-        ready = self._models_ready.wait(timeout=timeout)
-
-        if not ready:
-            logger.error("❌ Model loading timed out after %.1fs", timeout)
-            return False
-
-        if self._loading_error:
-            logger.error("❌ Model loading failed: %s", self._loading_error)
-            return False
-
-        logger.info("✅ Models ready!")
-        return True
 
     def analyze_turn_tone(
             self,
@@ -354,26 +498,10 @@ class ConversationLogger:
     ) -> Dict[str, Any]:
         """
         🎯 Unified tone analysis for ANY turn (human or any agent).
-        Waits for background model loading to complete before analysis.
+        
+        Models load on-demand. If models are in GCS cache (from previous deployment),
+        they load quickly. Otherwise, they download from HuggingFace on first use.
         """
-        # ✅ WAIT FOR MODELS: Block here if models still loading
-        if not self._models_ready.is_set():
-            logger.info("⏳ First turn - waiting for models to finish loading...")
-            if not self._wait_for_models():
-                logger.warning("⚠️ Models unavailable, skipping tone analysis")
-                return {
-                    "agent_name": agent_name if speaker and speaker.lower() == "assistant" else None,
-                    "sentiment_score": None,
-                    "sentiment_label": None,
-                    "sentiment_confidence": None,
-                    "formality_score": None,
-                    "formality_label": None,
-                    "formality_confidence": None,
-                    "professional_score": None,
-                    "professional_label": None,
-                    "nuanced_emotions": None,
-                }
-
         # Ensure tone pipelines are available
         self._ensure_tone_pipelines()
         spk = (speaker or "").strip().lower()
@@ -503,15 +631,9 @@ class ConversationLogger:
     def generate_embedding(self, text: str) -> List[float]:
         """
         Generate semantic embedding for text.
-        Waits for background model loading to complete.
-        """
-        # ✅ WAIT FOR MODELS: Block here if models still loading
-        if not self._models_ready.is_set():
-            logger.info("⏳ Waiting for embedding model to finish loading...")
-            if not self._wait_for_models():
-                logger.warning("⚠️ Embedding model unavailable, returning empty embedding")
-                return []
         
+        Model loads on-demand. If model is in GCS cache, it loads quickly.
+        """
         try:
             model = self._ensure_embedding_model()
             embedding = model.encode(text, normalize_embeddings=True)
@@ -868,4 +990,3 @@ class ConversationLogger:
             [data],
             [data["turn_id"]],
         )
-
