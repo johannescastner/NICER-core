@@ -8,7 +8,6 @@ from typing import Any, Optional
 from langgraph_sdk import Auth
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Get the environment from OS variables (default to "PROD" if not set)
