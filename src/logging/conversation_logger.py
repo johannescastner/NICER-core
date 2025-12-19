@@ -180,7 +180,7 @@ def trigger_model_download_job() -> bool:
         # ========================================================================
         # ✅ SELF-HEALING: Auto-create job if missing
         # ========================================================================
-        
+
         job_exists = False
         try:
             # Check if job exists
@@ -188,9 +188,11 @@ def trigger_model_download_job() -> bool:
             job_exists = True
             logger.info(f"✅ Cloud Run Job exists: {job_name}")
             
-        except gcp_exceptions.NotFound:
-            # Job doesn't exist - create it!
-            logger.info(f"📦 Job not found, creating automatically...")
+        except (gcp_exceptions.NotFound, gcp_exceptions.PermissionDenied) as e:
+            # Job doesn't exist - GCP returns 403 (PermissionDenied) OR 404 (NotFound)
+            # for non-existent resources to avoid information leakage
+            # Try to create it - if we truly lack permissions, creation will fail
+            logger.info(f"📦 Job not found (may not exist), creating automatically...")
             job_exists = _create_job_automatically(
                 client=client,
                 project_id=project_id,
@@ -202,13 +204,10 @@ def trigger_model_download_job() -> bool:
                 logger.info(f"✅ Job created successfully: {job_name}")
             else:
                 logger.warning(f"⚠️  Failed to create job: {job_name}")
+                logger.warning(f"   Error details: {e}")
+                logger.warning("   If permissions issue, run: ./scripts/grant_agent_sa_roles.sh YOUR_PROJECT_ID")
                 logger.warning("   Models will load on-demand instead")
                 return False
-        
-        except gcp_exceptions.PermissionDenied as e:
-            logger.warning(f"⚠️  Permission denied checking job: {e}")
-            logger.warning("   Run: ./scripts/grant_agent_sa_roles.sh YOUR_PROJECT_ID")
-            return False
         
         # ========================================================================
         # Trigger job execution
