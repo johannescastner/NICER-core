@@ -211,7 +211,6 @@ def trigger_model_download_job() -> bool:
         logger.warning(f"⚠️  Failed to trigger job: {e}")
         return False
 
-
 def _create_job_automatically(
     client,
     project_id: str,
