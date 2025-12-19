@@ -37,6 +37,7 @@ from src.langgraph_slack.config import (
     SERVICE_ACCOUNT_EMAIL,
     GCP_SERVICE_ACCOUNT_BASE64,
     GCP_REGION,
+    CREDENTIALS
 )
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -162,7 +163,7 @@ def trigger_model_download_job() -> bool:
     try:
         # Get configuration from environment
         project_id = os.getenv("GCP_PROJECT_ID")
-        region = os.getenv("GCP_REGION", "europe-west1")
+        region = GCP_REGION
         job_name = "model-downloader"
         
         if not project_id:
@@ -176,7 +177,7 @@ def trigger_model_download_job() -> bool:
         from google.api_core import exceptions as gcp_exceptions
         
         # Initialize client
-        client = run_v2.JobsClient()
+        client = run_v2.JobsClient(credentials=CREDENTIALS)
         job_path = f"projects/{project_id}/locations/{region}/jobs/{job_name}"
         
         # ========================================================================
