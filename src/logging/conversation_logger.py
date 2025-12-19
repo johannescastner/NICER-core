@@ -150,14 +150,15 @@ def trigger_model_download_job() -> bool:
     """
     Trigger Cloud Run Job to download models to GCS.
     
-    This is completely non-blocking - returns immediately after triggering.
-    The job runs separately with dedicated resources (8GB RAM, 4 CPUs, 30+ min timeout).
+    ✅ SELF-HEALING: Automatically creates job if it doesn't exist
+    ✅ ONE IMAGE: Same Docker image works for all clients
+    ✅ SIMPLE: Straightforward error handling
     
     Returns:
         True if job triggered successfully, False otherwise
     """
     try:
-        # Get configuration
+        # Get configuration from environment
         project_id = os.getenv("GCP_PROJECT_ID")
         region = os.getenv("GCP_REGION", "europe-west1")
         job_name = "model-downloader"
@@ -168,32 +169,179 @@ def trigger_model_download_job() -> bool:
         
         logger.info(f"🚀 Triggering Cloud Run Job: {job_name}")
         
-        # Import here to avoid loading heavy dependencies on startup
+        # Import Cloud Run client
         from google.cloud import run_v2
+        from google.api_core import exceptions as gcp_exceptions
         
-        # Initialize Cloud Run Jobs client
+        # Initialize client
         client = run_v2.JobsClient()
-        
-        # Build job path
         job_path = f"projects/{project_id}/locations/{region}/jobs/{job_name}"
         
-        # Trigger job execution (async - returns immediately)
+        # ========================================================================
+        # ✅ SELF-HEALING: Auto-create job if missing
+        # ========================================================================
+        
+        job_exists = False
+        try:
+            # Check if job exists
+            client.get_job(name=job_path)
+            job_exists = True
+            logger.info(f"✅ Cloud Run Job exists: {job_name}")
+            
+        except gcp_exceptions.NotFound:
+            # Job doesn't exist - create it!
+            logger.info(f"📦 Job not found, creating automatically...")
+            job_exists = _create_job_automatically(
+                client=client,
+                project_id=project_id,
+                region=region,
+                job_name=job_name
+            )
+            
+            if job_exists:
+                logger.info(f"✅ Job created successfully: {job_name}")
+            else:
+                logger.warning(f"⚠️  Failed to create job: {job_name}")
+                logger.warning("   Models will load on-demand instead")
+                return False
+        
+        except gcp_exceptions.PermissionDenied as e:
+            logger.warning(f"⚠️  Permission denied checking job: {e}")
+            logger.warning("   Run: ./scripts/grant_agent_sa_roles.sh YOUR_PROJECT_ID")
+            return False
+        
+        # ========================================================================
+        # Trigger job execution
+        # ========================================================================
+        
+        if not job_exists:
+            logger.warning("⚠️  Job doesn't exist and couldn't be created")
+            return False
+        
+        # Trigger the job (async - returns immediately)
         request = run_v2.RunJobRequest(name=job_path)
         operation = client.run_job(request=request)
         
         logger.info(f"✅ Model download job triggered successfully")
         logger.info(f"   Operation: {operation.name}")
-        logger.info(f"   Check status: https://console.cloud.google.com/run/jobs/{region}/{job_name}")
-        logger.info("📥 Models will download in background (won't block deployment)")
+        logger.info(f"   Console: https://console.cloud.google.com/run/jobs/{region}/{job_name}?project={project_id}")
+        logger.info(f"📥 Models will download in background (won't block deployment)")
         
         return True
         
     except Exception as e:
         logger.warning(f"⚠️  Failed to trigger model download job: {e}")
         logger.warning("   This is non-critical - models will load on-demand")
-        # Don't fail the deployment - this is an optional optimization
         return False
 
+
+def _create_job_automatically(
+    client,
+    project_id: str,
+    region: str,
+    job_name: str
+) -> bool:
+    """
+    Automatically create Cloud Run Job.
+    
+    ✅ Uses standard public image (same for all clients)
+    ✅ Injects client-specific secrets via env vars
+    ✅ Simple error handling
+    
+    Args:
+        client: Cloud Run Jobs client
+        project_id: GCP project ID
+        region: GCP region
+        job_name: Name for the job
+    
+    Returns:
+        True if job created successfully, False otherwise
+    """
+    try:
+        from google.cloud import run_v2
+        
+        # ========================================================================
+        # ✅ IMAGE: Same for all clients (no secrets baked in)
+        # ========================================================================
+        # Option 1: Use public pre-built image (recommended)
+        # image_name = "gcr.io/your-org/model-downloader:latest"
+        
+        # Option 2: Use client-specific Artifact Registry
+        image_name = f"{region}-docker.pkg.dev/{project_id}/jobs/{job_name}"
+        
+        logger.info(f"   Using image: {image_name}")
+        
+        # ========================================================================
+        # ✅ SECRETS: Injected via environment variables (client-specific)
+        # ========================================================================
+        
+        env_vars = []
+        
+        # Required: Project ID and Region
+        env_vars.append(run_v2.EnvVar(name="GCP_PROJECT_ID", value=project_id))
+        env_vars.append(run_v2.EnvVar(name="GCP_REGION", value=region))
+        
+        # Required: Service Account (from environment or secret)
+        sa_base64 = os.getenv("GCP_SERVICE_ACCOUNT_BASE64")
+        if sa_base64:
+            # Pass through from container environment
+            env_vars.append(run_v2.EnvVar(
+                name="GCP_SERVICE_ACCOUNT_BASE64",
+                value=sa_base64
+            ))
+            logger.info("   ✅ Service account credentials will be passed to job")
+        else:
+            logger.warning("   ⚠️  GCP_SERVICE_ACCOUNT_BASE64 not set")
+            logger.warning("      Job may fail to authenticate with GCS")
+        
+        # ========================================================================
+        # ✅ JOB CONFIGURATION
+        # ========================================================================
+        
+        job = run_v2.Job(
+            template=run_v2.ExecutionTemplate(
+                template=run_v2.TaskTemplate(
+                    containers=[
+                        run_v2.Container(
+                            image=image_name,
+                            env=env_vars,
+                            resources=run_v2.ResourceRequirements(
+                                limits={
+                                    "cpu": "4",
+                                    "memory": "8Gi"
+                                }
+                            )
+                        )
+                    ],
+                    max_retries=0,
+                    timeout="1800s"  # 30 minutes
+                )
+            )
+        )
+        
+        # ========================================================================
+        # ✅ CREATE JOB
+        # ========================================================================
+        
+        parent = f"projects/{project_id}/locations/{region}"
+        request = run_v2.CreateJobRequest(
+            parent=parent,
+            job=job,
+            job_id=job_name
+        )
+        
+        logger.info(f"   Creating Cloud Run Job...")
+        operation = client.create_job(request=request)
+        
+        # Wait for creation (up to 60 seconds)
+        result = operation.result(timeout=60)
+        
+        logger.info(f"   ✅ Job created: {result.name}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"   ❌ Failed to create job: {e}", exc_info=True)
+        return False
 
 def check_models_in_gcs() -> tuple[int, int]:
     """
