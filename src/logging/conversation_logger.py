@@ -33,9 +33,11 @@ from src.langgraph_slack.config import (
     PROJECT_ID,
     LANGSMITH_PROJECT,
     HF_CACHE_DIR,
-    CONVERSATION_MAX_CONTENT_CHARS
+    CONVERSATION_MAX_CONTENT_CHARS,
+    SERVICE_ACCOUNT_EMAIL,
+    GCP_SERVICE_ACCOUNT_BASE64,
+    GCP_REGION,
 )
-
 # Set up logging
 logger = logging.getLogger(__name__)
 
@@ -243,9 +245,9 @@ def _create_job_automatically(
     """
     Automatically create Cloud Run Job.
     
-    ✅ Uses standard public image (same for all clients)
+    ✅ Uses same Docker image for all clients
     ✅ Injects client-specific secrets via env vars
-    ✅ Simple error handling
+    ✅ Specifies service account to avoid permission errors
     
     Args:
         client: Cloud Run Jobs client
@@ -260,33 +262,36 @@ def _create_job_automatically(
         from google.cloud import run_v2
         
         # ========================================================================
+        # ✅ SERVICE ACCOUNT: Must be set or job creation fails with 403
+        # ========================================================================
+        
+        if not SERVICE_ACCOUNT_EMAIL:
+            logger.error("   ❌ SERVICE_ACCOUNT_EMAIL not available from config")
+            return False
+        
+        logger.info(f"   Job will run as: {SERVICE_ACCOUNT_EMAIL}")
+        
+        # ========================================================================
         # ✅ IMAGE: Same for all clients (no secrets baked in)
         # ========================================================================
-        # Option 1: Use public pre-built image (recommended)
-        # image_name = "gcr.io/your-org/model-downloader:latest"
         
-        # Option 2: Use client-specific Artifact Registry
         image_name = f"{region}-docker.pkg.dev/{project_id}/jobs/{job_name}"
-        
         logger.info(f"   Using image: {image_name}")
         
         # ========================================================================
         # ✅ SECRETS: Injected via environment variables (client-specific)
         # ========================================================================
         
-        env_vars = []
+        env_vars = [
+            run_v2.EnvVar(name="GCP_PROJECT_ID", value=project_id),
+            run_v2.EnvVar(name="GCP_REGION", value=region),
+        ]
         
-        # Required: Project ID and Region
-        env_vars.append(run_v2.EnvVar(name="GCP_PROJECT_ID", value=project_id))
-        env_vars.append(run_v2.EnvVar(name="GCP_REGION", value=region))
-        
-        # Required: Service Account (from environment or secret)
-        sa_base64 = os.getenv("GCP_SERVICE_ACCOUNT_BASE64")
-        if sa_base64:
-            # Pass through from container environment
+        # Pass service account credentials to job
+        if GCP_SERVICE_ACCOUNT_BASE64:
             env_vars.append(run_v2.EnvVar(
                 name="GCP_SERVICE_ACCOUNT_BASE64",
-                value=sa_base64
+                value=GCP_SERVICE_ACCOUNT_BASE64
             ))
             logger.info("   ✅ Service account credentials will be passed to job")
         else:
@@ -313,7 +318,8 @@ def _create_job_automatically(
                         )
                     ],
                     max_retries=0,
-                    timeout="1800s"  # 30 minutes
+                    timeout="1800s",  # 30 minutes
+                    service_account=SERVICE_ACCOUNT_EMAIL  # ✅ CRITICAL FIX!
                 )
             )
         )

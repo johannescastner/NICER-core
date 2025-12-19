@@ -54,11 +54,12 @@ LOCATION = environ.get("GCP_LOCATION", "EU")  # Default to 'EU' if not set
 SEMANTIC_TABLE = environ.get("GCP_SEMANTIC_TABLE", "semantic_memory")
 EPISODIC_TABLE = environ.get("GCP_EPISODIC_TABLE", "episodic_memory")
 PROCEDURAL_TABLE = environ.get("GCP_PROCEDURAL_TABLE", "procedural_memory")
-
+# Raw base64 service account (for passing to Cloud Run Jobs)
+GCP_SERVICE_ACCOUNT_BASE64 = environ.get("GCP_SERVICE_ACCOUNT_BASE64", "")
 # Service account credentials
 try:
     service_account_json = base64.b64decode(
-        environ.get("GCP_SERVICE_ACCOUNT_BASE64", "")
+        GCP_SERVICE_ACCOUNT_BASE64
     ).decode("utf-8")
     SERVICE_ACCOUNT_INFO: dict = json.loads(service_account_json)
     CREDENTIALS = service_account.Credentials.from_service_account_info(SERVICE_ACCOUNT_INFO)
