@@ -346,19 +346,86 @@ def download_models_from_gcs_background(models: List[str], cache):
     logger.info("🚀 Started GCS model download in background")
 
 
+def download_missing_models_immediately(models: List[str], cache):
+    """
+    Download missing models from HuggingFace immediately in background thread.
+    
+    ✅ SELF-HEALING: Downloads missing models in current container
+    ✅ Uploads to GCS for next deployment
+    ✅ No manual intervention needed
+    ✅ Works for thousands of clients automatically
+    
+    This ensures the current deployment has models ready, not just future deployments.
+    Models are also uploaded to GCS for next deployment.
+    """
+    import time
+    from pathlib import Path
+    
+    def _download():
+        for model in models:
+            try:
+                # Check if already in local cache
+                safe_model = model.replace("/", "--")
+                model_dir = Path(cache.cache_dir) / "hub" / f"models--{safe_model}"
+                
+                if model_dir.exists():
+                    logger.info(f"✅ {model} already in local cache")
+                    continue
+                
+                # Check if in GCS (validated) - download from GCS first (faster)
+                if cache.check_model_exists_in_gcs(model):
+                    logger.info(f"📥 Downloading {model} from GCS...")
+                    start = time.time()
+                    if cache.download_from_gcs(model):
+                        elapsed = time.time() - start
+                        logger.info(f"✅ Downloaded {model} from GCS in {elapsed:.1f}s")
+                        continue
+                
+                # Not in GCS or incomplete - download from HuggingFace
+                logger.info(f"📥 Downloading {model} from HuggingFace...")
+                start = time.time()
+                
+                # ✅ DETECT MODEL TYPE AND USE CORRECT LIBRARY
+                if model.startswith("sentence-transformers/"):
+                    from sentence_transformers import SentenceTransformer
+                    # Force HF cache structure
+                    SentenceTransformer(model, cache_folder=cache.cache_dir)
+                else:
+                    from transformers import AutoModel, AutoTokenizer
+                    # Use HF cache directory
+                    AutoModel.from_pretrained(model, cache_dir=cache.cache_dir)
+                    AutoTokenizer.from_pretrained(model, cache_dir=cache.cache_dir)
+                
+                elapsed = time.time() - start
+                logger.info(f"✅ Downloaded {model} from HuggingFace in {elapsed:.1f}s")
+                
+                # Upload to GCS for next deployment
+                logger.info(f"📤 Uploading {model} to GCS for future deployments...")
+                cache.upload_to_gcs(model)
+                
+            except Exception as e:
+                logger.error(f"❌ Failed to download {model}: {e}", exc_info=True)
+    
+    # Start download in background thread (won't block startup)
+    thread = threading.Thread(target=_download, daemon=True, name="HFModelDownloader")
+    thread.start()
+    logger.info("🚀 Started HuggingFace model download in background")
+
+
 def initialize_model_cache_strategy():
     """
-    Initialize model caching strategy.
+    Initialize model caching strategy with IMMEDIATE download on corruption.
     
-    Strategy:
+    ✅ SELF-HEALING Strategy:
     1. Check if models are in GCS
     2. If all present: Download from GCS (fast, 30s total)
-    3. If missing: Trigger Cloud Run Job to download from HuggingFace
+    3. If missing/corrupt: Download immediately from HuggingFace (this container)
+    4. Also trigger Cloud Run Job for redundancy
     
     This ensures:
     - Deployment NEVER times out (job runs separately)
-    - Models are ready for next deployment
-    - Fast startup when models are cached
+    - Models are ready IMMEDIATELY (no 1-deployment lag)
+    - Works for thousands of clients automatically
     """
     try:
         cache = get_model_cache()
@@ -371,41 +438,47 @@ def initialize_model_cache_strategy():
         
         logger.info(f"📦 Model cache status: {models_in_gcs}/{total_models} models in GCS")
         
+        # Define models list
+        models = [
+            "cardiffnlp/twitter-roberta-base-sentiment-latest",
+            "SamLowe/roberta-base-go_emotions",
+            "s-nlp/roberta-base-formality-ranker",
+            "sentence-transformers/all-MiniLM-L6-v2",
+        ]
+        
         if models_in_gcs == total_models:
-            # All models in GCS - download them (fast!)
+            # ✅ All models validated and present in GCS - download them (fast!)
             logger.info("✅ All models found in GCS cache")
             logger.info("📥 Downloading models from GCS in background...")
-            
-            models = [
-                "cardiffnlp/twitter-roberta-base-sentiment-latest",
-                "SamLowe/roberta-base-go_emotions",
-                "s-nlp/roberta-base-formality-ranker",
-                "sentence-transformers/all-MiniLM-L6-v2",
-            ]
-            
             download_models_from_gcs_background(models, cache)
             
         elif models_in_gcs > 0:
-            # Some models cached
+            # ⚠️ Some models missing/incomplete - IMMEDIATE DOWNLOAD
             logger.info(f"⚠️  Partial cache: {models_in_gcs}/{total_models} models in GCS")
-            logger.info("🚀 Triggering Cloud Run Job to download missing models...")
+            logger.info("📥 Downloading missing models from HuggingFace immediately...")
+            
+            # ✅ Download missing models NOW in current container
+            download_missing_models_immediately(models, cache)
+            
+            # Also trigger job for redundancy/next time
+            logger.info("🚀 Triggering Cloud Run Job for redundancy...")
             trigger_model_download_job()
             
         else:
-            # No models cached
+            # ❌ No models cached at all (first deployment)
             logger.info("📥 No models in GCS cache (first deployment)")
-            logger.info("🚀 Triggering Cloud Run Job to download from HuggingFace...")
+            logger.info("📥 Downloading all models from HuggingFace immediately...")
             
-            if trigger_model_download_job():
-                logger.info("✅ Job triggered - models will be ready for next deployment")
-                logger.info("   Estimated time: 10-20 minutes (runs in background)")
-            else:
-                logger.warning("⚠️  Job trigger failed - models will load on-demand")
+            # ✅ Download all models NOW in current container
+            download_missing_models_immediately(models, cache)
+            
+            # Trigger job for next deployment
+            logger.info("🚀 Triggering Cloud Run Job for next deployment...")
+            trigger_model_download_job()
         
     except Exception as e:
         logger.error(f"❌ Error in initialize_model_cache_strategy: {e}", exc_info=True)
         logger.info("⚠️  Continuing startup - models will load on-demand")
-
 
 # ============================================================================
 # CONVERSATION LOGGER CLASS
