@@ -8,6 +8,8 @@ This module is now persistence-agnostic. It focuses on:
 3) delegating all storage/search/summary ops to the Persistence Manager (PM).
 
 ✅ CLOUD RUN JOB INTEGRATION: Models download in separate job with dedicated resources
+✅ LAZY IMPORTS: PyTorch/transformers only imported when first needed (not at module load)
+✅ DEPRECATION FIX: Uses top_k=None instead of deprecated return_all_scores=True
 """
 import json
 import asyncio
@@ -24,8 +26,25 @@ from typing import (
 )
 from dataclasses import dataclass, asdict, fields
 from collections.abc import Mapping, Sequence
-from transformers import pipeline
+
+# ============================================================================
+# CRITICAL FIX: REMOVED TOP-LEVEL IMPORT
+# ============================================================================
+# The following import was causing 180+ second startup times:
+#
+#   from transformers import pipeline  # DON'T DO THIS!
+#
+# Even though pipeline() was only called lazily inside methods, the import
+# statement itself pulls in PyTorch at module load time.
+#
+# Now `from transformers import pipeline` is done inside _ensure_tone_pipelines()
+# and other methods that actually need it.
+# ============================================================================
+
+# SentenceTransformer is lighter but still pulls some deps - consider lazy-loading too
+# if startup is still slow. For now, it's less problematic than transformers.
 from sentence_transformers import SentenceTransformer
+
 from pro.persistence import get_persistence_manager
 from pro.monitoring.langsmith_integration import get_langsmith_integration
 from pro.utils.gcs_model_cache import get_model_cache
@@ -39,6 +58,7 @@ from src.langgraph_slack.config import (
     GCP_REGION,
     CREDENTIALS
 )
+
 # Set up logging
 logger = logging.getLogger(__name__)
 
@@ -47,6 +67,7 @@ _TONE_MAX_LENGTH_ENV = "CONVERSATION_TONE_MAX_TOKENS"
 _DEFAULT_TONE_MAX_LENGTH = 256
 _MIN_TONE_MAX_LENGTH = 32
 _MAX_TONE_MAX_LENGTH = 512
+
 
 def _get_tone_max_length_from_env() -> int:
     raw = os.getenv(_TONE_MAX_LENGTH_ENV, str(_DEFAULT_TONE_MAX_LENGTH))
@@ -59,6 +80,7 @@ def _get_tone_max_length_from_env() -> int:
     if val > _MAX_TONE_MAX_LENGTH:
         return _MAX_TONE_MAX_LENGTH
     return val
+
 
 def _sanitize_for_json(value: Any) -> Any:
     """
@@ -83,6 +105,7 @@ def _sanitize_for_json(value: Any) -> Any:
         return value
     except (TypeError, ValueError, OverflowError):
         return repr(value)
+
 
 @dataclass
 class ConversationTurn:
@@ -130,6 +153,7 @@ class ConversationTurn:
             else:
                 data[f.name] = value
         return data
+
 
 @dataclass
 class ConversationMetadata:
@@ -211,6 +235,7 @@ def trigger_model_download_job() -> bool:
         logger.warning(f"⚠️  Failed to trigger job: {e}")
         return False
 
+
 def _create_job_automatically(
     client,
     project_id: str,
@@ -283,6 +308,7 @@ def _create_job_automatically(
     except Exception as e:
         logger.error(f"   ❌ Failed: {e}", exc_info=True)
         return False
+
 
 def check_models_in_gcs() -> tuple[int, int]:
     """
@@ -388,11 +414,10 @@ def download_missing_models_immediately(models: List[str], cache):
                 # ✅ DETECT MODEL TYPE AND USE CORRECT LIBRARY
                 if model.startswith("sentence-transformers/"):
                     from sentence_transformers import SentenceTransformer
-                    # Force HF cache structure
                     SentenceTransformer(model, cache_folder=cache.cache_dir)
                 else:
+                    # ✅ LAZY IMPORT: Only import transformers when actually needed
                     from transformers import AutoModel, AutoTokenizer
-                    # Use HF cache directory
                     AutoModel.from_pretrained(model, cache_dir=cache.cache_dir)
                     AutoTokenizer.from_pretrained(model, cache_dir=cache.cache_dir)
                 
@@ -479,6 +504,7 @@ def initialize_model_cache_strategy():
     except Exception as e:
         logger.error(f"❌ Error in initialize_model_cache_strategy: {e}", exc_info=True)
         logger.info("⚠️  Continuing startup - models will load on-demand")
+
 
 # ============================================================================
 # CONVERSATION LOGGER CLASS
@@ -576,8 +602,14 @@ class ConversationLogger:
         """
         Lazy-load tone analysis pipelines.
         
-        If models are in GCS, they will be downloaded quickly.
-        Otherwise, they will be downloaded from HuggingFace on first use.
+        ✅ CRITICAL FIX #1: `from transformers import pipeline` is now done HERE,
+        not at module load time. This prevents 180+ second startup delays.
+        
+        ✅ CRITICAL FIX #2: Uses `top_k=None` instead of deprecated `return_all_scores=True`
+        to eliminate the deprecation warning.
+        
+        If models are in GCS cache (from previous deployment),
+        they load quickly. Otherwise, they download from HuggingFace on first use.
         """
         if self._sentiment_classifier and self._formality_classifier and self._emotion_classifier:
             return
@@ -594,14 +626,18 @@ class ConversationLogger:
             
             if self._sentiment_classifier is None:
                 try:
+                    # ✅ LAZY IMPORT: Only import when first needed
+                    from transformers import pipeline
+                    
                     model_name = "cardiffnlp/twitter-roberta-base-sentiment-latest"
                     if cache:
                         cache.ensure_model_cached(model_name)
                     
+                    # ✅ FIX: Use top_k=None instead of deprecated return_all_scores=True
                     self._sentiment_classifier = pipeline(
                         "sentiment-analysis",
                         model=model_name,
-                        return_all_scores=True,
+                        top_k=None,  # Returns all scores (replaces return_all_scores=True)
                         **pipe_kwargs,
                     )
                     logger.info("✅ Sentiment pipeline ready")
@@ -614,14 +650,18 @@ class ConversationLogger:
             
             if self._formality_classifier is None:
                 try:
+                    # ✅ LAZY IMPORT: Only import when first needed
+                    from transformers import pipeline
+                    
                     model_name = "s-nlp/roberta-base-formality-ranker"
                     if cache:
                         cache.ensure_model_cached(model_name)
                     
+                    # ✅ FIX: Use top_k=None instead of deprecated return_all_scores=True
                     self._formality_classifier = pipeline(
                         "text-classification",
                         model=model_name,
-                        return_all_scores=True,
+                        top_k=None,  # Returns all scores (replaces return_all_scores=True)
                         **pipe_kwargs,
                     )
                     logger.info("✅ Formality pipeline ready")
@@ -634,14 +674,18 @@ class ConversationLogger:
             
             if self._emotion_classifier is None:
                 try:
+                    # ✅ LAZY IMPORT: Only import when first needed
+                    from transformers import pipeline
+                    
                     model_name = "SamLowe/roberta-base-go_emotions"
                     if cache:
                         cache.ensure_model_cached(model_name)
                     
+                    # ✅ FIX: Use top_k=None instead of deprecated return_all_scores=True
                     self._emotion_classifier = pipeline(
                         "text-classification",
                         model=model_name,
-                        return_all_scores=True,
+                        top_k=None,  # Returns all scores (replaces return_all_scores=True)
                         **pipe_kwargs,
                     )
                     logger.info("✅ Emotion pipeline ready")
