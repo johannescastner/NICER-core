@@ -19,6 +19,7 @@ from slack_bolt.async_app import AsyncApp
 from langgraph_slack import config
 # Ambient HTTP endpoints (closed-source)
 from pro.http.ambient import router as ambient_router
+from pro.http.cron_lifecycle import ensure_ambient_cron_exists
 from pro.persistence import close_persistence_manager
 
 LOGGER = logging.getLogger(__name__)
@@ -316,6 +317,10 @@ async def lifespan(app: FastAPI):
         # "RuntimeError: generator didn't yield" without the root cause.
         worker_task = asyncio.create_task(worker(), name="slack_background_worker")
         worker_task.add_done_callback(_log_task_result)
+
+        # Idempotent ambient SQL cron setup (runs on every deploy/restart)
+        await ensure_ambient_cron_exists()
+
         yield
     except Exception:
         # This is the money line: you'll now see the real startup exception.
