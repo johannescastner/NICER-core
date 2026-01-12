@@ -539,6 +539,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         *,
         ttl: float | None | NotProvided = NOT_PROVIDED,
     ) -> None:
+        # Validate namespace consistently with BaseStore expectations
         _validate_namespace(namespace)
 
         logger.info(
@@ -547,44 +548,63 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             ".".join(namespace),
         )
         data = {"namespace": ".".join(namespace), "doc_id": key}
-        
+        logger.debug("[aput] initial data: %s", json.dumps(data, indent=2))
+        logger.debug("[aput] Using content field: %s", self.content_field)
+
         raw_content = value.get("content")
+        logger.debug("[aput] Raw content retrieved: %s", raw_content)
+
         if raw_content is None:
             logger.error("Content for %s is None. This is not expected.", self.content_field)
             return
 
-        # ─── FIX: Handle nested structure and extract timestamp ───
-        # If raw_content contains the content_field key (e.g., "episode"), unwrap it
         actual_content = raw_content
-        if isinstance(raw_content, dict) and self.content_field in raw_content:
-            actual_content = raw_content[self.content_field]
-            # Extract timestamp from content level if present
-            if "timestamp" in raw_content:
-                ts = raw_content["timestamp"]
+
+        # ─── EPISODIC-SPECIFIC HANDLING ───
+        # Only episodic table has a timestamp column (REQUIRED).
+        # Semantic and procedural tables do NOT have timestamp.
+        if self.content_field == "episode":
+            # Handle wrapped structure: {"episode": {...}, "timestamp": ...}
+            # This happens when caller sends: {"episode": Episode(...), "timestamp": datetime}
+            if isinstance(raw_content, dict) and "episode" in raw_content:
+                actual_content = raw_content["episode"]  # Unwrap to get Episode fields only
+                logger.debug("[aput] Unwrapped episode content from nested structure")
+                
+                # Extract timestamp from content level if present
+                if "timestamp" in raw_content:
+                    ts = raw_content["timestamp"]
+                    if isinstance(ts, datetime):
+                        data["timestamp"] = ts.isoformat()
+                    elif isinstance(ts, str):
+                        data["timestamp"] = ts
+                    logger.debug("[aput] Extracted timestamp from raw_content: %s", data.get("timestamp"))
+            
+            # Fallback: check value level (in case timestamp passed at invoke level)
+            if "timestamp" not in data and "timestamp" in value:
+                ts = value["timestamp"]
                 if isinstance(ts, datetime):
                     data["timestamp"] = ts.isoformat()
                 elif isinstance(ts, str):
                     data["timestamp"] = ts
-        
-        # Also check for timestamp at the invoke-value level (fallback)
-        if "timestamp" not in data and "timestamp" in value:
-            ts = value["timestamp"]
-            if isinstance(ts, datetime):
-                data["timestamp"] = ts.isoformat()
-            elif isinstance(ts, str):
-                data["timestamp"] = ts
-        
-        # Final fallback: generate timestamp if still missing (for REQUIRED field)
-        if "timestamp" not in data:
-            data["timestamp"] = datetime.now(timezone.utc).isoformat()
-        # ─── END FIX ───
+                logger.debug("[aput] Extracted timestamp from value: %s", data.get("timestamp"))
+            
+            # Final fallback: generate timestamp if still missing (field is REQUIRED in schema)
+            if "timestamp" not in data:
+                data["timestamp"] = datetime.now(timezone.utc).isoformat()
+                logger.debug("[aput] Generated fallback timestamp: %s", data["timestamp"])
+        # ─── END EPISODIC-SPECIFIC HANDLING ───
+        # For semantic/procedural: actual_content = raw_content unchanged, no timestamp added
 
         text = self._normalize_structured_field(actual_content)
         embedding_content = json.dumps(text)
+        logger.debug("[aput] Normalized content: %s", text)
         data[self.content_field] = text
+        logger.debug("[aput] Value being inserted: %s", json.dumps(data, indent=2, default=str))
+        logger.debug("[aput] the type(data[self.content_field]): %s", type(data[self.content_field]))
 
         doc = Document(page_content=embedding_content, metadata=data, id=key)
 
+        # IMPORTANT: offload the blocking BigQuery call to a worker thread
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             None,
