@@ -21,6 +21,7 @@ from langgraph_slack import config
 from pro.http.ambient import router as ambient_router
 from pro.http.cron_lifecycle import ensure_ambient_cron_exists
 from pro.persistence import close_persistence_manager
+from pro.utils.blocking_detector import install_blocking_detector
 
 LOGGER = logging.getLogger(__name__)
 LANGGRAPH_CLIENT = get_client(url=config.LANGGRAPH_URL)
@@ -311,6 +312,14 @@ async def lifespan(app: FastAPI):
     """
     worker_task: asyncio.Task | None = None
     LOGGER.info("App is starting up. Creating background worker...")
+
+    # Install blocking detector early to catch event loop blocks
+    try:
+        install_blocking_detector()
+        LOGGER.info("✅ Blocking detector installed")
+    except Exception:
+        LOGGER.exception("⚠️ Failed to install blocking detector", exc_info=True)
+
     try:
         # Everything before the first `yield` is "startup".
         # If anything fails here, asynccontextmanager otherwise surfaces only
