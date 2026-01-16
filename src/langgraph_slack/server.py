@@ -327,9 +327,20 @@ async def lifespan(app: FastAPI):
         worker_task = asyncio.create_task(worker(), name="slack_background_worker")
         worker_task.add_done_callback(_log_task_result)
 
-        # Idempotent ambient SQL cron setup (runs on every deploy/restart)
-        await ensure_ambient_cron_exists()
+        # ✅ IMPORTANT: Don't block startup on external/network setup.
+        # LangGraph Cloud can mark the deployment unhealthy if import/startup is slow.
+        async def _post_startup_setup():
+            try:
+                # Gate with env so you can disable quickly if needed.
+                if os.getenv("AMBIENT_CRON_ENABLED", "true").lower() in {"1","true","yes","y"}:
+                    await ensure_ambient_cron_exists()
+                    LOGGER.info("✅ ensure_ambient_cron_exists finished")
+                else:
+                    LOGGER.info("AMBIENT_CRON_ENABLED=false; skipping cron setup")
+            except Exception:
+                LOGGER.exception("❌ Post-startup setup failed", exc_info=True)
 
+        asyncio.create_task(_post_startup_setup(), name="post_startup_setup")
         yield
     except Exception:
         # This is the money line: you'll now see the real startup exception.
