@@ -386,9 +386,9 @@ APP.include_router(ambient_router)
 
 @APP.post("/events/slack")
 async def slack_endpoint(req: Request):
-    """
-    Handle Slack events.
-    """
+    body = await req.json()
+    if body.get("type") == "url_verification" and "challenge" in body:
+        return {"challenge": body["challenge"]}
     return await APP_HANDLER.handle(req)
 
 
