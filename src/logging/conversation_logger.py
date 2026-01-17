@@ -22,7 +22,8 @@ from typing import (
     Dict,
     List,
     Any,
-    Optional
+    Optional,
+    TYPE_CHECKING,
 )
 from dataclasses import dataclass, asdict, fields
 from collections.abc import Mapping, Sequence
@@ -41,9 +42,9 @@ from collections.abc import Mapping, Sequence
 # and other methods that actually need it.
 # ============================================================================
 
-# SentenceTransformer is lighter but still pulls some deps - consider lazy-loading too
-# if startup is still slow. For now, it's less problematic than transformers.
-from sentence_transformers import SentenceTransformer
+if TYPE_CHECKING:
+    # Only for type hints; avoids importing torch at module import time.
+    from sentence_transformers import SentenceTransformer
 
 from pro.persistence import get_persistence_manager
 from pro.monitoring.langsmith_integration import get_langsmith_integration
@@ -546,7 +547,7 @@ class ConversationLogger:
                 logger.warning("HF cache dir %s not creatable: %s", self._hf_cache_dir, e)
 
         # Lazy model caches
-        self._embedding_model: Optional[SentenceTransformer] = None
+        self._embedding_model: Optional["SentenceTransformer"] = None
         self._sentiment_classifier = None
         self._formality_classifier = None
         self._emotion_classifier = None
@@ -561,7 +562,7 @@ class ConversationLogger:
 
         logger.info("ConversationLogger initialized for project %s", self.project_id)
 
-    def _ensure_embedding_model(self) -> SentenceTransformer:
+    def _ensure_embedding_model(self) -> "SentenceTransformer":
         """
         Lazy-load embedding model.
         
@@ -572,6 +573,8 @@ class ConversationLogger:
             with self._embed_lock:
                 if self._embedding_model is None:
                     try:
+                        # ✅ LAZY IMPORT: avoid torch import at startup
+                        from sentence_transformers import SentenceTransformer
                         # Check GCS cache first
                         cache = get_model_cache()
                         if cache:

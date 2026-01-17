@@ -4,6 +4,7 @@ This is where we define the BigQuery memory store,
 which connects the langmem longrun memory system to BigQuery.
 """
 from __future__ import annotations
+from functools import lru_cache
 import asyncio
 import concurrent.futures
 from collections.abc import Iterable as IterableABC
@@ -31,8 +32,6 @@ import google
 from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
 from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_google_community.bq_storage_vectorstores.bigquery import BigQueryVectorStore
 from langchain_google_community.bq_storage_vectorstores.utils import validate_column_in_bq_schema
 from langgraph.store.base import (
@@ -69,13 +68,30 @@ NamespaceTemplate = Tuple[str, ...]
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-embedding = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+@lru_cache(maxsize=1)
+def get_embedding():
+    """
+    Lazy embedding factory.
+    IMPORTANT: importing HuggingFaceEmbeddings at module scope can drag in torch
+    and slow startup. Keep the import inside this function.
+    """
+    from langchain_huggingface import HuggingFaceEmbeddings
+    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-try:
-    bq_client = bigquery.Client(credentials=CREDENTIALS, project=PROJECT_ID, location=LOCATION)
-    logger.info("BigQuery client initialized successfully.")
-except Exception as e:
-    logger.error("Failed to initialize BigQuery client: %s", e, exc_info=True)
+
+@lru_cache(maxsize=1)
+def get_bq_client() -> bigquery.Client:
+    """
+    Lazy BigQuery client factory.
+    Avoid doing API/client setup at import time.
+    """
+    try:
+        client = bigquery.Client(credentials=CREDENTIALS, project=PROJECT_ID, location=LOCATION)
+        logger.info("BigQuery client initialized successfully.")
+        return client
+    except Exception as e:
+        logger.error("Failed to initialize BigQuery client: %s", e, exc_info=True)
+        raise
 
 CONTENT_FIELDS = {
     SEMANTIC_TABLE: "fact",
@@ -492,8 +508,9 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         schema: Optional[List[bigquery.SchemaField]] = None,
         **kwargs,
     ) -> "BigQueryMemoryStore":
+        bq_client = get_bq_client()
         vectorstore = PatchedBigQueryVectorStore(
-            embedding=embedding,
+            embedding=get_embedding(),
             project_id=bq_client.project,
             doc_id_field="doc_id",
             dataset_name=dataset_name,
