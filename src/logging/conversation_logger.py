@@ -62,6 +62,10 @@ from src.langgraph_slack.config import (
 
 # Set up logging
 logger = logging.getLogger(__name__)
+# If true, we will proactively warm caches at startup (may import torch/transformers).
+# Default OFF to keep LangGraph Cloud startup fast & deterministic.
+_WARMUP_ENV = "MODEL_CACHE_WARMUP_ON_STARTUP"
+_WARMUP_ON_STARTUP = os.getenv(_WARMUP_ENV, "false").lower().strip() in ("1", "true", "yes", "on")
 
 # ---------------- Tone analysis token caps ----------------
 _TONE_MAX_LENGTH_ENV = "CONVERSATION_TONE_MAX_TOKENS"
@@ -475,8 +479,11 @@ def initialize_model_cache_strategy():
         if models_in_gcs == total_models:
             # ✅ All models validated and present in GCS - download them (fast!)
             logger.info("✅ All models found in GCS cache")
-            logger.info("📥 Downloading models from GCS in background...")
-            download_models_from_gcs_background(models, cache)
+            if _WARMUP_ON_STARTUP:
+                logger.info("📥 Warmup enabled (%s=true): downloading models from GCS in background...", _WARMUP_ENV)
+                download_models_from_gcs_background(models, cache)
+            else:
+                logger.info("⏭️  Warmup disabled (%s=false): will download from GCS on first use.", _WARMUP_ENV)
             
         elif models_in_gcs > 0:
             # ⚠️ Some models missing/incomplete - IMMEDIATE DOWNLOAD
