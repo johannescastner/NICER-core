@@ -34,7 +34,8 @@ if DEPLOY_MODAL:
         environ["SLACK_BOT_TOKEN"] = "fake-token"
     BOT_USER_ID = BOT_USER_ID or "fake-user-id"
 else:
-    assert isinstance(BOT_TOKEN, str)
+    if BOT_TOKEN is None:
+        LOGGER.warning("BOT_TOKEN not set - will be provided dynamically by router")
 
 LANGGRAPH_URL = environ.get("LANGGRAPH_URL")
 ASSISTANT_ID = environ.get("LANGGRAPH_ASSISTANT_ID", "default_assistant_id")
