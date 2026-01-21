@@ -1,5 +1,14 @@
 # src/langgraph_slack/server.py
-"""This is the slack server interface"""
+"""
+This is the slack server interface
+
+MULTI-TENANT SUPPORT (2026-01-21):
+Added /slack/event endpoint for CollectiWise Router.
+- Router forwards events with X-Slack-Bot-Token header
+- Token flows through task queue → LangGraph metadata → callback
+- Callback uses dynamic token for workspace-specific responses
+- Existing /events/slack endpoint preserved for backward compatibility
+"""
 import src.langgraph_slack.patch_typing  # must run before any Pydantic model loading
 import asyncio
 import contextlib
@@ -9,13 +18,14 @@ import re
 import json
 import uuid
 from urllib.parse import urlparse
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Optional
 from typing_extensions import TypedDict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from langgraph_sdk import get_client
 from slack_bolt.adapter.fastapi.async_handler import AsyncSlackRequestHandler
 from slack_bolt.async_app import AsyncApp
+from slack_sdk.web.async_client import AsyncWebClient  # NEW: for dynamic bot tokens
 from langgraph_slack import config
 # Ambient HTTP endpoints (closed-source)
 from pro.http.ambient import router as ambient_router
@@ -112,6 +122,10 @@ async def worker():
 async def _process_task(task: dict):
     event = task["event"]
     event_type = task["type"]
+    
+    # NEW: Extract bot_token if present (from router-forwarded events)
+    bot_token: Optional[str] = task.get("bot_token")
+    
     if event_type == "slack_message":
         thread_id = _get_thread_id(
             event.get("thread_ts") or event["ts"], event["channel"]
@@ -120,8 +134,15 @@ async def _process_task(task: dict):
         # This will connect to the loopback endpoint if not provided.
         webhook = f"{config.DEPLOYMENT_URL}/callbacks/{thread_id}"
 
-        if (await _is_mention(event)) or _is_dm(event):
-            text_with_names = await _build_contextual_message(event)
+        # NEW: Use bot_token-specific client for mention check if available
+        if bot_token:
+            is_mention = await _is_mention_with_token(event, bot_token)
+        else:
+            is_mention = await _is_mention(event)
+            
+        if is_mention or _is_dm(event):
+            # NEW: Pass bot_token for user name resolution
+            text_with_names = await _build_contextual_message(event, bot_token=bot_token)
         else:
             LOGGER.info("Skipping non-mention message")
             return
@@ -170,6 +191,33 @@ async def _process_task(task: dict):
         # swarm_graph's orchestrated workflow to ensure consistency and
         # capture of rich metadata like embeddings and sentiment.
 
+        # Build metadata - include bot_token if from router (for callback to use)
+        run_metadata = {
+            "event": "slack",
+            "slack_event_type": "message",
+            "bot_user_id": config.BOT_USER_ID,
+            "slack_user_id": event["user"],
+            "channel_id": channel_id,
+            "channel": channel_id,
+            "thread_ts": event.get("thread_ts"),
+            "event_ts": event["ts"],
+            "channel_type": event.get("channel_type"),
+            # 🚨 CRITICAL: Add conversation context to metadata for correlation
+            "conversation_id": conversation_id,
+        }
+        
+        # NEW: Include bot_token in metadata for callback to use
+        # This enables multi-tenant responses via router
+        if bot_token:
+            run_metadata["bot_token"] = bot_token
+            LOGGER.info(
+                "[%s].[%s] Using router-provided bot_token (redacted: %s...%s)",
+                channel_id,
+                thread_id,
+                bot_token[:10] if len(bot_token) > 15 else "***",
+                bot_token[-4:] if len(bot_token) > 15 else "***",
+            )
+
         result = await LANGGRAPH_CLIENT.runs.create(
             thread_id=thread_id,
             assistant_id=config.ASSISTANT_ID,
@@ -190,19 +238,7 @@ async def _process_task(task: dict):
                 "conversation_id": conversation_id,  # For cost tracking correlation
             },
             config=updated_graph_config,
-            metadata={
-                "event": "slack",
-                "slack_event_type": "message",
-                "bot_user_id": config.BOT_USER_ID,
-                "slack_user_id": event["user"],
-                "channel_id": channel_id,
-                "channel": channel_id,
-                "thread_ts": event.get("thread_ts"),
-                "event_ts": event["ts"],
-                "channel_type": event.get("channel_type"),
-                # 🚨 CRITICAL: Add conversation context to metadata for correlation
-                "conversation_id": conversation_id
-            },
+            metadata=run_metadata,
             multitask_strategy="interrupt",
             if_not_exists="create",
             webhook=webhook,
@@ -233,15 +269,41 @@ async def _process_task(task: dict):
         # The agent's response has already been logged by the `log_agent_turn`
         # node within the global graph.
 
-        await APP_HANDLER.app.client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            text=_clean_markdown(_get_text(response_message["content"])),
-            metadata={
-                "event_type": "webhook",
-                "event_payload": {"thread_id": event["thread_id"]},
-            },
-        )
+        # NEW: Use dynamic bot_token if present in metadata (multi-tenant support)
+        # This allows responding to the correct Slack workspace
+        callback_bot_token = event["metadata"].get("bot_token")
+        
+        if callback_bot_token:
+            # Multi-tenant: use workspace-specific token from router
+            LOGGER.info(
+                "[%s].[%s] Using router-provided bot_token for response (redacted: %s...%s)",
+                channel_id,
+                thread_ts,
+                callback_bot_token[:10] if len(callback_bot_token) > 15 else "***",
+                callback_bot_token[-4:] if len(callback_bot_token) > 15 else "***",
+            )
+            slack_client = AsyncWebClient(token=callback_bot_token)
+            await slack_client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=_clean_markdown(_get_text(response_message["content"])),
+                metadata={
+                    "event_type": "webhook",
+                    "event_payload": {"thread_id": event["thread_id"]},
+                },
+            )
+        else:
+            # Single-tenant fallback: use global APP_HANDLER client
+            await APP_HANDLER.app.client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                text=_clean_markdown(_get_text(response_message["content"])),
+                metadata={
+                    "event_type": "webhook",
+                    "event_payload": {"thread_id": event["thread_id"]},
+                },
+            )
+            
         LOGGER.info(
             "[%s].[%s] sent message to Slack for callback %s", 
             channel_id,
@@ -258,7 +320,7 @@ async def handle_message(
         ack: Callable
 ):
     """
-    Handle incoming Slack messages.
+    Handle incoming Slack messages (direct from Slack, not via router).
     """
     LOGGER.info("Enqueuing handle_message task...")
     nouser = not event.get("user")
@@ -272,6 +334,7 @@ async def handle_message(
         )
         return
 
+    # NOTE: No bot_token here - this path uses global APP_HANDLER client
     TASK_QUEUE.put_nowait({"type": "slack_message", "event": event})
     await ack()
 
@@ -397,11 +460,110 @@ APP.include_router(ambient_router)
 
 @APP.post("/events/slack")
 async def slack_endpoint(req: Request):
+    """
+    EXISTING ENDPOINT: Direct Slack → Agent communication.
+    Preserved for backward compatibility during transition.
+    Uses global APP_HANDLER with environment-configured bot token.
+    """
     body = await req.json()
     if body.get("type") == "url_verification" and "challenge" in body:
         return {"challenge": body["challenge"]}
     return await APP_HANDLER.handle(req)
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NEW: Multi-Tenant Router Endpoint
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@APP.post("/slack/event")
+async def slack_event_from_router(req: Request):
+    """
+    NEW ENDPOINT: CollectiWise Router → Agent communication.
+    
+    The centralized router forwards Slack events from multiple workspaces.
+    Each request includes:
+    - X-CollectiWise-Router: true (for auth)
+    - X-Slack-Bot-Token: xoxb-... (workspace-specific token)
+    - X-Slack-Team-Id: T... (for logging)
+    
+    The bot_token flows through to the callback handler, enabling
+    responses to the correct Slack workspace.
+    """
+    # Extract router-provided headers
+    bot_token = req.headers.get("x-slack-bot-token")
+    team_id = req.headers.get("x-slack-team-id", "unknown")
+    
+    LOGGER.info(
+        "🔀 Router-forwarded event from team=%s (bot_token present: %s)",
+        team_id,
+        bool(bot_token),
+    )
+    
+    body = await req.json()
+    
+    # Handle Slack URL verification (shouldn't happen via router, but just in case)
+    if body.get("type") == "url_verification" and "challenge" in body:
+        LOGGER.info("Responding to URL verification challenge via router")
+        return {"challenge": body["challenge"]}
+    
+    # Extract the event
+    event = body.get("event", {})
+    event_type = event.get("type")
+    
+    if not event_type:
+        LOGGER.warning("No event type in router-forwarded body: %s", body)
+        return {"ok": True}  # Ack anyway to satisfy Slack
+    
+    # Filter: only process messages and app_mentions
+    if event_type not in ("message", "app_mention"):
+        LOGGER.info("Ignoring non-message event type: %s", event_type)
+        return {"ok": True}
+    
+    # Skip bot's own messages
+    if event.get("bot_id"):
+        LOGGER.info("Ignoring bot message from bot_id=%s", event.get("bot_id"))
+        return {"ok": True}
+    
+    # Skip messages without user (system messages, etc.)
+    if not event.get("user"):
+        LOGGER.info("Ignoring message without user")
+        return {"ok": True}
+    
+    # For message events, check if it's a mention or DM
+    if event_type == "message":
+        # Check if it's a mention using the bot token
+        if bot_token:
+            is_mention = await _is_mention_with_token(event, bot_token)
+        else:
+            is_mention = await _is_mention(event)
+        
+        is_dm = _is_dm(event)
+        
+        if not (is_mention or is_dm):
+            LOGGER.info("Ignoring non-mention, non-DM message")
+            return {"ok": True}
+    
+    # Enqueue for processing with bot_token
+    LOGGER.info(
+        "🔀 Enqueuing router event: type=%s, user=%s, channel=%s, team=%s",
+        event_type,
+        event.get("user"),
+        event.get("channel"),
+        team_id,
+    )
+    
+    TASK_QUEUE.put_nowait({
+        "type": "slack_message",
+        "event": event,
+        "bot_token": bot_token,  # NEW: flows through to callback
+    })
+    
+    return {"ok": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helper Functions
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _get_text(content: str | list[dict]):
     if isinstance(content, str):
@@ -436,12 +598,33 @@ async def webhook_callback(req: Request):
 
 
 async def _is_mention(event: SlackMessageData):
+    """Check if event mentions the bot using global APP_HANDLER client."""
     global USER_ID_PATTERN
     if not config.BOT_USER_ID or config.BOT_USER_ID == "fake-user-id":
         config.BOT_USER_ID = (await APP_HANDLER.app.client.auth_test())["user_id"]
         USER_ID_PATTERN = re.compile(rf"<@{config.BOT_USER_ID}>")
     matches = re.search(USER_ID_PATTERN, event["text"])
     return bool(matches)
+
+
+async def _is_mention_with_token(event: SlackMessageData, bot_token: str) -> bool:
+    """
+    NEW: Check if event mentions the bot using a specific bot token.
+    Used for router-forwarded events where we have workspace-specific token.
+    """
+    try:
+        client = AsyncWebClient(token=bot_token)
+        auth_result = await client.auth_test()
+        bot_user_id = auth_result["user_id"]
+        pattern = re.compile(rf"<@{bot_user_id}>")
+        matches = re.search(pattern, event.get("text", ""))
+        return bool(matches)
+    except Exception as exc:
+        LOGGER.warning(
+            "Failed to check mention with bot_token: %s. Falling back to global check.",
+            exc
+        )
+        return await _is_mention(event)
 
 
 def _get_thread_id(thread_ts: str, channel: str) -> str:
@@ -455,23 +638,33 @@ def _is_dm(event: SlackMessageData):
 
 
 async def _fetch_thread_history(
-    channel_id: str, thread_ts: str
+    channel_id: str, thread_ts: str, *, bot_token: Optional[str] = None
 ) -> list[SlackMessageData]:
     """
     Fetch all messages in a Slack thread, following pagination if needed.
+    
+    NEW: Accepts optional bot_token for multi-tenant support.
     """
     LOGGER.info(
-        "Fetching thread history for channel=%s, thread_ts=%s", 
+        "Fetching thread history for channel=%s, thread_ts=%s (bot_token: %s)", 
         channel_id,
-        thread_ts
+        thread_ts,
+        "provided" if bot_token else "global",
     )
+    
+    # Use provided token or fall back to global client
+    if bot_token:
+        client = AsyncWebClient(token=bot_token)
+    else:
+        client = APP_HANDLER.app.client
+    
     all_messages = []
     cursor = None
 
     while True:
         try:
             if cursor:
-                response = await APP_HANDLER.app.client.conversations_replies(
+                response = await client.conversations_replies(
                     channel=channel_id,
                     ts=thread_ts,
                     inclusive=True,
@@ -479,7 +672,7 @@ async def _fetch_thread_history(
                     cursor=cursor,
                 )
             else:
-                response = await APP_HANDLER.app.client.conversations_replies(
+                response = await client.conversations_replies(
                     channel=channel_id,
                     ts=thread_ts,
                     inclusive=True,
@@ -499,11 +692,23 @@ async def _fetch_thread_history(
     return all_messages
 
 
-async def _fetch_user_names(user_ids: set[str]) -> dict[str, str]:
-    """Fetch and cache Slack display names for user IDs."""
+async def _fetch_user_names(
+    user_ids: set[str], *, bot_token: Optional[str] = None
+) -> dict[str, str]:
+    """
+    Fetch and cache Slack display names for user IDs.
+    
+    NEW: Accepts optional bot_token for multi-tenant support.
+    """
+    # Use provided token or fall back to global client
+    if bot_token:
+        client = AsyncWebClient(token=bot_token)
+    else:
+        client = APP_HANDLER.app.client
+    
     uncached_ids = [uid for uid in user_ids if uid not in USER_NAME_CACHE]
     if uncached_ids:
-        tasks = [APP_HANDLER.app.client.users_info(user=uid) for uid in uncached_ids]
+        tasks = [client.users_info(user=uid) for uid in uncached_ids]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for uid, result in zip(uncached_ids, results):
             if isinstance(result, Exception):
@@ -522,12 +727,19 @@ async def _fetch_user_names(user_ids: set[str]) -> dict[str, str]:
     return {uid: USER_NAME_CACHE[uid] for uid in user_ids if uid in USER_NAME_CACHE}
 
 
-async def _build_contextual_message(event: SlackMessageData) -> str:
-    """Build a message with thread context, using display names for all users."""
+async def _build_contextual_message(
+    event: SlackMessageData, *, bot_token: Optional[str] = None
+) -> str:
+    """
+    Build a message with thread context, using display names for all users.
+    
+    NEW: Accepts optional bot_token for multi-tenant support.
+    """
     thread_ts = event.get("thread_ts") or event["ts"]
     channel_id = event["channel"]
 
-    history = await _fetch_thread_history(channel_id, thread_ts)
+    # Pass bot_token to helper functions
+    history = await _fetch_thread_history(channel_id, thread_ts, bot_token=bot_token)
     included = []
     for msg in reversed(history):
         if msg.get("bot_id") == config.BOT_USER_ID:
@@ -542,7 +754,8 @@ async def _build_contextual_message(event: SlackMessageData) -> str:
     all_user_ids.add(event["user"])
     all_user_ids.update(MENTION_REGEX.findall(event["text"]))
 
-    user_names = await _fetch_user_names(all_user_ids)
+    # Pass bot_token to user name fetcher
+    user_names = await _fetch_user_names(all_user_ids, bot_token=bot_token)
 
     def format_message(msg: SlackMessageData) -> str:
         text = msg["text"]

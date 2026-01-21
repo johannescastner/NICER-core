@@ -48,7 +48,7 @@ def _to_str(x: Any) -> str:
 
 def _redact_header_val(k: str, v: Any) -> Any:
     lk = (k or "").lower()
-    if lk in {"authorization", "cookie", "set-cookie", "x-api-key", "x_auth_token"}:
+    if lk in {"authorization", "cookie", "set-cookie", "x-api-key", "x_auth_token", "x-slack-bot-token"}:
         s = _to_str(v)
         return (s[:6] + "…" + s[-4:]) if len(s) > 12 else "…"
     return v
@@ -86,6 +86,7 @@ def _collect_debug(headers: Any, request: Any, *, path: Any, method: Any) -> dic
         "x-cloud-trace-context",
         "authorization",
         "x-api-key",
+        "x-collectiwise-router",  # NEW: for router debugging
     ]
     subset = {}
     for k in keys:
@@ -168,6 +169,16 @@ async def authenticate(request, path, headers, method):
         print(f"🔥 AUTH: Allowing Studio origin (origin={origin_s!r})")
         logger.info(f"auth: Studio origin allowed (origin={origin_s!r})", extra=dbg)
         return {"identity": "studio-user", "permissions": ["read", "write"]}
+
+    # ─────────────────────────────────────────────────────────────
+    # 2.5) Allow CollectiWise Slack Router (multi-tenant support)
+    # The centralized router forwards Slack events to client deployments
+    # ─────────────────────────────────────────────────────────────
+    router_header = _hget(headers, "x-collectiwise-router")
+    if router_header and _to_str(router_header).lower() == "true":
+        print(f"🔥 AUTH: Allowing CollectiWise Router")
+        logger.info("auth: CollectiWise Router allowed", extra=dbg)
+        return {"identity": "collectiwise-router", "permissions": ["read", "write"]}
 
     # ─────────────────────────────────────────────────────────────
     # 3) PROD external policy: Slackbot UA OR API key
