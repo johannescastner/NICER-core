@@ -350,7 +350,10 @@ async def just_ack(ack: Callable[..., Awaitable], event):
     await ack()
 
 
-APP_HANDLER = AsyncSlackRequestHandler(AsyncApp(logger=LOGGER))
+APP_HANDLER = AsyncSlackRequestHandler(AsyncApp(
+    token="xoxb-placeholder-for-multi-tenant-router",
+    logger=LOGGER
+))
 MENTION_REGEX = re.compile(r"<@([A-Z0-9]+)>")
 USER_ID_PATTERN = re.compile(rf"<@{config.BOT_USER_ID}>")
 APP_HANDLER.app.event("message")(ack=just_ack, lazy=[handle_message])
