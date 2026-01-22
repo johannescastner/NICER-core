@@ -18,7 +18,7 @@ import logging
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
 
-from src.logging.conversation_logger import ConversationLogger
+from src.nicer_logging.conversation_logger import ConversationLogger
 from src.metrics.knowledge_discovery_metrics import (
     SQLAgentPerformanceEvaluator,
     DiscoveredFact,

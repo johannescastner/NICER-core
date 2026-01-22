@@ -24,7 +24,7 @@ from langchain_core.messages import (
 )
 from langchain_core.runnables import RunnableConfig
 
-from src.logging import get_conversation_logger
+from src.nicer_logging import get_conversation_logger
 
 _logger = logging.getLogger(__name__)
  

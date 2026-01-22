@@ -1,5 +1,5 @@
 """Pre-initialize ConversationLogger at module import time."""
-from src.logging.conversation_logger import ConversationLogger
+from src.nicer_logging.conversation_logger import ConversationLogger
 
 # Force instantiation during import (before any graph is created)
 # This ensures models are loaded BEFORE the queue worker starts
