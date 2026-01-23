@@ -102,9 +102,9 @@ _compiled_graphs: Dict[str, CompiledStateGraph] = {}
 #   - ("module_factory", (module, func_name)) → getattr(module, func_name)(checkpointer=...)
 GRAPH_CONFIG = {
     "chat": ("compiled", chat_pro),  # Already compiled, no checkpointer support
-    "sql_agent": ("builder", get_sql_graph),  # Returns StateGraph builder
+    "sql_agent": ("factory", get_sql_graph),  # Factory accepts checkpointer parameter
     "swarm": ("module_factory", (swarm_module, "create_sql_swarm")),  # Factory in module
-    "ambient_sql": ("builder", create_ambient_sql_graph),  # Returns builder
+    "ambient_sql": ("builder", create_ambient_sql_graph),  # Returns builder - VERIFY THIS!
 }
 
 # Default graph for Slack messages
