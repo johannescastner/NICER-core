@@ -40,6 +40,10 @@ from slack_bolt.async_app import AsyncApp
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
+# PostgreSQL connection pool (required for AsyncPostgresSaver)
+from psycopg_pool import AsyncConnectionPool
+from psycopg.rows import dict_row
+
 from langgraph_slack import config
 from langgraph_slack.auth_fastapi import verify_request  # New auth module
 
@@ -50,7 +54,6 @@ from pro.persistence import close_persistence_manager
 from pro.utils.blocking_detector import install_blocking_detector
 
 # Set MIT mode BEFORE importing swarm_graph to prevent auto-creation
-import os
 os.environ["LANGGRAPH_MIT_MODE"] = "true"
 
 # Import graph builders/factories
@@ -84,6 +87,9 @@ except Exception as e:
 
 # Global checkpointer - initialized in lifespan
 _checkpointer: Optional[AsyncPostgresSaver] = None
+
+# Global connection pool - initialized in lifespan, cleaned up on shutdown
+_connection_pool: Optional[AsyncConnectionPool] = None
 
 # Compiled graphs - initialized in lifespan
 _compiled_graphs: Dict[str, CompiledStateGraph] = {}
@@ -138,20 +144,59 @@ def _build_database_uri() -> str:
 
 
 async def _init_checkpointer() -> AsyncPostgresSaver:
-    """Initialize the PostgreSQL checkpointer."""
-    global _checkpointer
+    """
+    Initialize the PostgreSQL checkpointer with connection pool.
+    
+    IMPORTANT: AsyncPostgresSaver.from_conn_string() returns an async context
+    manager, not a checkpointer directly. For long-running servers, we need
+    to manage the connection pool ourselves.
+    
+    Required psycopg settings:
+    - autocommit=True: Required for setup() to commit table creation
+    - row_factory=dict_row: Required because AsyncPostgresSaver uses dict-style row access
+    """
+    global _checkpointer, _connection_pool
     
     database_uri = _build_database_uri()
-    LOGGER.info("Initializing AsyncPostgresSaver with URI: %s", 
-                database_uri.replace(os.getenv("DB_PASSWORD", ""), "***"))
     
-    _checkpointer = AsyncPostgresSaver.from_conn_string(database_uri)
+    # Create connection pool (stays open for app lifetime)
+    # IMPORTANT: autocommit=True and row_factory=dict_row are REQUIRED
+    _connection_pool = AsyncConnectionPool(
+        conninfo=database_uri,
+        max_size=20,
+        open=False,
+        kwargs={
+            "autocommit": True,
+            "row_factory": dict_row,
+        }
+    )
+    await _connection_pool.open(wait=True, timeout=30)
+    LOGGER.info("✅ Connection pool opened (max_size=20)")
     
-    # Create checkpoint tables if they don't exist
+    # Create checkpointer with the pool
+    _checkpointer = AsyncPostgresSaver(conn=_connection_pool)
+    
+    # Setup tables (idempotent - safe to call every startup)
+    # Creates: checkpoint_migrations, checkpoints, checkpoint_blobs, checkpoint_writes
     await _checkpointer.setup()
     LOGGER.info("✅ Checkpointer initialized and tables created")
     
     return _checkpointer
+
+
+async def _cleanup_checkpointer():
+    """Cleanup connection pool on shutdown."""
+    global _connection_pool, _checkpointer
+    
+    if _connection_pool:
+        try:
+            await _connection_pool.close()
+            LOGGER.info("✅ Connection pool closed")
+        except Exception as e:
+            LOGGER.warning("⚠️ Error closing connection pool: %s", e)
+        _connection_pool = None
+    
+    _checkpointer = None
 
 
 async def _compile_graphs(checkpointer: AsyncPostgresSaver) -> Dict[str, CompiledStateGraph]:
@@ -724,12 +769,8 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
         
-        # Close checkpointer connection
-        if _checkpointer:
-            try:
-                await _checkpointer.conn.close()
-            except Exception:
-                pass
+        # Close checkpointer connection pool
+        await _cleanup_checkpointer()
 
 
 APP = FastAPI(lifespan=lifespan)

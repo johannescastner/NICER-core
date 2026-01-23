@@ -74,6 +74,40 @@ except Exception as e:
     SERVICE_ACCOUNT_INFO = {}
     CREDENTIALS = None
 
+# ───────────────────── CollectiWise Central Service Account ─────────────────────
+CW_SERVICE_ACCOUNT_BASE64 = environ.get("CW_SERVICE_ACCOUNT_BASE64", "")
+
+# Fallback logic with appropriate warnings
+if not CW_SERVICE_ACCOUNT_BASE64:
+    CW_SERVICE_ACCOUNT_BASE64 = GCP_SERVICE_ACCOUNT_BASE64
+    if GCP_SERVICE_ACCOUNT_BASE64:
+        LOGGER.warning(
+            "⚠️  CW_SERVICE_ACCOUNT_BASE64 not set - falling back to GCP_SERVICE_ACCOUNT_BASE64. "
+            "This is only valid for canary or dev deployments."
+        )
+
+# Parse CollectiWise credentials
+try:
+    if CW_SERVICE_ACCOUNT_BASE64:
+        cw_service_account_json = base64.b64decode(CW_SERVICE_ACCOUNT_BASE64).decode("utf-8")
+        CW_SERVICE_ACCOUNT_INFO: dict = json.loads(cw_service_account_json)
+        CW_CREDENTIALS = service_account.Credentials.from_service_account_info(CW_SERVICE_ACCOUNT_INFO)
+        CW_PROJECT_ID = CW_SERVICE_ACCOUNT_INFO.get("project_id", "collectiwise-nicer")
+    else:
+        CW_SERVICE_ACCOUNT_INFO = {}
+        CW_CREDENTIALS = None
+        CW_PROJECT_ID = "collectiwise-nicer"
+except Exception as e:
+    LOGGER.error("Failed to load CollectiWise central SA: %s", e)
+    CW_CREDENTIALS = None
+    CW_PROJECT_ID = "collectiwise-nicer"
+
+# Location-aware dataset naming
+def get_regional_dataset_suffix(location: str) -> str:
+    return location.lower().replace("-", "_")
+
+CENTRAL_DATASET_SUFFIX = get_regional_dataset_suffix(LOCATION)
+CENTRAL_DATASET_ID = f"agent_cognitive_processes_{CENTRAL_DATASET_SUFFIX}"
 # Best-effort derive the SA email from embedded credentials.
 # This is useful for provisioning scripts that need to grant Secret Manager access
 # to the runtime identity without forcing clients to repeat themselves.
