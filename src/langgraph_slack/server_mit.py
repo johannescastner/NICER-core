@@ -104,7 +104,7 @@ GRAPH_CONFIG = {
     "chat": ("compiled", chat_pro),  # Already compiled, no checkpointer support
     "sql_agent": ("factory", get_sql_graph),  # Factory accepts checkpointer parameter
     "swarm": ("module_factory", (swarm_module, "create_sql_swarm")),  # Factory in module
-    "ambient_sql": ("builder", create_ambient_sql_graph),  # Returns builder - VERIFY THIS!
+    "ambient_sql": ("factory", create_ambient_sql_graph),  # Returns builder - VERIFY THIS!
 }
 
 # Default graph for Slack messages
