@@ -59,8 +59,8 @@ os.environ["LANGGRAPH_MIT_MODE"] = "true"
 # Import graph builders/factories
 # NOTE: We import FACTORIES (not pre-compiled graphs) so we can inject checkpointer
 from pro.graphs.chat_pro import chat_pro  # Pre-compiled, will use as-is
-from pro.graphs.sql_graph import get_sql_graph  # Returns builder
-from pro.graphs.ambient_sql_graph import create_ambient_sql_graph  # Returns builder
+from pro.graphs.sql_graph import get_sql_graph_standalone  # MIT mode: accepts checkpointer
+from pro.graphs.ambient_sql_graph import create_ambient_sql_graph_standalone  # MIT mode: accepts checkpointer
 
 # Import swarm_graph module to access both the factory AND any existing instance
 import pro.graphs.swarm_graph as swarm_module
@@ -102,9 +102,9 @@ _compiled_graphs: Dict[str, CompiledStateGraph] = {}
 #   - ("module_factory", (module, func_name)) → getattr(module, func_name)(checkpointer=...)
 GRAPH_CONFIG = {
     "chat": ("compiled", chat_pro),  # Already compiled, no checkpointer support
-    "sql_agent": ("factory", get_sql_graph),  # Factory accepts checkpointer parameter
+    "sql_agent": ("factory", get_sql_graph_standalone),  # MIT mode: accepts checkpointer
     "swarm": ("module_factory", (swarm_module, "create_sql_swarm")),  # Factory in module
-    "ambient_sql": ("factory", create_ambient_sql_graph),  # Returns builder - VERIFY THIS!
+    "ambient_sql": ("factory", create_ambient_sql_graph_standalone),  # MIT mode: accepts checkpointer
 }
 
 # Default graph for Slack messages
