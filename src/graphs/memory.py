@@ -32,6 +32,7 @@ import google
 from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain_google_community.bq_storage_vectorstores.bigquery import BigQueryVectorStore
 from langchain_google_community.bq_storage_vectorstores.utils import validate_column_in_bq_schema
 from langgraph.store.base import (
@@ -68,7 +69,7 @@ NamespaceTemplate = Tuple[str, ...]
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
-class ModalEmbeddings:
+class ModalEmbeddings(Embeddings):
     """
     LangChain-compatible embeddings wrapper that calls Modal endpoints.
     
