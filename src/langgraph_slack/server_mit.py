@@ -110,6 +110,9 @@ GRAPH_CONFIG = {
 # Default graph for Slack messages
 DEFAULT_GRAPH = os.getenv("DEFAULT_GRAPH", "swarm")
 
+# Graph invocation timeout (seconds) - prevents hung requests
+GRAPH_TIMEOUT = float(os.getenv("GRAPH_TIMEOUT", "300"))  # 5 minutes default
+
 
 def _build_database_uri() -> str:
     """
@@ -154,13 +157,14 @@ async def _init_checkpointer() -> AsyncPostgresSaver:
     Required psycopg settings:
     - autocommit=True: Required for setup() to commit table creation
     - row_factory=dict_row: Required because AsyncPostgresSaver uses dict-style row access
+    - prepare_threshold=0: Prevents DuplicatePreparedStatement errors in connection pools
     """
     global _checkpointer, _connection_pool
     
     database_uri = _build_database_uri()
     
     # Create connection pool (stays open for app lifetime)
-    # IMPORTANT: autocommit=True and row_factory=dict_row are REQUIRED
+    # CRITICAL: All three kwargs are REQUIRED for reliable operation
     _connection_pool = AsyncConnectionPool(
         conninfo=database_uri,
         max_size=20,
@@ -168,10 +172,11 @@ async def _init_checkpointer() -> AsyncPostgresSaver:
         kwargs={
             "autocommit": True,
             "row_factory": dict_row,
+            "prepare_threshold": 0,  # Prevents DuplicatePreparedStatement errors
         }
     )
     await _connection_pool.open(wait=True, timeout=30)
-    LOGGER.info("✅ Connection pool opened (max_size=20)")
+    LOGGER.info("✅ Connection pool opened (max_size=20, prepare_threshold=0)")
     
     # Create checkpointer with the pool
     _checkpointer = AsyncPostgresSaver(conn=_connection_pool)
@@ -211,9 +216,9 @@ async def _compile_graphs(checkpointer: AsyncPostgresSaver) -> Dict[str, Compile
     """
     global _compiled_graphs
     
-    for name, config in GRAPH_CONFIG.items():
-        pattern = config[0]
-        source = config[1]
+    for name, graph_config in GRAPH_CONFIG.items():
+        pattern = graph_config[0]
+        source = graph_config[1]
         
         try:
             if pattern == "factory":
@@ -303,13 +308,13 @@ async def worker():
             if task is None:
                 LOGGER.info("Worker received sentinel, exiting.")
                 break
-            LOGGER.info("Worker got a new task: %s", task.get("type"))
+            LOGGER.info("👷 Worker got a new task: %s", task.get("type"))
             await _process_task(task)
         except asyncio.CancelledError:
             LOGGER.info("Worker task was cancelled.")
             break
         except Exception as exc:
-            LOGGER.exception("Error in worker: %s", exc)
+            LOGGER.exception("❌ Error in worker: %s", exc)
         finally:
             if task is not None:
                 TASK_QUEUE.task_done()
@@ -321,12 +326,33 @@ async def _process_task(task: dict):
     event_type = task["type"]
     bot_token: Optional[str] = task.get("bot_token")
     
+    LOGGER.info("📋 Processing task: type=%s, event_channel=%s", event_type, event.get("channel"))
+    
     if event_type == "slack_message":
         await _handle_slack_message(event, bot_token)
     elif event_type == "callback":
         await _handle_callback(event)
     else:
         raise ValueError(f"Unknown event type: {event_type}")
+
+
+def _extract_message_content(message) -> str:
+    """
+    Safely extract content from a message object.
+    
+    Handles both:
+    - Pydantic AIMessage objects (from LangGraph): use .content attribute
+    - Plain dicts (from manual construction): use .get("content", "")
+    """
+    if hasattr(message, 'content'):
+        # Pydantic model (AIMessage, HumanMessage, etc.)
+        return message.content
+    elif isinstance(message, dict):
+        # Plain dict
+        return message.get("content", "")
+    else:
+        LOGGER.warning("Unknown message type: %s", type(message))
+        return str(message)
 
 
 async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str]):
@@ -336,6 +362,9 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
     This replaces the langgraph_sdk.runs.create() call with direct graph invocation.
     LangSmith tracing is added for observability (optional but recommended).
     """
+    LOGGER.info("🔔 _handle_slack_message ENTERED: user=%s, channel=%s, bot_token=%s",
+                event.get("user"), event.get("channel"), bool(bot_token))
+    
     thread_id = _get_thread_id(
         event.get("thread_ts") or event["ts"], event["channel"]
     )
@@ -348,8 +377,11 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
     else:
         is_mention = await _is_mention(event)
     
-    if not (is_mention or _is_dm(event)):
-        LOGGER.info("Skipping non-mention message")
+    is_dm = _is_dm(event)
+    LOGGER.info("📊 Message check: is_mention=%s, is_dm=%s", is_mention, is_dm)
+    
+    if not (is_mention or is_dm):
+        LOGGER.info("⏭️ Skipping non-mention, non-DM message")
         return
     
     # Build contextual message with thread history
@@ -362,9 +394,10 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
     turn_number = 1  # TODO: Track actual turn number via checkpointer state
     
     LOGGER.info(
-        "[%s].[%s] invoking graph with message: %s...",
+        "[%s].[%s] 🚀 Invoking graph '%s' with message: %s...",
         channel_id,
         thread_id,
+        DEFAULT_GRAPH,
         text_with_names[:100],
     )
     
@@ -413,9 +446,10 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
     try:
         # Get the default graph and invoke it directly
         graph = get_graph(DEFAULT_GRAPH)
+        LOGGER.info("📊 Got graph '%s', starting invocation with timeout=%ss...", DEFAULT_GRAPH, GRAPH_TIMEOUT)
         
         # ════════════════════════════════════════════════════════════════════
-        # Invoke graph with optional LangSmith tracing
+        # Invoke graph with optional LangSmith tracing and timeout
         # ════════════════════════════════════════════════════════════════════
         if _LSI is not None:
             # Wrap execution in LangSmith turn tracing for observability
@@ -431,26 +465,37 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
             ) as turn:
                 turn.set_inputs({"messages": graph_input["messages"]})
                 
-                result = await graph.ainvoke(graph_input, config=graph_config)
+                # Invoke with timeout to prevent hung requests
+                result = await asyncio.wait_for(
+                    graph.ainvoke(graph_input, config=graph_config),
+                    timeout=GRAPH_TIMEOUT
+                )
                 
                 # Record outputs for LangSmith
                 messages = result.get("messages", [])
                 if messages:
-                    last_msg = messages[-1]
-                    content = last_msg.content if hasattr(last_msg, 'content') else last_msg.get("content", "")
+                    content = _extract_message_content(messages[-1])
                     turn.set_outputs({"response": _get_text(content)})
         else:
-            # No LangSmith - just invoke directly
-            result = await graph.ainvoke(graph_input, config=graph_config)
+            # No LangSmith - just invoke directly with timeout
+            result = await asyncio.wait_for(
+                graph.ainvoke(graph_input, config=graph_config),
+                timeout=GRAPH_TIMEOUT
+            )
         
-        LOGGER.info("[%s].[%s] Graph execution complete", channel_id, thread_id)
+        LOGGER.info("[%s].[%s] ✅ Graph execution complete", channel_id, thread_id)
         
         # Extract response and send to Slack
         messages = result.get("messages", [])
+        LOGGER.info("[%s].[%s] 📨 Result has %d messages", channel_id, thread_id, len(messages))
+        
         if messages:
             response_message = messages[-1]
-            content = response_message.content if hasattr(response_message, 'content') else response_message.get("content", "")
+            content = _extract_message_content(response_message)
             response_text = _get_text(content)
+            
+            LOGGER.info("[%s].[%s] 📤 Sending response (%d chars) to Slack...", 
+                       channel_id, thread_id, len(response_text))
             
             # Send response to Slack
             await _send_slack_response(
@@ -460,15 +505,23 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
                 bot_token=bot_token,
             )
         else:
-            LOGGER.warning("[%s].[%s] No messages in graph result", channel_id, thread_id)
+            LOGGER.warning("[%s].[%s] ⚠️ No messages in graph result", channel_id, thread_id)
             
-    except Exception as e:
-        LOGGER.exception("[%s].[%s] Graph execution failed: %s", channel_id, thread_id, e)
-        # Optionally send error message to Slack
+    except asyncio.TimeoutError:
+        LOGGER.error("[%s].[%s] ⏰ Graph execution timed out after %ss", channel_id, thread_id, GRAPH_TIMEOUT)
         await _send_slack_response(
             channel_id=channel_id,
             thread_ts=metadata["thread_ts"],
-            text=f"Sorry, I encountered an error processing your request.",
+            text="Sorry, the request took too long to process. Please try again.",
+            bot_token=bot_token,
+        )
+    except Exception as e:
+        LOGGER.exception("[%s].[%s] ❌ Graph execution failed: %s", channel_id, thread_id, e)
+        # Send error message to Slack
+        await _send_slack_response(
+            channel_id=channel_id,
+            thread_ts=metadata["thread_ts"],
+            text="Sorry, I encountered an error processing your request.",
             bot_token=bot_token,
         )
 
@@ -486,7 +539,8 @@ async def _handle_callback(event: dict):
     if not channel_id:
         raise ValueError("Channel ID not found in event metadata")
     
-    response_text = _get_text(response_message.get("content", ""))
+    content = _extract_message_content(response_message)
+    response_text = _get_text(content)
     
     await _send_slack_response(
         channel_id=channel_id,
@@ -515,6 +569,11 @@ async def _send_slack_response(
         client = AsyncWebClient(token=bot_token)
     else:
         # Single-tenant fallback
+        LOGGER.info(
+            "[%s].[%s] Using APP_HANDLER client (no bot_token provided)",
+            channel_id,
+            thread_ts,
+        )
         client = APP_HANDLER.app.client
     
     await client.chat_postMessage(
@@ -523,7 +582,7 @@ async def _send_slack_response(
         text=cleaned_text,
     )
     
-    LOGGER.info("[%s].[%s] Sent message to Slack", channel_id, thread_ts)
+    LOGGER.info("[%s].[%s] ✅ Sent message to Slack (%d chars)", channel_id, thread_ts, len(cleaned_text))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -533,8 +592,10 @@ async def _send_slack_response(
 def _get_text(content: str | list[dict]) -> str:
     if isinstance(content, str):
         return content
+    elif isinstance(content, list):
+        return "".join([block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"])
     else:
-        return "".join([block["text"] for block in content if block.get("type") == "text"])
+        return str(content)
 
 
 def _clean_markdown(text: str) -> str:
@@ -555,17 +616,43 @@ def _is_dm(event: SlackMessageData) -> bool:
     return event.get("channel_type") == "im"
 
 
+def _detect_mention_from_text(event: SlackMessageData, bot_user_id: str) -> bool:
+    """Check if the event text contains a mention of the given bot user ID."""
+    text = event.get("text", "")
+    pattern = re.compile(rf"<@{bot_user_id}>")
+    return bool(re.search(pattern, text))
+
+
 async def _is_mention(event: SlackMessageData) -> bool:
-    """Check if event mentions the bot using global client."""
-    if not config.BOT_USER_ID or config.BOT_USER_ID == "fake-user-id":
-        try:
-            auth_result = await APP_HANDLER.app.client.auth_test()
-            config.BOT_USER_ID = auth_result["user_id"]
-        except Exception:
-            return False
+    """
+    Check if event mentions the bot using global client.
     
-    pattern = re.compile(rf"<@{config.BOT_USER_ID}>")
-    return bool(re.search(pattern, event.get("text", "")))
+    Falls back to checking if ANY mention exists if we can't determine bot_user_id.
+    """
+    # Try to use cached bot_user_id
+    if config.BOT_USER_ID and config.BOT_USER_ID != "fake-user-id":
+        return _detect_mention_from_text(event, config.BOT_USER_ID)
+    
+    # Try to get bot_user_id via auth_test
+    try:
+        auth_result = await APP_HANDLER.app.client.auth_test()
+        config.BOT_USER_ID = auth_result["user_id"]
+        LOGGER.info("🔑 Cached BOT_USER_ID from auth_test: %s", config.BOT_USER_ID)
+        return _detect_mention_from_text(event, config.BOT_USER_ID)
+    except Exception as e:
+        LOGGER.warning("⚠️ auth_test failed: %s", e)
+    
+    # Fallback: Check if there's ANY mention in the text
+    # This is permissive but better than dropping all messages
+    text = event.get("text", "")
+    has_any_mention = bool(MENTION_REGEX.search(text))
+    
+    if has_any_mention:
+        LOGGER.info("🔄 Fallback: detected mention pattern in text, assuming it's for this bot")
+        return True
+    
+    LOGGER.info("📝 No mention detected in message text")
+    return False
 
 
 async def _is_mention_with_token(event: SlackMessageData, bot_token: str) -> bool:
@@ -574,10 +661,10 @@ async def _is_mention_with_token(event: SlackMessageData, bot_token: str) -> boo
         client = AsyncWebClient(token=bot_token)
         auth_result = await client.auth_test()
         bot_user_id = auth_result["user_id"]
-        pattern = re.compile(rf"<@{bot_user_id}>")
-        return bool(re.search(pattern, event.get("text", "")))
+        LOGGER.debug("🔑 Got bot_user_id from token: %s", bot_user_id)
+        return _detect_mention_from_text(event, bot_user_id)
     except Exception as exc:
-        LOGGER.warning("Failed to check mention with bot_token: %s", exc)
+        LOGGER.warning("⚠️ Failed to check mention with bot_token: %s", exc)
         return await _is_mention(event)
 
 
@@ -854,14 +941,39 @@ async def slack_event_from_router(req: Request, _: None = Depends(verify_request
     event = body.get("event", {})
     event_type = event.get("type")
     
+    LOGGER.info(
+        "📨 Event details: type=%s, user=%s, channel=%s, text_preview=%s",
+        event_type,
+        event.get("user"),
+        event.get("channel"),
+        (event.get("text", "")[:50] + "...") if event.get("text") else "(no text)",
+    )
+    
     if not event_type:
+        LOGGER.info("⏭️ No event_type, skipping")
         return {"ok": True}
     
     # Filter events
     if event_type not in ("message", "app_mention"):
+        LOGGER.info("⏭️ Event type '%s' not handled, skipping", event_type)
         return {"ok": True}
     
-    if event.get("bot_id") or not event.get("user"):
+    if event.get("bot_id"):
+        LOGGER.info("⏭️ Message from bot (bot_id=%s), skipping", event.get("bot_id"))
+        return {"ok": True}
+    
+    if not event.get("user"):
+        LOGGER.info("⏭️ No user in event, skipping")
+        return {"ok": True}
+    
+    # For app_mention events, always process (Slack guarantees it's a mention)
+    if event_type == "app_mention":
+        LOGGER.info("✅ app_mention event, enqueuing directly")
+        TASK_QUEUE.put_nowait({
+            "type": "slack_message",
+            "event": event,
+            "bot_token": bot_token,
+        })
         return {"ok": True}
     
     # For messages, check if it's a mention or DM
@@ -871,12 +983,16 @@ async def slack_event_from_router(req: Request, _: None = Depends(verify_request
         else:
             is_mention = await _is_mention(event)
         
-        if not (is_mention or _is_dm(event)):
+        is_dm = _is_dm(event)
+        LOGGER.info("📊 Message check: is_mention=%s, is_dm=%s", is_mention, is_dm)
+        
+        if not (is_mention or is_dm):
+            LOGGER.info("⏭️ Not a mention or DM, skipping")
             return {"ok": True}
     
     # Enqueue for processing
     LOGGER.info(
-        "🔀 Enqueuing router event: type=%s, user=%s, channel=%s",
+        "✅ Enqueuing router event: type=%s, user=%s, channel=%s",
         event_type,
         event.get("user"),
         event.get("channel"),
@@ -926,13 +1042,18 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
     
     try:
         graph = get_graph(graph_name)
-        result = await graph.ainvoke(input_data, config=config_data)
+        result = await asyncio.wait_for(
+            graph.ainvoke(input_data, config=config_data),
+            timeout=GRAPH_TIMEOUT
+        )
         
         return {
             "thread_id": thread_id,
             "status": "success",
             "values": result,
         }
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail=f"Request timed out after {GRAPH_TIMEOUT}s")
     except Exception as e:
         LOGGER.exception("Run failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -965,4 +1086,4 @@ async def get_thread_state(thread_id: str, _: None = Depends(verify_request)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("langgraph_slack.server_mit:APP", host="0.0.0.0", port=8080)
+    uvicorn.run("langgraph_slack.server_mit:APP", host="0.0.0.0", port=8080")
