@@ -436,7 +436,9 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
                 # Record outputs for LangSmith
                 messages = result.get("messages", [])
                 if messages:
-                    turn.set_outputs({"response": _get_text(messages[-1].get("content", ""))})
+                    last_msg = messages[-1]
+                    content = last_msg.content if hasattr(last_msg, 'content') else last_msg.get("content", "")
+                    turn.set_outputs({"response": _get_text(content)})
         else:
             # No LangSmith - just invoke directly
             result = await graph.ainvoke(graph_input, config=graph_config)
@@ -447,7 +449,8 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
         messages = result.get("messages", [])
         if messages:
             response_message = messages[-1]
-            response_text = _get_text(response_message.get("content", ""))
+            content = response_message.content if hasattr(response_message, 'content') else response_message.get("content", "")
+            response_text = _get_text(content)
             
             # Send response to Slack
             await _send_slack_response(
