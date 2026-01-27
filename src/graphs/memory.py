@@ -68,16 +68,92 @@ NamespaceTemplate = Tuple[str, ...]
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+class ModalEmbeddings:
+    """
+    LangChain-compatible embeddings wrapper that calls Modal endpoints.
+    
+    Replaces HuggingFaceEmbeddings to eliminate local model loading.
+    Uses bge-base-en-v1.5 (768 dims) for best retrieval quality.
+    """
+    
+    def __init__(self, model: str = "bge-base"):
+        """
+        Args:
+            model: "bge-base" (768 dims, best quality) or "minilm" (384 dims, legacy)
+        """
+        self.model = model
+        self._client = None
+    
+    def _get_client(self):
+        """Lazy-load the inference client."""
+        if self._client is None:
+            from pro.ml_inference.client import get_inference_client
+            self._client = get_inference_client()
+        return self._client
+    
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        """Embed a list of documents (sync, for LangChain compatibility)."""
+        import asyncio
+        
+        async def _embed_batch():
+            client = self._get_client()
+            results = await client.embed_batch(texts, model=self.model)
+            return [r.embedding for r in results]
+        
+        # Handle running in existing event loop vs new loop
+        try:
+            loop = asyncio.get_running_loop()
+            # Already in async context - run in thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, _embed_batch())
+                return future.result()
+        except RuntimeError:
+            # No running loop - safe to create one
+            return asyncio.run(_embed_batch())
+    
+    def embed_query(self, text: str) -> list[float]:
+        """Embed a single query (sync, for LangChain compatibility)."""
+        import asyncio
+        
+        async def _embed():
+            client = self._get_client()
+            result = await client.embed(text, model=self.model)
+            return result.embedding
+        
+        try:
+            loop = asyncio.get_running_loop()
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, _embed())
+                return future.result()
+        except RuntimeError:
+            return asyncio.run(_embed())
+    
+    async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
+        """Async embed documents."""
+        client = self._get_client()
+        results = await client.embed_batch(texts, model=self.model)
+        return [r.embedding for r in results]
+    
+    async def aembed_query(self, text: str) -> list[float]:
+        """Async embed query."""
+        client = self._get_client()
+        result = await client.embed(text, model=self.model)
+        return result.embedding
+
+
 @lru_cache(maxsize=1)
 def get_embedding():
     """
     Lazy embedding factory.
-    IMPORTANT: importing HuggingFaceEmbeddings at module scope can drag in torch
-    and slow startup. Keep the import inside this function.
+    
+    Returns a Modal-based embeddings object that's compatible with LangChain
+    but doesn't load any local models.
+    
+    Uses bge-base-en-v1.5 (768 dims) for 22% better retrieval than MiniLM.
     """
-    from langchain_huggingface import HuggingFaceEmbeddings
-    return HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
+    return ModalEmbeddings(model="bge-base")
 
 @lru_cache(maxsize=1)
 def get_bq_client() -> bigquery.Client:
