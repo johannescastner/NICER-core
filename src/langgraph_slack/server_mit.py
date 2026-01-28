@@ -1086,4 +1086,4 @@ async def get_thread_state(thread_id: str, _: None = Depends(verify_request)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("langgraph_slack.server_mit:APP", host="0.0.0.0", port=8080")
+    uvicorn.run("langgraph_slack.server_mit:APP", host="0.0.0.0", port=8080)
