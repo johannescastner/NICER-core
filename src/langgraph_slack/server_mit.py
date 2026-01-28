@@ -880,7 +880,30 @@ async def lifespan(app: FastAPI):
         # Start background worker
         worker_task = asyncio.create_task(worker(), name="slack_background_worker")
         worker_task.add_done_callback(_log_task_result)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Initialize BOT_USER_ID from Slack auth_test
+        # This is required for proper message filtering in _build_contextual_message
+        # Without this, config.BOT_USER_ID=None causes the loop to break on
+        # ANY message (since None == None when checking bot_id on user messages)
+        # ═══════════════════════════════════════════════════════════════════
+        async def _init_bot_user_id():
+            """Fetch and cache BOT_USER_ID from Slack."""
+            try:
+                bot_token = os.environ.get("SLACK_BOT_TOKEN")
+                if not bot_token:
+                    LOGGER.warning("⚠️ SLACK_BOT_TOKEN not set, BOT_USER_ID will remain None")
+                    return
+                
+                client = AsyncWebClient(token=bot_token)
+                auth_result = await client.auth_test()
+                config.BOT_USER_ID = auth_result["user_id"]
+                LOGGER.info("✅ BOT_USER_ID initialized: %s", config.BOT_USER_ID)
+            except Exception as e:
+                LOGGER.warning("⚠️ Failed to initialize BOT_USER_ID: %s", e)
         
+        asyncio.create_task(_init_bot_user_id(), name="init_bot_user_id")
+
         # Post-startup setup (non-blocking)
         async def _post_startup_setup():
             try:

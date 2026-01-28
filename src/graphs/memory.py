@@ -73,7 +73,14 @@ class ModalEmbeddings(Embeddings):
     """
     LangChain-compatible embeddings wrapper that calls Modal endpoints.
     
-    Replaces HuggingFaceEmbeddings to eliminate local model loading.
+    Uses DUAL httpx clients to avoid event loop conflicts:
+    - Sync httpx.Client for embed_query/embed_documents (called from sync contexts)
+    - Async httpx.AsyncClient for aembed_query/aembed_documents (called from async contexts)
+    
+    This pattern is identical to how langchain-openai handles the same problem.
+    NEVER use asyncio.run() to bridge sync→async - it creates/destroys event loops
+    which corrupts httpx connection pools and causes "Event loop is closed" errors.
+    
     Uses bge-base-en-v1.5 (768 dims) for best retrieval quality.
     """
     
@@ -83,66 +90,170 @@ class ModalEmbeddings(Embeddings):
             model: "bge-base" (768 dims, best quality) or "minilm" (384 dims, legacy)
         """
         self.model = model
-        self._client = None
+        self._sync_client = None  # httpx.Client for sync calls
+        self._async_client = None  # httpx.AsyncClient for async calls
+        self._inference_client = None  # Our Modal inference client (for URL building)
     
-    def _get_client(self):
-        """Lazy-load the inference client."""
-        if self._client is None:
+    def _get_inference_client(self):
+        """Lazy-load the inference client (used for URL building)."""
+        if self._inference_client is None:
             from pro.ml_inference.client import get_inference_client
-            self._client = get_inference_client()
-        return self._client
+            self._inference_client = get_inference_client()
+        return self._inference_client
     
+    def _get_sync_client(self):
+        """Get or create sync httpx client."""
+        if self._sync_client is None:
+            import httpx
+            self._sync_client = httpx.Client(timeout=60.0)
+        return self._sync_client
+    
+    def _get_async_client(self):
+        """Get or create async httpx client."""
+        if self._async_client is None:
+            import httpx
+            self._async_client = httpx.AsyncClient(timeout=60.0)
+        return self._async_client
+    
+    def _get_url(self, endpoint: str) -> str:
+        """Get the Modal endpoint URL from the inference client."""
+        client = self._get_inference_client()
+        
+        # Map our endpoint names to the client's URL attributes
+        if endpoint == "embed":
+            return client.embedding_url
+        elif endpoint == "embed_batch":
+            return client.embedding_batch_url
+        else:
+            raise ValueError(f"Unknown endpoint: {endpoint}")
+     
+    # =========================================================================
+    # SYNC METHODS - Use sync httpx.Client, NO asyncio.run()
+    # =========================================================================
+ 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        """Embed a list of documents (sync, for LangChain compatibility)."""
-        import asyncio
+        """Embed a list of documents (sync, for LangChain compatibility).
         
-        async def _embed_batch():
-            client = self._get_client()
-            results = await client.embed_batch(texts, model=self.model)
-            return [r.embedding for r in results]
-        
-        # Handle running in existing event loop vs new loop
+        Uses sync httpx.Client - safe to call from any context including
+        inside run_in_executor or ThreadPoolExecutor.
+        """
+        sync_http = self._get_sync_client()
+        url = self._get_url("embed_batch")
+        payload = {"texts": texts, "model": self.model}
+
         try:
-            loop = asyncio.get_running_loop()
-            # Already in async context - run in thread
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, _embed_batch())
-                return future.result()
-        except RuntimeError:
-            # No running loop - safe to create one
-            return asyncio.run(_embed_batch())
+            response = sync_http.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            return self._parse_batch_response(data)
+        except Exception as e:
+            logger.error("Sync embed_documents failed: %s", e)
+            raise
     
     def embed_query(self, text: str) -> list[float]:
-        """Embed a single query (sync, for LangChain compatibility)."""
-        import asyncio
+        """Embed a single query (sync, for LangChain compatibility).
         
-        async def _embed():
-            client = self._get_client()
-            result = await client.embed(text, model=self.model)
-            return result.embedding
+        Uses sync httpx.Client - safe to call from any context.
+        """
+        sync_http = self._get_sync_client()
+        url = self._get_url("embed")
+        payload = {"text": text, "model": self.model}
+
         
         try:
-            loop = asyncio.get_running_loop()
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, _embed())
-                return future.result()
-        except RuntimeError:
-            return asyncio.run(_embed())
+            response = sync_http.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            return self._parse_single_response(data)
+        except Exception as e:
+            logger.error("Sync embed_query failed: %s", e)
+            raise
+    
+    # =========================================================================
+    # ASYNC METHODS - Use async httpx.AsyncClient  
+    # =========================================================================
     
     async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
-        """Async embed documents."""
-        client = self._get_client()
-        results = await client.embed_batch(texts, model=self.model)
-        return [r.embedding for r in results]
+        """Async embed documents - uses native async client."""
+        async_http = self._get_async_client()
+        url = self._get_url("embed_batch")
+        payload = {"texts": texts, "model": self.model}
+        
+        try:
+            response = await async_http.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            return self._parse_batch_response(data)
+        except Exception as e:
+            logger.error("Async aembed_documents failed: %s", e)
+            raise
     
     async def aembed_query(self, text: str) -> list[float]:
-        """Async embed query."""
-        client = self._get_client()
-        result = await client.embed(text, model=self.model)
-        return result.embedding
-
+        """Async embed query - uses native async client."""
+        async_http = self._get_async_client()
+        url = self._get_url("embed")
+        payload = {"text": text, "model": self.model}
+        
+        try:
+            response = await async_http.post(url, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            return self._parse_single_response(data)
+        except Exception as e:
+            logger.error("Async aembed_query failed: %s", e)
+            raise
+    
+    # =========================================================================
+    # RESPONSE PARSING (shared by sync/async)
+    # =========================================================================
+    
+    def _parse_batch_response(self, data) -> list[list[float]]:
+        """Parse batch embedding response from Modal."""
+        if isinstance(data, list):
+            return [
+                item.get("embedding", item) if isinstance(item, dict) else item 
+                for item in data
+            ]
+        elif isinstance(data, dict):
+            if "embeddings" in data:
+                return data["embeddings"]
+            elif "results" in data:
+                return [r.get("embedding", r) for r in data["results"]]
+        logger.warning("Unexpected batch response format: %s", type(data))
+        return data
+    
+    def _parse_single_response(self, data) -> list[float]:
+        """Parse single embedding response from Modal."""
+        if isinstance(data, dict) and "embedding" in data:
+            return data["embedding"]
+        elif isinstance(data, list):
+            return data
+        logger.warning("Unexpected single response format: %s", type(data))
+        return data
+    
+    # =========================================================================
+    # CLEANUP
+    # =========================================================================
+    
+    def close(self):
+        """Close sync client."""
+        if self._sync_client:
+            self._sync_client.close()
+            self._sync_client = None
+    
+    async def aclose(self):
+        """Close async client."""
+        if self._async_client:
+            await self._async_client.aclose()
+            self._async_client = None
+    
+    def __del__(self):
+        """Cleanup on garbage collection."""
+        if self._sync_client:
+            try:
+                self._sync_client.close()
+            except Exception:
+                pass
 
 @lru_cache(maxsize=1)
 def get_embedding():
