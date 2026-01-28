@@ -735,13 +735,59 @@ async def _build_contextual_message(
     """Build a message with thread context, using display names."""
     thread_ts = event.get("thread_ts") or event["ts"]
     channel_id = event["channel"]
+    event_ts = event.get("ts")
+    event_text = event.get("text", "")
+    
+    LOGGER.info(
+        "🔍 _build_contextual_message: channel=%s, thread_ts=%s, event_ts=%s, event_text=%s",
+        channel_id, thread_ts, event_ts, event_text[:100] if event_text else "(empty)"
+    )
+    LOGGER.info(
+        "🔍 config.BOT_USER_ID=%s",
+        config.BOT_USER_ID
+    )
     
     history = await _fetch_thread_history(channel_id, thread_ts, bot_token=bot_token)
+    LOGGER.info("🔍 _fetch_thread_history returned %d messages", len(history))
+    
+    # Debug: log each message in history
+    for i, msg in enumerate(history):
+        LOGGER.info(
+            "🔍 history[%d]: ts=%s, user=%s, bot_id=%s, text=%s",
+            i, msg.get("ts"), msg.get("user"), msg.get("bot_id"), 
+            (msg.get("text", "")[:50] + "...") if msg.get("text") else "(no text)"
+        )
+    
     included = []
     for msg in reversed(history):
-        if msg.get("bot_id") == config.BOT_USER_ID:
+        msg_bot_id = msg.get("bot_id")
+        LOGGER.info(
+            "🔍 Checking msg: bot_id=%s, comparing to config.BOT_USER_ID=%s, match=%s",
+            msg_bot_id, config.BOT_USER_ID, msg_bot_id == config.BOT_USER_ID
+        )
+        if msg_bot_id == config.BOT_USER_ID:
+            LOGGER.info("🔍 Breaking on bot message")
             break
         included.append(msg)
+    
+    LOGGER.info("🔍 After filtering: included has %d messages", len(included))
+    
+    # ══════════════════════════════════════════════════════════════════════════
+    # FIX: If history doesn't include the current event, add it
+    # This happens for new messages that aren't indexed as threads yet,
+    # or when conversations_replies returns empty for a fresh message
+    # ══════════════════════════════════════════════════════════════════════════
+    current_event_in_included = any(msg.get("ts") == event_ts for msg in included)
+    LOGGER.info(
+        "🔍 current_event_in_included=%s (event_ts=%s)", 
+        current_event_in_included, event_ts
+    )
+    
+    if not current_event_in_included and event_text:
+        LOGGER.info("🔍 Adding current event to included (wasn't in history)")
+        included.insert(0, event)
+    
+    LOGGER.info("🔍 Final included count: %d", len(included))
     
     all_user_ids = set()
     for msg in included:
@@ -766,16 +812,28 @@ async def _build_contextual_message(
         return f'<slackMessage user="{speaker_name}">{replaced_text}</slackMessage>'
     
     context_parts = [format_message(msg) for msg in reversed(included)]
+    LOGGER.info("🔍 context_parts has %d items", len(context_parts))
+    
     new_message = context_parts[-1] if context_parts else ""
     preceding_context = "\n".join(context_parts[:-1]) if len(context_parts) > 1 else ""
+    
+    LOGGER.info(
+        "🔍 new_message length=%d, preview=%s",
+        len(new_message), new_message[:100] if new_message else "(empty)"
+    )
     
     contextual_message = (
         (("Preceding context:\n" + preceding_context) if preceding_context else "")
         + "\n\nNew message:\n"
         + new_message
     )
+    
+    LOGGER.info(
+        "🔍 Final contextual_message length=%d, preview=%s",
+        len(contextual_message), contextual_message[:150]
+    )
+    
     return contextual_message
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FastAPI App Setup
