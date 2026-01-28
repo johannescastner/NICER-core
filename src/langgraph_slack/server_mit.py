@@ -18,9 +18,11 @@ MULTI-TENANT SUPPORT preserved:
 - Bot token flows through task queue → graph config → callback
 """
 import src.langgraph_slack.patch_typing  # must run before any Pydantic model loading
+# Set MIT mode BEFORE importing swarm_graph to prevent auto-creation
+import os
+os.environ["LANGGRAPH_MIT_MODE"] = "true"
 import asyncio
 import logging
-import os
 import re
 import json
 import uuid
@@ -53,8 +55,7 @@ from pro.http.cron_lifecycle import ensure_ambient_cron_exists
 from pro.persistence import close_persistence_manager
 from pro.utils.blocking_detector import install_blocking_detector
 
-# Set MIT mode BEFORE importing swarm_graph to prevent auto-creation
-os.environ["LANGGRAPH_MIT_MODE"] = "true"
+
 
 # Import graph builders/factories
 # NOTE: We import FACTORIES (not pre-compiled graphs) so we can inject checkpointer
