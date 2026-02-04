@@ -29,6 +29,29 @@ if DEPLOY_MODAL := environ.get("DEPLOY_MODAL"):
 BOT_USER_ID = environ.get("SLACK_BOT_USER_ID")
 BOT_TOKEN = environ.get("SLACK_BOT_TOKEN")
 
+def _slugify(value: str) -> str:
+    value = value.strip().lower()
+    value = re.sub(r"[^a-z0-9]+", "-", value)
+    return value.strip("-") or "tenant"
+# Company configuration
+COMPANY = environ.get("COMPANY", "Towards People")
+# Tenant + region
+# IMPORTANT:
+#  - GCP_LOCATION here is your BigQuery location (EU/US multi-region label).
+#  - Cloud Run/Cloud SQL/Redis require a *region* like europe-west1.
+#
+# If you don't supply SUPERSET_REGION explicitly, we fall back to:
+#   GCP_REGION -> SUPERSET_REGION -> europe-west1
+#
+GCP_REGION = environ.get("GCP_REGION", "europe-west1")  # optional, if you start standardizing this
+SUPERSET_TENANT = environ.get("SUPERSET_TENANT") or _slugify(COMPANY)
+SUPERSET_REGION = (
+    environ.get("SUPERSET_REGION")
+    or GCP_REGION
+    or "europe-west1"
+)
+LOCATION = environ.get("GCP_LOCATION", GCP_REGION)
+
 if DEPLOY_MODAL:
     if not environ.get("SLACK_BOT_TOKEN"):
         environ["SLACK_BOT_TOKEN"] = "fake-token"
@@ -43,13 +66,9 @@ CONFIG = environ.get("CONFIG") or "{}"
 DEPLOYMENT_URL = environ.get("DEPLOYMENT_URL", "")
 SLACK_CHANNEL_ID = environ.get("SLACK_CHANNEL_ID")
 
-# Company configuration
-COMPANY = environ.get("COMPANY", "Towards People")
-
 # Google Cloud project details
 PROJECT_ID = environ.get("GCP_PROJECT_ID", "default_project_id")
 DATASET_ID = environ.get("GCP_DATASET_ID", "agent_system_memory")
-LOCATION = environ.get("GCP_LOCATION", "EU")  # Default to 'EU' if not set
 
 # Table names for different memory types
 SEMANTIC_TABLE = environ.get("GCP_SEMANTIC_TABLE", "semantic_memory")
@@ -148,29 +167,10 @@ SUPERSET_RUN_SERVICE_ACCOUNT = (
 #
 # This module only reads env; provisioning is handled by an external script.
 
-def _slugify(value: str) -> str:
-    value = value.strip().lower()
-    value = re.sub(r"[^a-z0-9]+", "-", value)
-    return value.strip("-") or "tenant"
 
 # Enable/disable Superset integration at runtime
 SUPERSET_ENABLED = (environ.get("SUPERSET_ENABLED", "true").lower() == "true")
 
-# Tenant + region
-# IMPORTANT:
-#  - GCP_LOCATION here is your BigQuery location (EU/US multi-region label).
-#  - Cloud Run/Cloud SQL/Redis require a *region* like europe-west1.
-#
-# If you don't supply SUPERSET_REGION explicitly, we fall back to:
-#   GCP_REGION -> SUPERSET_REGION -> europe-west1
-#
-GCP_REGION = environ.get("GCP_REGION", "europe-west1")  # optional, if you start standardizing this
-SUPERSET_TENANT = environ.get("SUPERSET_TENANT") or _slugify(COMPANY)
-SUPERSET_REGION = (
-    environ.get("SUPERSET_REGION")
-    or GCP_REGION
-    or "europe-west1"
-)
 
 # URL of the Superset instance (set after deploy)
 SUPERSET_URL = environ.get("SUPERSET_URL", "")
