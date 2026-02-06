@@ -66,6 +66,47 @@ from src.langgraph_slack.config import (
 
 NamespaceTemplate = Tuple[str, ...]
 
+# =============================================================================
+# FIX: Table schema pre-creation to prevent "No schema specified" errors
+# =============================================================================
+
+def ensure_table_with_schema(
+    client: bigquery.Client,
+    project_id: str,
+    dataset_id: str,
+    table_name: str,
+    schema: List[bigquery.SchemaField],
+) -> bigquery.Table:
+    """
+    Ensure a BigQuery table exists with the specified schema.
+    
+    MUST be called BEFORE BigQueryVectorStore is instantiated.
+    BigQueryVectorStore._initialize_bq_table() creates empty tables.
+    
+    Handles:
+    1. Table doesn't exist -> Create with schema
+    2. Table exists with no schema -> Delete and recreate  
+    3. Table exists with schema -> Return as-is
+    """
+    table_id = f"{project_id}.{dataset_id}.{table_name}"
+    
+    try:
+        existing = client.get_table(table_id)
+        
+        if len(existing.schema) == 0:
+            logger.warning("Table %s has no schema. Recreating.", table_id)
+            client.delete_table(table_id)
+            raise NotFound(f"Deleted empty table {table_id}")
+        
+        logger.info("Table %s exists with %d columns", table_id, len(existing.schema))
+        return existing
+            
+    except NotFound:
+        logger.info("Creating table %s with %d columns", table_id, len(schema))
+        table = bigquery.Table(table_id, schema=schema)
+        return client.create_table(table)
+
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -697,6 +738,32 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         **kwargs,
     ) -> "BigQueryMemoryStore":
         bq_client = get_bq_client()
+        
+        # =====================================================================
+        # FIX: Pre-create table with schema BEFORE vectorstore init
+        # This prevents "No schema specified on job or table" errors.
+        # =====================================================================
+        if schema:
+            # Ensure dataset exists
+            dataset_ref = f"{bq_client.project}.{dataset_name}"
+            try:
+                bq_client.get_dataset(dataset_ref)
+            except NotFound:
+                dataset = bigquery.Dataset(dataset_ref)
+                dataset.location = bq_client.location
+                bq_client.create_dataset(dataset)
+                logger.info("Created dataset %s", dataset_ref)
+            
+            # Ensure table exists with proper schema
+            ensure_table_with_schema(
+                client=bq_client,
+                project_id=bq_client.project,
+                dataset_id=dataset_name,
+                table_name=table_name,
+                schema=schema,
+            )
+        # =====================================================================
+ 
         vectorstore = PatchedBigQueryVectorStore(
             embedding=get_embedding(),
             project_id=bq_client.project,
