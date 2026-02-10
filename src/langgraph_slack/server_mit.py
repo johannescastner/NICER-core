@@ -560,6 +560,7 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
             "channel_id": channel_id,
             "thread_id": thread_id,
             "thread_ts": event.get("thread_ts") or event["ts"],
+            "bot_token": bot_token or os.environ.get("SLACK_BOT_TOKEN", ""),
         },
         "conversation_id": conversation_id,
     }

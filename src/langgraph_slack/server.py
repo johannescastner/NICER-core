@@ -272,6 +272,7 @@ async def _process_task(task: dict):
                     "channel_id": channel_id,
                     "thread_id": thread_id,
                     "thread_ts": event.get("thread_ts") or event["ts"],
+                    "bot_token": bot_token or os.environ.get("SLACK_BOT_TOKEN", ""),
                 },  # Required for LangMem SummarizationNode
                 "conversation_id": conversation_id,  # For cost tracking correlation
             },
