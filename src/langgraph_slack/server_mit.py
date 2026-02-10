@@ -114,6 +114,135 @@ DEFAULT_GRAPH = os.getenv("DEFAULT_GRAPH", "swarm")
 # Graph invocation timeout (seconds) - prevents hung requests
 GRAPH_TIMEOUT = float(os.getenv("GRAPH_TIMEOUT", "300"))  # 5 minutes default
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Interrupt/Resume Support (mid-execution clarification)
+# ═══════════════════════════════════════════════════════════════════════════════
+from langgraph.types import Command
+
+# Slack thread_ts → graph resume metadata. Single-instance safe.
+# For multi-instance Cloud Run, move to Redis or Postgres.
+_INTERRUPT_THREAD_MAP: Dict[str, Dict[str, Any]] = {}
+
+async def _detect_interrupt(graph, config: dict) -> tuple[bool, Any]:
+    """
+    Version-safe interrupt detection (works on langgraph 0.2.x through 0.6.x).
+    Returns (is_paused, interrupt_payload_or_None).
+    """
+    try:
+        state = await graph.aget_state(config)
+        if state.next:
+            for task in (state.tasks or []):
+                for intr in (task.interrupts or ()):
+                    return True, intr.value
+            return True, None
+    except Exception as exc:
+        LOGGER.warning("Failed to check graph state for interrupt: %s", exc)
+    return False, None
+
+async def _handle_interrupt(
+    graph,
+    thread_id: str,
+    channel_id: str,
+    thread_ts: str,
+    bot_token: Optional[str],
+    graph_config: dict,
+) -> bool:
+    """If graph is paused at interrupt, forward the agent\\'s question to Slack."""
+    paused, payload = await _detect_interrupt(graph, graph_config)
+    if not paused:
+        return False
+
+    # The agent wrote the question via ask_human — forward it directly.
+    # payload["message"] is the agent's own natural-language question.
+    if isinstance(payload, dict):
+        question = payload.get("message") or payload.get("title") or str(payload)
+    else:
+        question = str(payload) if payload else "I need some clarification before I can continue."
+
+    await _send_slack_response(
+        channel_id=channel_id, thread_ts=thread_ts,
+        text=question, bot_token=bot_token,
+    )
+
+    _INTERRUPT_THREAD_MAP[thread_ts] = {
+        "thread_id": thread_id,
+        "channel_id": channel_id,
+        "bot_token": bot_token,
+        "graph_config": graph_config,
+    }
+    LOGGER.info("[%s] Interrupt: thread_ts=%s → thread_id=%s", channel_id, thread_ts, thread_id)
+    return True
+
+async def _resume_interrupted_graph(
+    event: dict,
+    mapping: dict,
+    parent_ts: str,
+    bot_token: Optional[str],
+):
+    """
+    Resume an interrupted graph with the user's Slack reply.
+    """
+    channel_id = event["channel"]
+    user_reply = event.get("text", "").strip()
+    effective_token = mapping.get("bot_token") or bot_token
+    graph_config = mapping["graph_config"]
+
+    LOGGER.info(
+        "[%s] Resuming interrupted graph thread_id=%s with: %s...",
+        channel_id, mapping["thread_id"], user_reply[:100],
+    )
+
+    resume_value = {
+        "answers": [user_reply],
+        "status": "answered",
+        "responders": [{"id": event.get("user", "")}],
+        "thread_ts": parent_ts,
+    }
+
+    try:
+        graph = get_graph(DEFAULT_GRAPH)
+
+        result = await asyncio.wait_for(
+            graph.ainvoke(Command(resume=resume_value), config=graph_config),
+            timeout=GRAPH_TIMEOUT,
+        )
+
+        # Check for another interrupt (follow-up question)
+        did_interrupt = await _handle_interrupt(
+            graph, mapping["thread_id"],
+            channel_id, parent_ts, effective_token, graph_config,
+        )
+        if did_interrupt:
+            return
+
+        # Done — clean up and send result
+        _INTERRUPT_THREAD_MAP.pop(parent_ts, None)
+
+        messages = result.get("messages", [])
+        if messages:
+            content = _extract_message_content(messages[-1])
+            await _send_slack_response(
+                channel_id=channel_id,
+                thread_ts=parent_ts,
+                text=_get_text(content),
+                bot_token=effective_token,
+            )
+
+    except asyncio.TimeoutError:
+        _INTERRUPT_THREAD_MAP.pop(parent_ts, None)
+        await _send_slack_response(
+            channel_id=channel_id, thread_ts=parent_ts,
+            text="Sorry, the resumed work timed out.",
+            bot_token=effective_token,
+        )
+    except Exception as exc:
+        LOGGER.exception("[%s] Resume failed: %s", channel_id, exc)
+        _INTERRUPT_THREAD_MAP.pop(parent_ts, None)
+        await _send_slack_response(
+            channel_id=channel_id, thread_ts=parent_ts,
+            text="Sorry, something went wrong while continuing.",
+            bot_token=effective_token,
+        )
 
 def _build_database_uri() -> str:
     """
@@ -384,6 +513,14 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
     if not (is_mention or is_dm):
         LOGGER.info("⏭️ Skipping non-mention, non-DM message")
         return
+
+    # ═══ Check if this is a reply to an interrupted (paused) graph ═══
+    parent_ts = event.get("thread_ts")
+    if parent_ts and parent_ts in _INTERRUPT_THREAD_MAP:
+        await _resume_interrupted_graph(
+            event, _INTERRUPT_THREAD_MAP[parent_ts], parent_ts, bot_token,
+        )
+        return
     
     # Build contextual message with thread history
     text_with_names = await _build_contextual_message(event, bot_token=bot_token)
@@ -448,7 +585,7 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
         # Get the default graph and invoke it directly
         graph = get_graph(DEFAULT_GRAPH)
         LOGGER.info("📊 Got graph '%s', starting invocation with timeout=%ss...", DEFAULT_GRAPH, GRAPH_TIMEOUT)
-        
+
         # ════════════════════════════════════════════════════════════════════
         # Invoke graph with optional LangSmith tracing and timeout
         # ════════════════════════════════════════════════════════════════════
@@ -485,7 +622,15 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
             )
         
         LOGGER.info("[%s].[%s] ✅ Graph execution complete", channel_id, thread_id)
-        
+
+        # ─── Check for interrupt (agent asked a clarifying question) ───
+        did_interrupt = await _handle_interrupt(
+            graph, thread_id,
+            channel_id, metadata["thread_ts"], bot_token, graph_config,
+        )
+        if did_interrupt:
+            return
+
         # Extract response and send to Slack
         messages = result.get("messages", [])
         LOGGER.info("[%s].[%s] 📨 Result has %d messages", channel_id, thread_id, len(messages))

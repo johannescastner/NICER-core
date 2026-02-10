@@ -18,7 +18,7 @@ import re
 import json
 import uuid
 from urllib.parse import urlparse
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 from typing_extensions import TypedDict
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -72,6 +72,8 @@ ALLOW_ORIGIN_REGEX = os.getenv(
 USER_NAME_CACHE: dict[str, str] = {}
 TASK_QUEUE: asyncio.Queue = asyncio.Queue()
 
+# Interrupt/resume: Slack thread_ts → {thread_id, channel_id, bot_token, ...}
+_INTERRUPT_THREAD_MAP: dict[str, dict[str, Any]] = {}
 
 class SlackMessageData(TypedDict):
     user: str
@@ -131,6 +133,42 @@ async def _process_task(task: dict):
             event.get("thread_ts") or event["ts"], event["channel"]
         )
         channel_id = event["channel"]
+
+        # ═══ Check if this is a reply to an interrupted (paused) graph ═══
+        parent_ts = event.get("thread_ts")
+        if parent_ts and parent_ts in _INTERRUPT_THREAD_MAP:
+            mapping = _INTERRUPT_THREAD_MAP[parent_ts]
+            resume_thread_id = mapping["thread_id"]
+            user_reply = (event.get("text") or "").strip()
+            effective_token = mapping.get("bot_token") or bot_token
+            webhook = f"{config.DEPLOYMENT_URL}/callbacks/{resume_thread_id}"
+
+            LOGGER.info("[%s] Resuming interrupted run thread_id=%s", channel_id, resume_thread_id)
+
+            await LANGGRAPH_CLIENT.runs.create(
+                thread_id=resume_thread_id,
+                assistant_id=config.ASSISTANT_ID,
+                command={"resume": {
+                    "answers": [user_reply],
+                    "status": "answered",
+                    "responders": [{"id": event.get("user", "")}],
+                    "thread_ts": parent_ts,
+                }},
+                config={**GRAPH_CONFIG},
+                metadata={
+                    "event": "slack",
+                    "channel_id": channel_id,
+                    "channel": channel_id,
+                    "thread_ts": parent_ts,
+                    "event_ts": event["ts"],
+                    "bot_token": effective_token,
+                    "resume": True,
+                },
+                webhook=webhook,
+                multitask_strategy="interrupt",
+            )
+            return
+
         # This will connect to the loopback endpoint if not provided.
         webhook = f"{config.DEPLOYMENT_URL}/callbacks/{thread_id}"
 
@@ -253,6 +291,43 @@ async def _process_task(task: dict):
             "Processing LangGraph callback: %s",
             event['thread_id']
         )
+
+        # ═══ Check if this callback is for an interrupted (paused) run ═══
+        run_status = event.get("status")
+        if run_status == "interrupted":
+            thread_ts = event["metadata"].get("thread_ts") or event["metadata"].get("event_ts")
+            cb_channel = event["metadata"].get("channel") or config.SLACK_CHANNEL_ID
+            cb_token = event["metadata"].get("bot_token")
+            cb_thread_id = event.get("thread_id")
+
+            # Extract the agent's question from the interrupt payload
+            state_vals = event.get("values", {})
+            interrupts = state_vals.get("__interrupt__", [])
+            question = None
+            if interrupts:
+                payload = interrupts[0] if isinstance(interrupts[0], dict) else getattr(interrupts[0], "value", {})
+                if isinstance(payload, dict):
+                    question = payload.get("message") or payload.get("title")
+                if not question:
+                    question = str(payload)
+
+            if question and cb_channel:
+                # Forward the agent's question directly — no wrapper template
+                if cb_token:
+                    client = AsyncWebClient(token=cb_token)
+                else:
+                    client = APP_HANDLER.app.client
+
+                await client.chat_postMessage(channel=cb_channel, thread_ts=thread_ts, text=question)
+
+                _INTERRUPT_THREAD_MAP[thread_ts] = {
+                    "thread_id": cb_thread_id,
+                    "channel_id": cb_channel,
+                    "bot_token": cb_token,
+                }
+                LOGGER.info("[%s] Interrupt stored: %s → %s", cb_channel, thread_ts, cb_thread_id)
+            return
+
         state_values = event["values"]
         response_message = state_values["messages"][-1]
         thread_ts = event["metadata"].get("thread_ts") or event["metadata"].get(
@@ -304,6 +379,10 @@ async def _process_task(task: dict):
                 },
             )
             
+        # Clean up any stale interrupt mapping for this thread
+        if thread_ts:
+            _INTERRUPT_THREAD_MAP.pop(thread_ts, None)
+
         LOGGER.info(
             "[%s].[%s] sent message to Slack for callback %s", 
             channel_id,
