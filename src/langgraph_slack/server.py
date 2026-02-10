@@ -192,6 +192,17 @@ async def _process_task(task: dict):
             updated_graph_config["configurable"] = {}
         updated_graph_config["configurable"]["langgraph_auth_user_id"] = user_id
 
+        # ── Slack context for instant acknowledgment ─────────────────
+        # These flow through LangGraph configurable → sql_graph bridge
+        # → reflective.py ack logic. State.context may get dropped by
+        # the swarm subgraph handoff, but configurable always propagates.
+        updated_graph_config["configurable"]["bot_token"] = (
+            bot_token or os.environ.get("SLACK_BOT_TOKEN", "")
+        )
+        updated_graph_config["configurable"]["channel_id"] = channel_id
+        updated_graph_config["configurable"]["thread_ts"] = (
+            event.get("thread_ts") or event["ts"]
+        )
         # Log the message content being sent to LangGraph
         LOGGER.debug(
             "Processed message for LangGraph: %s",

@@ -544,6 +544,10 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
         "configurable": {
             "thread_id": thread_id,
             "langgraph_auth_user_id": user_id,
+            # Slack context for instant acknowledgment (propagates through subgraphs)
+            "bot_token": bot_token or os.environ.get("SLACK_BOT_TOKEN", ""),
+            "channel_id": channel_id,
+            "thread_ts": event.get("thread_ts") or event["ts"],
         }
     }
     
