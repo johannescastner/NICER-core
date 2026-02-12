@@ -738,22 +738,54 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         **kwargs,
     ) -> "BigQueryMemoryStore":
         bq_client = get_bq_client()
-        
+
         # =====================================================================
-        # FIX: Pre-create table with schema BEFORE vectorstore init
-        # This prevents "No schema specified on job or table" errors.
+        # FIX: Detect the dataset's ACTUAL location and use a location-matched
+        # client.  BigQuery load jobs MUST run in the same region as the
+        # dataset — a client created with location=europe-west1 cannot write
+        # to a dataset in EU (or US), even though reads are location-agnostic.
         # =====================================================================
+        dataset_ref = f"{bq_client.project}.{dataset_name}"
+        dataset_location = bq_client.location  # default from config
+
         if schema:
             # Ensure dataset exists
-            dataset_ref = f"{bq_client.project}.{dataset_name}"
             try:
-                bq_client.get_dataset(dataset_ref)
+                existing_ds = bq_client.get_dataset(dataset_ref)
+                dataset_location = existing_ds.location
+                logger.info(
+                    "Dataset %s exists in location=%s (client default=%s)",
+                    dataset_ref, dataset_location, bq_client.location,
+                )
             except NotFound:
                 dataset = bigquery.Dataset(dataset_ref)
                 dataset.location = bq_client.location
-                bq_client.create_dataset(dataset)
-                logger.info("Created dataset %s", dataset_ref)
-            
+                created_ds = bq_client.create_dataset(dataset)
+                dataset_location = created_ds.location
+                logger.info("Created dataset %s in location=%s", dataset_ref, dataset_location)
+        else:
+            # Even without schema pre-creation, detect the dataset location
+            try:
+                existing_ds = bq_client.get_dataset(dataset_ref)
+                dataset_location = existing_ds.location
+            except NotFound:
+                pass  # will be created later if needed
+
+        # If the dataset lives in a different location than the client,
+        # create a location-matched client for all subsequent operations.
+        if dataset_location != bq_client.location:
+            logger.warning(
+                "Location mismatch: client=%s, dataset=%s. "
+                "Creating location-matched client for %s.",
+                bq_client.location, dataset_location, dataset_ref,
+            )
+            bq_client = bigquery.Client(
+                credentials=bq_client._credentials,
+                project=bq_client.project,
+                location=dataset_location,
+            )
+
+        if schema:
             # Ensure table exists with proper schema
             ensure_table_with_schema(
                 client=bq_client,
@@ -763,7 +795,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
                 schema=schema,
             )
         # =====================================================================
- 
+
         vectorstore = PatchedBigQueryVectorStore(
             embedding=get_embedding(),
             project_id=bq_client.project,
@@ -772,7 +804,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             table_name=table_name,
             content_field=content_field,
             credentials=bq_client._credentials,
-            location=bq_client.location,
+            location=dataset_location,
             **kwargs,
         )
         object.__setattr__(vectorstore, "_bq_client", bq_client)
