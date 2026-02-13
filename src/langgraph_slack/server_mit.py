@@ -45,6 +45,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 # PostgreSQL connection pool (required for AsyncPostgresSaver)
 from psycopg_pool import AsyncConnectionPool
 from psycopg.rows import dict_row
+import psycopg  # For OperationalError in stale-connection retry
 
 from langgraph_slack import config
 from langgraph_slack.auth_fastapi import verify_request  # New auth module
@@ -113,6 +114,12 @@ DEFAULT_GRAPH = os.getenv("DEFAULT_GRAPH", "swarm")
 
 # Graph invocation timeout (seconds) - prevents hung requests
 GRAPH_TIMEOUT = float(os.getenv("GRAPH_TIMEOUT", "300"))  # 5 minutes default
+
+# Maximum retries for stale DB connection errors (OperationalError).
+# Cloud SQL Proxy idle-timeout can leave dead connections in the pool.
+# The `check` parameter on the pool prevents MOST of these, but edge cases
+# (connection dies mid-checkout) still need retry.
+_DB_RETRY_MAX = 2
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Interrupt/Resume Support (mid-execution clarification)
@@ -202,10 +209,24 @@ async def _resume_interrupted_graph(
     try:
         graph = get_graph(DEFAULT_GRAPH)
 
-        result = await asyncio.wait_for(
-            graph.ainvoke(Command(resume=resume_value), config=graph_config),
-            timeout=GRAPH_TIMEOUT,
-        )
+        # Retry on stale DB connection (same pattern as _handle_slack_message)
+        result = None
+        for _db_attempt in range(_DB_RETRY_MAX + 1):
+            try:
+                result = await asyncio.wait_for(
+                    graph.ainvoke(Command(resume=resume_value), config=graph_config),
+                    timeout=GRAPH_TIMEOUT,
+                )
+                break
+            except psycopg.OperationalError as db_err:
+                if _db_attempt < _DB_RETRY_MAX:
+                    LOGGER.warning(
+                        "[%s] Stale DB connection on resume (attempt %d/%d): %s",
+                        channel_id, _db_attempt + 1, _DB_RETRY_MAX, db_err,
+                    )
+                    await asyncio.sleep(0.5)
+                    continue
+                raise
 
         # Check for another interrupt (follow-up question)
         did_interrupt = await _handle_interrupt(
@@ -295,18 +316,41 @@ async def _init_checkpointer() -> AsyncPostgresSaver:
     
     # Create connection pool (stays open for app lifetime)
     # CRITICAL: All three kwargs are REQUIRED for reliable operation
+    #
+    # FIX 2026-02-13: Added connection health checks and TCP keepalives.
+    # Without these, Cloud SQL Proxy idle-timeout (~30 min) kills connections
+    # and the pool returns BAD connections to callers, causing
+    # psycopg.OperationalError: "server closed the connection unexpectedly"
+    # (Root cause of Tobias/Viebeg outage — graph never starts, checkpointer
+    # crashes on aget_tuple with stale pool connection.)
     _connection_pool = AsyncConnectionPool(
         conninfo=database_uri,
         max_size=20,
+        min_size=2,          # Keep 2 warm connections ready (avoid cold-start)
+        max_lifetime=1200,   # Recycle connections every 20 min (before proxy timeout)
+        max_idle=600,        # Close idle connections after 10 min
         open=False,
+        # Validate connection before handing it to a caller.
+        # This is THE critical fix: without it, stale connections from the pool
+        # cause OperationalError on the first query after idle period.
+        check=AsyncConnectionPool.check_connection,
         kwargs={
             "autocommit": True,
             "row_factory": dict_row,
             "prepare_threshold": 0,  # Prevents DuplicatePreparedStatement errors
+            # TCP keepalives: detect dead connections before Cloud SQL Proxy
+            # drops them. Probe every 60s after 60s idle, close after 5 failures.
+            "keepalives": 1,
+            "keepalives_idle": 60,
+            "keepalives_interval": 10,
+            "keepalives_count": 5,
         }
     )
     await _connection_pool.open(wait=True, timeout=30)
-    LOGGER.info("✅ Connection pool opened (max_size=20, prepare_threshold=0)")
+    LOGGER.info(
+        "✅ Connection pool opened (max_size=20, min_size=2, "
+        "max_lifetime=1200, check=check_connection, keepalives=on)"
+    )
     
     # Create checkpointer with the pool
     _checkpointer = AsyncPostgresSaver(conn=_connection_pool)
@@ -592,39 +636,64 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
         LOGGER.info("📊 Got graph '%s', starting invocation with timeout=%ss...", DEFAULT_GRAPH, GRAPH_TIMEOUT)
 
         # ════════════════════════════════════════════════════════════════════
-        # Invoke graph with optional LangSmith tracing and timeout
+        # Invoke graph with retry on stale DB connections.
+        # 
+        # FIX 2026-02-13: Cloud SQL Proxy drops idle connections after ~30 min.
+        # Even with pool `check=check_connection`, edge cases exist where a
+        # connection dies between checkout and first query. The checkpointer's
+        # aget_tuple() then throws psycopg.OperationalError.
+        #
+        # We retry up to _DB_RETRY_MAX times on OperationalError before giving up.
+        # The pool's check_connection will discard the bad connection and hand us
+        # a fresh one on the next attempt.
         # ════════════════════════════════════════════════════════════════════
-        if _LSI is not None:
-            # Wrap execution in LangSmith turn tracing for observability
-            # Note: start_turn is a sync context manager (uses threading internally)
-            with _LSI.start_turn(
-                conversation_id=conversation_id,
-                thread_id=thread_id,
-                user_id=user_id,
-                channel_id=channel_id,
-                turn_number=turn_number,
-                name="swarm_turn",
-                tags=["slack", "mit-server"],
-            ) as turn:
-                turn.set_inputs({"messages": graph_input["messages"]})
-                
-                # Invoke with timeout to prevent hung requests
-                result = await asyncio.wait_for(
-                    graph.ainvoke(graph_input, config=graph_config),
-                    timeout=GRAPH_TIMEOUT
-                )
-                
-                # Record outputs for LangSmith
-                messages = result.get("messages", [])
-                if messages:
-                    content = _extract_message_content(messages[-1])
-                    turn.set_outputs({"response": _get_text(content)})
-        else:
-            # No LangSmith - just invoke directly with timeout
-            result = await asyncio.wait_for(
-                graph.ainvoke(graph_input, config=graph_config),
-                timeout=GRAPH_TIMEOUT
-            )
+        result = None
+        for _db_attempt in range(_DB_RETRY_MAX + 1):
+            try:
+                if _LSI is not None:
+                    # Wrap execution in LangSmith turn tracing for observability
+                    # Note: start_turn is a sync context manager (uses threading internally)
+                    with _LSI.start_turn(
+                        conversation_id=conversation_id,
+                        thread_id=thread_id,
+                        user_id=user_id,
+                        channel_id=channel_id,
+                        turn_number=turn_number,
+                        name="swarm_turn",
+                        tags=["slack", "mit-server"],
+                    ) as turn:
+                        turn.set_inputs({"messages": graph_input["messages"]})
+                        
+                        # Invoke with timeout to prevent hung requests
+                        result = await asyncio.wait_for(
+                            graph.ainvoke(graph_input, config=graph_config),
+                            timeout=GRAPH_TIMEOUT
+                        )
+                        
+                        # Record outputs for LangSmith
+                        messages = result.get("messages", [])
+                        if messages:
+                            content = _extract_message_content(messages[-1])
+                            turn.set_outputs({"response": _get_text(content)})
+                else:
+                    # No LangSmith - just invoke directly with timeout
+                    result = await asyncio.wait_for(
+                        graph.ainvoke(graph_input, config=graph_config),
+                        timeout=GRAPH_TIMEOUT
+                    )
+                break  # Success — exit retry loop
+
+            except psycopg.OperationalError as db_err:
+                if _db_attempt < _DB_RETRY_MAX:
+                    LOGGER.warning(
+                        "[%s].[%s] ⚠️ Stale DB connection (attempt %d/%d), retrying: %s",
+                        channel_id, thread_id, _db_attempt + 1, _DB_RETRY_MAX, db_err,
+                    )
+                    # Brief pause to let pool discard bad connection
+                    await asyncio.sleep(0.5)
+                    continue
+                # Final attempt failed — re-raise to outer handler
+                raise
         
         LOGGER.info("[%s].[%s] ✅ Graph execution complete", channel_id, thread_id)
 
@@ -682,13 +751,20 @@ async def _handle_callback(event: dict):
     LOGGER.info("Processing callback: %s", event.get('thread_id'))
     
     state_values = event.get("values", {})
-    response_message = state_values.get("messages", [{}])[-1]
-    thread_ts = event.get("metadata", {}).get("thread_ts") or event.get("metadata", {}).get("event_ts")
-    channel_id = event.get("metadata", {}).get("channel") or config.SLACK_CHANNEL_ID
-    bot_token = event.get("metadata", {}).get("bot_token")
+    messages = state_values.get("messages", [])
+    if not messages:
+        LOGGER.warning("Callback has no messages, skipping")
+        return
+    
+    response_message = messages[-1]
+    metadata = event.get("metadata", {})
+    thread_ts = metadata.get("thread_ts") or metadata.get("event_ts")
+    channel_id = metadata.get("channel") or config.SLACK_CHANNEL_ID
+    bot_token = metadata.get("bot_token")
     
     if not channel_id:
-        raise ValueError("Channel ID not found in event metadata")
+        LOGGER.error("Channel ID not found in callback metadata, dropping callback")
+        return
     
     content = _extract_message_content(response_message)
     response_text = _get_text(content)
@@ -707,33 +783,47 @@ async def _send_slack_response(
     text: str,
     bot_token: Optional[str] = None,
 ):
-    """Send a response to Slack."""
+    """Send a response to Slack.
+    
+    Catches Slack API errors to prevent cascading failures. If this function
+    is called from an error handler (e.g. to send "Sorry, an error occurred"),
+    a Slack API failure here must NOT raise — otherwise the outer handler
+    would try to send yet another error message, which also fails, etc.
+    """
     cleaned_text = _clean_markdown(text)
     
-    if bot_token:
-        # Multi-tenant: use workspace-specific token
-        LOGGER.info(
-            "[%s].[%s] Using router-provided bot_token for response",
-            channel_id,
-            thread_ts,
+    try:
+        if bot_token:
+            # Multi-tenant: use workspace-specific token
+            LOGGER.info(
+                "[%s].[%s] Using router-provided bot_token for response",
+                channel_id,
+                thread_ts,
+            )
+            client = AsyncWebClient(token=bot_token)
+        else:
+            # Single-tenant fallback
+            LOGGER.info(
+                "[%s].[%s] Using APP_HANDLER client (no bot_token provided)",
+                channel_id,
+                thread_ts,
+            )
+            client = APP_HANDLER.app.client
+        
+        await client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=cleaned_text,
         )
-        client = AsyncWebClient(token=bot_token)
-    else:
-        # Single-tenant fallback
-        LOGGER.info(
-            "[%s].[%s] Using APP_HANDLER client (no bot_token provided)",
-            channel_id,
-            thread_ts,
+        
+        LOGGER.info("[%s].[%s] ✅ Sent message to Slack (%d chars)", channel_id, thread_ts, len(cleaned_text))
+    except Exception as slack_err:
+        # Log but do NOT re-raise — this prevents cascading failures
+        # when error handlers call _send_slack_response to notify the user.
+        LOGGER.error(
+            "[%s].[%s] ❌ Failed to send Slack message (%d chars): %s",
+            channel_id, thread_ts, len(cleaned_text), slack_err,
         )
-        client = APP_HANDLER.app.client
-    
-    await client.chat_postMessage(
-        channel=channel_id,
-        thread_ts=thread_ts,
-        text=cleaned_text,
-    )
-    
-    LOGGER.info("[%s].[%s] ✅ Sent message to Slack (%d chars)", channel_id, thread_ts, len(cleaned_text))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -806,13 +896,22 @@ async def _is_mention(event: SlackMessageData) -> bool:
     return False
 
 
+# Cache: bot_token → bot_user_id (avoids calling auth_test on every message)
+_BOT_USER_ID_CACHE: Dict[str, str] = {}
+
+
 async def _is_mention_with_token(event: SlackMessageData, bot_token: str) -> bool:
     """Check if event mentions the bot using a specific bot token."""
+    # Check cache first (auth_test is expensive — called on EVERY message otherwise)
+    if bot_token in _BOT_USER_ID_CACHE:
+        return _detect_mention_from_text(event, _BOT_USER_ID_CACHE[bot_token])
+    
     try:
         client = AsyncWebClient(token=bot_token)
         auth_result = await client.auth_test()
         bot_user_id = auth_result["user_id"]
-        LOGGER.debug("🔑 Got bot_user_id from token: %s", bot_user_id)
+        _BOT_USER_ID_CACHE[bot_token] = bot_user_id
+        LOGGER.debug("🔑 Cached bot_user_id for token: %s", bot_user_id)
         return _detect_mention_from_text(event, bot_user_id)
     except Exception as exc:
         LOGGER.warning("⚠️ Failed to check mention with bot_token: %s", exc)
@@ -1107,11 +1206,21 @@ APP.include_router(ambient_router)
 
 @APP.get("/health")
 async def health():
-    """Health check endpoint."""
+    """Health check endpoint with connection pool status."""
+    pool_info = {}
+    if _connection_pool:
+        pool_stats = _connection_pool.get_stats()
+        pool_info = {
+            "pool_size": pool_stats.get("pool_size", 0),
+            "pool_available": pool_stats.get("pool_available", 0),
+            "requests_waiting": pool_stats.get("requests_waiting", 0),
+        }
+    
     return {
         "status": "healthy",
         "graphs": list(_compiled_graphs.keys()),
         "checkpointer": "connected" if _checkpointer else "disconnected",
+        "pool": pool_info,
     }
 
 
