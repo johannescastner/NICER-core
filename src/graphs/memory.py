@@ -27,7 +27,7 @@ from typing import (
     Iterator,
     overload
 )
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 import google
 from google.cloud import bigquery
 from google.cloud.exceptions import NotFound
@@ -394,6 +394,13 @@ class Fact(BaseModel):
     """
     satisfying the fact type
     """
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_string(cls, v):
+        if isinstance(v, str):
+            return {"content": v}
+        return v
+
     content: str
     importance: Optional[str] = None
     category: Optional[str] = None
@@ -402,6 +409,13 @@ class Episode(BaseModel):
     """
     satisfying the episode type
     """
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_string(cls, v):
+        if isinstance(v, str):
+            return {"observation": v}
+        return v
+
     observation: Optional[str] = None
     thoughts: Optional[str] = None
     action: Optional[str] = None
@@ -411,6 +425,13 @@ class Procedure(BaseModel):
     """
     satisfying the procedure type
     """
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_string(cls, v):
+        if isinstance(v, str):
+            return {"name": v}
+        return v
+
     name: Optional[str] = None
     conditions: Optional[str] = None
     steps: Optional[str] = None
