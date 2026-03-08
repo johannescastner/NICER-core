@@ -167,17 +167,22 @@ class ConversationLogger:
     def __init__(
             self,
             project_id: str = PROJECT_ID or "",
-            dataset_id: str = "conversation_logs_eu",
+            dataset_id: str | None = None,
             langsmith_project: str = LANGSMITH_PROJECT,
             pm=None
     ):
         """Initialize the conversation logger (lightweight, no model loading)."""
         self.project_id = project_id
-        self.dataset_id = dataset_id
         self.langsmith_project = langsmith_project
 
         # Persistence Manager
         self.pm = pm or get_persistence_manager()
+
+        # Dataset name — derive from persistence manager if not explicitly set
+        if dataset_id is not None:
+            self.dataset_id = dataset_id
+        else:
+            self.dataset_id = self.pm.conversation_logs_dataset
 
         # Tone analysis token cap
         self._tone_max_length: int = _get_tone_max_length_from_env()

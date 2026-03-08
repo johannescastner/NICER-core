@@ -52,6 +52,13 @@ SUPERSET_REGION = (
 )
 LOCATION = environ.get("GCP_LOCATION", GCP_REGION)
 
+# BigQuery dataset naming suffix. Controls the suffix in dataset names like
+# "conversation_logs_{suffix}", "agent_cognitive_processes_{suffix}".
+# This is purely a naming convention — independent of the physical BQ location.
+# Default "eu" preserves backward compatibility with all existing deployments.
+# New clients should set this to match their region (e.g. "us" for US clients).
+BQ_DATASET_SUFFIX = environ.get("BQ_DATASET_SUFFIX", "eu")
+
 if DEPLOY_MODAL:
     if not environ.get("SLACK_BOT_TOKEN"):
         environ["SLACK_BOT_TOKEN"] = "fake-token"
@@ -122,11 +129,7 @@ except Exception as e:
     CW_PROJECT_ID = "collectiwise-nicer"
 
 # Location-aware dataset naming
-def get_regional_dataset_suffix(location: str) -> str:
-    return location.lower().replace("-", "_")
-
-CENTRAL_DATASET_SUFFIX = get_regional_dataset_suffix(LOCATION)
-CENTRAL_DATASET_ID = f"agent_cognitive_processes_{CENTRAL_DATASET_SUFFIX}"
+CENTRAL_DATASET_ID = f"agent_cognitive_processes_{BQ_DATASET_SUFFIX}"
 # Best-effort derive the SA email from embedded credentials.
 # This is useful for provisioning scripts that need to grant Secret Manager access
 # to the runtime identity without forcing clients to repeat themselves.
@@ -310,7 +313,6 @@ PROVIDER_CONFIG = MODEL_PROVIDERS[CURRENT_PROVIDER]
 # ───── Language-model defaults ─────
 DEFAULT_MODEL = f"{CURRENT_PROVIDER}:{PROVIDER_CONFIG[CURRENT_MODEL_TYPE]}"
 DEFAULT_TEMPERATURE = float(environ.get("NICER_TEMPERATURE", "0.1"))
-DEFAULT_DATASET = "linkedin_raw"
 
 # API configuration for current provider
 API_KEY = environ.get(PROVIDER_CONFIG["api_key_env"])
