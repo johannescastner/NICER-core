@@ -130,6 +130,23 @@ except Exception as e:
 
 # Location-aware dataset naming
 CENTRAL_DATASET_ID = f"agent_cognitive_processes_{BQ_DATASET_SUFFIX}"
+
+# Per-tenant semantic_staging cache dataset (FQN: project.dataset).
+#
+# IMPORTANT: this dataset MUST be in the SAME BigQuery region as the central
+# warehouse (US multi-region), because the resolver's wrap SQL JOINs the
+# tenant's ``semantic_staging`` against the central ``region_geometry`` in a
+# single query, and BigQuery cannot cross-region JOIN.
+#
+# Architecture: every tenant maintains its own cache (regenerable from Wikidata
+# SPARQL), in a dedicated US-multi-region dataset they own. The per-tenant SA
+# has dataEditor on its own dataset; the central CW SA is reserved for explicit
+# admin/telemetry paths in persistence.py.
+#
+# Naming: ``semantic_cache_us`` — fixed name (not dataset-suffix-driven)
+# because the cache region is dictated by the warehouse, not the tenant's
+# operational region. Provisioned by ``persistence.py`` at startup.
+SEMANTIC_CACHE_DATASET = f"{PROJECT_ID}.semantic_cache_us"
 # Best-effort derive the SA email from embedded credentials.
 # This is useful for provisioning scripts that need to grant Secret Manager access
 # to the runtime identity without forcing clients to repeat themselves.

@@ -544,19 +544,14 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
     )
     channel_id = event["channel"]
     user_id = event["user"]
-    
-    # Check if it's a mention or DM
-    if bot_token:
-        is_mention = await _is_mention_with_token(event, bot_token)
-    else:
-        is_mention = await _is_mention(event)
-    
-    is_dm = _is_dm(event)
-    LOGGER.info("📊 Message check: is_mention=%s, is_dm=%s", is_mention, is_dm)
-    
-    if not (is_mention or is_dm):
-        LOGGER.info("⏭️ Skipping non-mention, non-DM message")
-        return
+
+    # Events arriving here have already been validated upstream (either by
+    # the slack-router for /slack/event, or by slack_bolt for /events/slack).
+    # We do not re-gate: the router has strictly more information (per-tenant
+    # bot_id AND bot_user_id) and already accepts both <@U…> and <@B…> forms.
+    # Historical bug 2026-04-13: re-gating here with a regex that only matched
+    # <@U…> silently dropped legitimate B-form mentions that the router
+    # correctly forwarded. See tests/test_router_endpoint_trusts_router.py.
 
     # ═══ Check if this is a reply to an interrupted (paused) graph ═══
     parent_ts = event.get("thread_ts")
@@ -855,67 +850,6 @@ def _get_thread_id(thread_ts: str, channel: str) -> str:
 
 def _is_dm(event: SlackMessageData) -> bool:
     return event.get("channel_type") == "im"
-
-
-def _detect_mention_from_text(event: SlackMessageData, bot_user_id: str) -> bool:
-    """Check if the event text contains a mention of the given bot user ID."""
-    text = event.get("text", "")
-    pattern = re.compile(rf"<@{bot_user_id}>")
-    return bool(re.search(pattern, text))
-
-
-async def _is_mention(event: SlackMessageData) -> bool:
-    """
-    Check if event mentions the bot using global client.
-    
-    Falls back to checking if ANY mention exists if we can't determine bot_user_id.
-    """
-    # Try to use cached bot_user_id
-    if config.BOT_USER_ID and config.BOT_USER_ID != "fake-user-id":
-        return _detect_mention_from_text(event, config.BOT_USER_ID)
-    
-    # Try to get bot_user_id via auth_test
-    try:
-        auth_result = await APP_HANDLER.app.client.auth_test()
-        config.BOT_USER_ID = auth_result["user_id"]
-        LOGGER.info("🔑 Cached BOT_USER_ID from auth_test: %s", config.BOT_USER_ID)
-        return _detect_mention_from_text(event, config.BOT_USER_ID)
-    except Exception as e:
-        LOGGER.warning("⚠️ auth_test failed: %s", e)
-    
-    # Fallback: Check if there's ANY mention in the text
-    # This is permissive but better than dropping all messages
-    text = event.get("text", "")
-    has_any_mention = bool(MENTION_REGEX.search(text))
-    
-    if has_any_mention:
-        LOGGER.info("🔄 Fallback: detected mention pattern in text, assuming it's for this bot")
-        return True
-    
-    LOGGER.info("📝 No mention detected in message text")
-    return False
-
-
-# Cache: bot_token → bot_user_id (avoids calling auth_test on every message)
-_BOT_USER_ID_CACHE: Dict[str, str] = {}
-
-
-async def _is_mention_with_token(event: SlackMessageData, bot_token: str) -> bool:
-    """Check if event mentions the bot using a specific bot token."""
-    # Check cache first (auth_test is expensive — called on EVERY message otherwise)
-    if bot_token in _BOT_USER_ID_CACHE:
-        return _detect_mention_from_text(event, _BOT_USER_ID_CACHE[bot_token])
-    
-    try:
-        client = AsyncWebClient(token=bot_token)
-        auth_result = await client.auth_test()
-        bot_user_id = auth_result["user_id"]
-        _BOT_USER_ID_CACHE[bot_token] = bot_user_id
-        LOGGER.debug("🔑 Cached bot_user_id for token: %s", bot_user_id)
-        return _detect_mention_from_text(event, bot_user_id)
-    except Exception as exc:
-        LOGGER.warning("⚠️ Failed to check mention with bot_token: %s", exc)
-        return await _is_mention(event)
 
 
 async def _fetch_thread_history(
@@ -1282,13 +1216,18 @@ async def slack_event_from_router(req: Request, _: None = Depends(verify_request
     event = body.get("event", {})
     event_type = event.get("type")
     
+    _text = event.get("text", "")
     LOGGER.info(
         "📨 Event details: type=%s, user=%s, channel=%s, text_preview=%s",
         event_type,
         event.get("user"),
         event.get("channel"),
-        (event.get("text", "")[:50] + "...") if event.get("text") else "(no text)",
+        (_text[:500] + ("…" if len(_text) > 500 else "")) if _text else "(no text)",
     )
+    # DEBUG-level dump of structured blocks — lets us reconstruct the exact
+    # Slack payload when a regression occurs (previously truncated to 50
+    # chars, which hid the B-form mention bug for hours).
+    LOGGER.debug("📨 Event blocks: %s", event.get("blocks"))
     
     if not event_type:
         LOGGER.info("⏭️ No event_type, skipping")
@@ -1307,30 +1246,15 @@ async def slack_event_from_router(req: Request, _: None = Depends(verify_request
         LOGGER.info("⏭️ No user in event, skipping")
         return {"ok": True}
     
-    # For app_mention events, always process (Slack guarantees it's a mention)
-    if event_type == "app_mention":
-        LOGGER.info("✅ app_mention event, enqueuing directly")
-        TASK_QUEUE.put_nowait({
-            "type": "slack_message",
-            "event": event,
-            "bot_token": bot_token,
-        })
-        return {"ok": True}
-    
-    # For messages, check if it's a mention or DM
-    if event_type == "message":
-        if bot_token:
-            is_mention = await _is_mention_with_token(event, bot_token)
-        else:
-            is_mention = await _is_mention(event)
-        
-        is_dm = _is_dm(event)
-        LOGGER.info("📊 Message check: is_mention=%s, is_dm=%s", is_mention, is_dm)
-        
-        if not (is_mention or is_dm):
-            LOGGER.info("⏭️ Not a mention or DM, skipping")
-            return {"ok": True}
-    
+    # Trust the router: it only forwards events that should be processed
+    # (DMs, channel mentions in either <@U…> or <@B…> form, app_mentions,
+    # with dedup against duplicate deliveries). See
+    # nicer-deployments/slack-router/app/main.py:handle_message for the
+    # authoritative gate. Re-gating here would strictly lose information —
+    # the router has per-tenant bot_id AND bot_user_id; the agent only has
+    # bot_user_id. See tests/test_router_endpoint_trusts_router.py for the
+    # regression this closes.
+
     # Enqueue for processing
     LOGGER.info(
         "✅ Enqueuing router event: type=%s, user=%s, channel=%s",

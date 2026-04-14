@@ -122,20 +122,34 @@ except (ImportError, AttributeError):
 original_warn = warnings.warn
 
 
-def silent_warn(message, category=UserWarning, filename='', lineno=-1, 
-                file=None, stacklevel=1):
-    """Custom warning handler that suppresses third-party deprecation warnings."""
+def silent_warn(message, category=UserWarning, stacklevel=1, source=None,
+                *, skip_file_prefixes=(), **kwargs):
+    """Custom warn() that suppresses specific third-party DeprecationWarnings.
+
+    Signature mirrors CPython 3.12's warnings.warn(message, category, stacklevel,
+    source, *, skip_file_prefixes). The ``**kwargs`` catch-all future-proofs
+    against Python 3.13+ adding new keyword arguments to warnings.warn without
+    requiring another patch here.
+
+    The ``source`` parameter is what the previous signature was missing: since
+    Python 3.12, ``_warn_unawaited_coroutine`` (warnings.py:553) calls
+    ``warn(msg, category=RuntimeWarning, stacklevel=2, source=coro)`` so that
+    tracemalloc can attach the coroutine-origin traceback. The old shim had
+    ``filename``, ``lineno``, ``file`` parameters copied from ``warn_explicit``
+    that never actually matched ``warn``'s real signature — they were dead
+    params absorbed by a TypeError fallback. Cleaned up here.
+    """
     # Suppress all deprecation warnings from third-party libraries
     if category == DeprecationWarning:
         keywords = ['pydantic_v1', 'LangChain', 'langchain_core']
         if any(keyword in str(message) for keyword in keywords):
             return
-    # Call original warn with correct arguments
-    try:
-        original_warn(message, category, filename, lineno, file, stacklevel)
-    except TypeError:
-        # Fallback for different warning signatures
-        original_warn(message, category, stacklevel=stacklevel)
+    original_warn(
+        message, category,
+        stacklevel=stacklevel, source=source,
+        skip_file_prefixes=skip_file_prefixes,
+        **kwargs,
+    )
 
 
 warnings.warn = silent_warn
