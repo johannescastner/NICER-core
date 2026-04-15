@@ -147,6 +147,15 @@ CENTRAL_DATASET_ID = f"agent_cognitive_processes_{BQ_DATASET_SUFFIX}"
 # because the cache region is dictated by the warehouse, not the tenant's
 # operational region. Provisioned by ``persistence.py`` at startup.
 SEMANTIC_CACHE_DATASET = f"{PROJECT_ID}.semantic_cache_us"
+
+# Default LangGraph ``recursion_limit`` for every inner-agent ``.invoke()``
+# in baby-NICER (SupersetAgent, PlotlyAgent, and the intellagent adapter's
+# outer swarm loop).  LangGraph's library default is 25 — too low for NICER's
+# chart workflows, which commonly take 30-40 Pregel super-steps through the
+# validate → retry → Tufte-review cycle.  Set here so every agent that
+# invokes a compiled graph can ``setdefault("recursion_limit", …)`` with a
+# single source of truth and no 25-vs-50 drift between agents.
+AGENT_RECURSION_LIMIT = 50
 # Best-effort derive the SA email from embedded credentials.
 # This is useful for provisioning scripts that need to grant Secret Manager access
 # to the runtime identity without forcing clients to repeat themselves.

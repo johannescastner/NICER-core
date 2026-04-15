@@ -7,6 +7,7 @@ from __future__ import annotations
 from functools import lru_cache
 import asyncio
 import concurrent.futures
+import time
 from collections.abc import Iterable as IterableABC
 import uuid
 import logging
@@ -110,18 +111,184 @@ def ensure_table_with_schema(
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
+# ════════════════════════════════════════════════════════════════════════════
+# Bug 24 fix (2026-04-14): retry + soft-dedupe for Modal embedding calls.
+#
+# Root cause: three concurrent vectorstore constructions (semantic/episodic/
+# procedural) each called ``embed_query("test")`` as a Pydantic validator
+# probe.  They hit Modal through a single shared ``httpx.Client`` connection
+# pool, serialising HEAD-of-line on one HTTP/1.1 connection.  Under Modal
+# cold-start, the 60s read timeout fired and the unhandled ``ReadTimeout``
+# bubbled up through the store builder → asyncio.to_thread → gather →
+# LangGraph task, killing the whole scenario.
+#
+# Fix shape (mirrors ``pro/canonical/wikidata_client`` Bug 22(a) pattern):
+#   * bounded exponential-backoff retry for transient network errors
+#     (ReadTimeout, ConnectTimeout, NetworkError, PoolTimeout) and HTTP
+#     429 / 5xx.  Retry-After header honoured (delta-seconds or HTTP-date)
+#     when present, capped at _MAX_EMBED_RETRY_WAIT seconds per attempt.
+#   * per-``(model, text)`` result cache: embeddings are deterministic, so
+#     caching the Pydantic "test" probe means second + third probes never
+#     touch Modal at all — eliminating the connection-pool amplification
+#     that turned one slow call into three.  Bounded FIFO (size 512) so
+#     the cache can't grow unbounded on normal traffic.
+# ════════════════════════════════════════════════════════════════════════════
+
+_EMBED_CACHE_MAX = 512
+_embed_cache: "dict[tuple[str, str], list[float]]" = {}
+
+
+def _embed_cache_get(model: str, text: str):
+    return _embed_cache.get((model, text))
+
+
+def _embed_cache_put(model: str, text: str, embedding):
+    if len(_embed_cache) >= _EMBED_CACHE_MAX:
+        # FIFO eviction — drop an arbitrary oldest item
+        _embed_cache.pop(next(iter(_embed_cache)), None)
+    _embed_cache[(model, text)] = embedding
+
+
+def _parse_embed_retry_after(hdr, fallback: float) -> float:
+    """Parse RFC 7231 Retry-After (delta-seconds or HTTP-date).
+    Mirrors the helper in ``pro/canonical/wikidata_client.py``.
+    """
+    if not hdr:
+        return fallback
+    hdr_s = hdr.strip() if isinstance(hdr, str) else str(hdr).strip()
+    try:
+        return float(hdr_s)
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        import datetime as _dt
+        target = parsedate_to_datetime(hdr_s)
+        now = (
+            _dt.datetime.now(target.tzinfo)
+            if target.tzinfo is not None
+            else _dt.datetime.utcnow()
+        )
+        return max((target - now).total_seconds(), 0.0)
+    except Exception:
+        return fallback
+
+
+_MAX_EMBED_RETRY_WAIT = 60.0
+_EMBED_MAX_RETRIES = 4
+
+
+def _is_transient_http_exc(exc) -> bool:
+    """True for httpx exceptions that represent transient network failures
+    safe to retry (timeouts, connection errors, pool saturation).
+    """
+    import httpx
+    return isinstance(exc, (
+        httpx.ReadTimeout,
+        httpx.ConnectTimeout,
+        httpx.WriteTimeout,
+        httpx.PoolTimeout,
+        httpx.ConnectError,
+        httpx.NetworkError,
+        httpx.RemoteProtocolError,
+    ))
+
+
+def _sync_modal_post_with_retry(client, url: str, payload: dict):
+    """POST to Modal with retry on 429/5xx + transient network errors.
+
+    Raises the last exception / HTTPStatusError when all retries exhausted.
+    """
+    import httpx
+    last_exc: Optional[BaseException] = None
+    for attempt in range(_EMBED_MAX_RETRIES):
+        try:
+            response = client.post(url, json=payload)
+            if response.status_code == 429 or 500 <= response.status_code < 600:
+                if attempt >= _EMBED_MAX_RETRIES - 1:
+                    response.raise_for_status()
+                wait = min(
+                    _parse_embed_retry_after(
+                        response.headers.get("Retry-After"),
+                        fallback=2 ** (attempt + 1),
+                    ),
+                    _MAX_EMBED_RETRY_WAIT,
+                )
+                logger.warning(
+                    "Modal embed HTTP %d (attempt %d/%d), retrying in %.1fs",
+                    response.status_code, attempt + 1, _EMBED_MAX_RETRIES, wait,
+                )
+                time.sleep(wait)
+                continue
+            response.raise_for_status()
+            return response
+        except httpx.HTTPError as e:
+            if not _is_transient_http_exc(e) or attempt >= _EMBED_MAX_RETRIES - 1:
+                raise
+            last_exc = e
+            wait = min(2 ** (attempt + 1), _MAX_EMBED_RETRY_WAIT)
+            logger.warning(
+                "Modal embed transient %s (attempt %d/%d), retrying in %.1fs: %s",
+                type(e).__name__, attempt + 1, _EMBED_MAX_RETRIES, wait, e,
+            )
+            time.sleep(wait)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Modal embed retry loop exhausted without exception")
+
+
+async def _async_modal_post_with_retry(client, url: str, payload: dict):
+    """Async variant of ``_sync_modal_post_with_retry``."""
+    import httpx
+    last_exc: Optional[BaseException] = None
+    for attempt in range(_EMBED_MAX_RETRIES):
+        try:
+            response = await client.post(url, json=payload)
+            if response.status_code == 429 or 500 <= response.status_code < 600:
+                if attempt >= _EMBED_MAX_RETRIES - 1:
+                    response.raise_for_status()
+                wait = min(
+                    _parse_embed_retry_after(
+                        response.headers.get("Retry-After"),
+                        fallback=2 ** (attempt + 1),
+                    ),
+                    _MAX_EMBED_RETRY_WAIT,
+                )
+                logger.warning(
+                    "Modal embed HTTP %d (attempt %d/%d), retrying in %.1fs",
+                    response.status_code, attempt + 1, _EMBED_MAX_RETRIES, wait,
+                )
+                await asyncio.sleep(wait)
+                continue
+            response.raise_for_status()
+            return response
+        except httpx.HTTPError as e:
+            if not _is_transient_http_exc(e) or attempt >= _EMBED_MAX_RETRIES - 1:
+                raise
+            last_exc = e
+            wait = min(2 ** (attempt + 1), _MAX_EMBED_RETRY_WAIT)
+            logger.warning(
+                "Modal embed transient %s (attempt %d/%d), retrying in %.1fs: %s",
+                type(e).__name__, attempt + 1, _EMBED_MAX_RETRIES, wait, e,
+            )
+            await asyncio.sleep(wait)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Modal embed retry loop exhausted without exception")
+
+
 class ModalEmbeddings(Embeddings):
     """
     LangChain-compatible embeddings wrapper that calls Modal endpoints.
-    
+
     Uses DUAL httpx clients to avoid event loop conflicts:
     - Sync httpx.Client for embed_query/embed_documents (called from sync contexts)
     - Async httpx.AsyncClient for aembed_query/aembed_documents (called from async contexts)
-    
+
     This pattern is identical to how langchain-openai handles the same problem.
     NEVER use asyncio.run() to bridge sync→async - it creates/destroys event loops
     which corrupts httpx connection pools and causes "Event loop is closed" errors.
-    
+
     Uses bge-base-en-v1.5 (768 dims) for best retrieval quality.
     """
     
@@ -174,75 +341,119 @@ class ModalEmbeddings(Embeddings):
  
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         """Embed a list of documents (sync, for LangChain compatibility).
-        
+
         Uses sync httpx.Client - safe to call from any context including
         inside run_in_executor or ThreadPoolExecutor.
+
+        Bug 24 fix: retries transient failures (429/5xx/timeouts) via
+        ``_sync_modal_post_with_retry``.  Per-text result cache means
+        repeat calls with identical text skip Modal entirely.
         """
+        # Serve cache hits first; only POST the uncached subset.
+        cached_out: "list[Optional[list[float]]]" = [
+            _embed_cache_get(self.model, t) for t in texts
+        ]
+        missing_idx = [i for i, v in enumerate(cached_out) if v is None]
+        if not missing_idx:
+            return [v for v in cached_out if v is not None]
+        missing_texts = [texts[i] for i in missing_idx]
+
         sync_http = self._get_sync_client()
         url = self._get_url("embed_batch")
-        payload = {"texts": texts, "model": self.model}
-
+        payload = {"texts": missing_texts, "model": self.model}
         try:
-            response = sync_http.post(url, json=payload)
-            response.raise_for_status()
+            response = _sync_modal_post_with_retry(sync_http, url, payload)
             data = response.json()
-            return self._parse_batch_response(data)
+            fetched = self._parse_batch_response(data)
         except Exception as e:
-            logger.error("Sync embed_documents failed: %s", e)
+            logger.error("Sync embed_documents failed after retries: %s", e)
             raise
-    
+
+        for local_i, global_i in enumerate(missing_idx):
+            emb = fetched[local_i]
+            _embed_cache_put(self.model, texts[global_i], emb)
+            cached_out[global_i] = emb
+        return [v for v in cached_out if v is not None]
+
     def embed_query(self, text: str) -> list[float]:
         """Embed a single query (sync, for LangChain compatibility).
-        
+
         Uses sync httpx.Client - safe to call from any context.
+        Bug 24 fix: retries + result cache (eliminates the 3-simultaneous-
+        probe connection-pool amplification during vectorstore construction).
         """
+        cached = _embed_cache_get(self.model, text)
+        if cached is not None:
+            return cached
+
         sync_http = self._get_sync_client()
         url = self._get_url("embed")
         payload = {"text": text, "model": self.model}
-
-        
         try:
-            response = sync_http.post(url, json=payload)
-            response.raise_for_status()
+            response = _sync_modal_post_with_retry(sync_http, url, payload)
             data = response.json()
-            return self._parse_single_response(data)
+            embedding = self._parse_single_response(data)
         except Exception as e:
-            logger.error("Sync embed_query failed: %s", e)
+            logger.error("Sync embed_query failed after retries: %s", e)
             raise
+        _embed_cache_put(self.model, text, embedding)
+        return embedding
     
     # =========================================================================
     # ASYNC METHODS - Use async httpx.AsyncClient  
     # =========================================================================
     
     async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
-        """Async embed documents - uses native async client."""
+        """Async embed documents - uses native async client.
+
+        Bug 24 fix: retry + cache (same shape as the sync path).
+        """
+        cached_out: "list[Optional[list[float]]]" = [
+            _embed_cache_get(self.model, t) for t in texts
+        ]
+        missing_idx = [i for i, v in enumerate(cached_out) if v is None]
+        if not missing_idx:
+            return [v for v in cached_out if v is not None]
+        missing_texts = [texts[i] for i in missing_idx]
+
         async_http = self._get_async_client()
         url = self._get_url("embed_batch")
-        payload = {"texts": texts, "model": self.model}
-        
+        payload = {"texts": missing_texts, "model": self.model}
         try:
-            response = await async_http.post(url, json=payload)
-            response.raise_for_status()
+            response = await _async_modal_post_with_retry(async_http, url, payload)
             data = response.json()
-            return self._parse_batch_response(data)
+            fetched = self._parse_batch_response(data)
         except Exception as e:
-            logger.error("Async aembed_documents failed: %s", e)
+            logger.error("Async aembed_documents failed after retries: %s", e)
             raise
-    
+
+        for local_i, global_i in enumerate(missing_idx):
+            emb = fetched[local_i]
+            _embed_cache_put(self.model, texts[global_i], emb)
+            cached_out[global_i] = emb
+        return [v for v in cached_out if v is not None]
+
     async def aembed_query(self, text: str) -> list[float]:
-        """Async embed query - uses native async client."""
+        """Async embed query - uses native async client.
+
+        Bug 24 fix: retry + cache.
+        """
+        cached = _embed_cache_get(self.model, text)
+        if cached is not None:
+            return cached
+
         async_http = self._get_async_client()
         url = self._get_url("embed")
         payload = {"text": text, "model": self.model}
-        
         try:
-            response = await async_http.post(url, json=payload)
-            response.raise_for_status()
+            response = await _async_modal_post_with_retry(async_http, url, payload)
             data = response.json()
-            return self._parse_single_response(data)
+            embedding = self._parse_single_response(data)
         except Exception as e:
-            logger.error("Async aembed_query failed: %s", e)
+            logger.error("Async aembed_query failed after retries: %s", e)
             raise
+        _embed_cache_put(self.model, text, embedding)
+        return embedding
     
     # =========================================================================
     # RESPONSE PARSING (shared by sync/async)
