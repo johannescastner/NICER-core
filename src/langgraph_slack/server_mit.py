@@ -467,9 +467,19 @@ class SlackMessageData(TypedDict):
     channel_type: str
 
 
-USER_NAME_CACHE: dict[str, str] = {}
 TASK_QUEUE: asyncio.Queue = asyncio.Queue()
-MENTION_REGEX = re.compile(r"<@([A-Z0-9]+)>")
+
+# Shared with src/langgraph_slack/server.py via the canonical module —
+# keeps the user-name cache, mention regex, and contextual-message
+# construction in one place. Approach C (May 2026 fix for the VIEBEG
+# bug) lives there; see that module's docstring.
+from src.langgraph_slack.contextual_message import (  # noqa: E402
+    MENTION_REGEX,
+    USER_NAME_CACHE,
+    build_contextual_message,
+    fetch_user_names,
+    resolve_user_mentions,
+)
 
 
 async def worker():
@@ -561,8 +571,11 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
         )
         return
     
-    # Build contextual message with thread history
-    text_with_names = await _build_contextual_message(event, bot_token=bot_token)
+    # Resolve <@USERID> mentions in the user's event text. The LangGraph
+    # checkpointer (keyed on a stable thread_id) keeps prior turns in
+    # state.messages — no need to inject thread history into every new
+    # HumanMessage. See src/langgraph_slack/contextual_message.py.
+    text_with_names = await build_contextual_message(event, bot_token=bot_token)
     
     # Generate conversation_id for tracking
     conversation_id = f"slack_{thread_id}"
@@ -852,171 +865,12 @@ def _is_dm(event: SlackMessageData) -> bool:
     return event.get("channel_type") == "im"
 
 
-async def _fetch_thread_history(
-    channel_id: str, thread_ts: str, *, bot_token: Optional[str] = None
-) -> list[SlackMessageData]:
-    """Fetch all messages in a Slack thread."""
-    if bot_token:
-        client = AsyncWebClient(token=bot_token)
-    else:
-        client = APP_HANDLER.app.client
-    
-    all_messages = []
-    cursor = None
-    
-    while True:
-        try:
-            kwargs = {
-                "channel": channel_id,
-                "ts": thread_ts,
-                "inclusive": True,
-                "limit": 150,
-            }
-            if cursor:
-                kwargs["cursor"] = cursor
-            
-            response = await client.conversations_replies(**kwargs)
-            all_messages.extend(response["messages"])
-            
-            if not response.get("has_more"):
-                break
-            cursor = response["response_metadata"]["next_cursor"]
-        except Exception as exc:
-            LOGGER.exception("Error fetching thread messages: %s", exc)
-            break
-    
-    return all_messages
+# Note: _fetch_thread_history / _fetch_user_names / _build_contextual_message
+# used to live here. Approach C (May 2026) consolidated them into
+# src/langgraph_slack/contextual_message.py and dropped the thread-history
+# wrapping. The LangGraph checkpointer keeps prior turns in state.messages
+# across messages — see that module's docstring for full context.
 
-
-async def _fetch_user_names(
-    user_ids: set[str], *, bot_token: Optional[str] = None
-) -> dict[str, str]:
-    """Fetch and cache Slack display names for user IDs."""
-    if bot_token:
-        client = AsyncWebClient(token=bot_token)
-    else:
-        client = APP_HANDLER.app.client
-    
-    uncached_ids = [uid for uid in user_ids if uid not in USER_NAME_CACHE]
-    if uncached_ids:
-        tasks = [client.users_info(user=uid) for uid in uncached_ids]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for uid, result in zip(uncached_ids, results):
-            if isinstance(result, Exception):
-                continue
-            user_obj = result.get("user", {})
-            profile = user_obj.get("profile", {})
-            display_name = profile.get("display_name") or profile.get("real_name") or uid
-            USER_NAME_CACHE[uid] = display_name
-    
-    return {uid: USER_NAME_CACHE[uid] for uid in user_ids if uid in USER_NAME_CACHE}
-
-
-async def _build_contextual_message(
-    event: SlackMessageData, *, bot_token: Optional[str] = None
-) -> str:
-    """Build a message with thread context, using display names."""
-    thread_ts = event.get("thread_ts") or event["ts"]
-    channel_id = event["channel"]
-    event_ts = event.get("ts")
-    event_text = event.get("text", "")
-    
-    LOGGER.info(
-        "🔍 _build_contextual_message: channel=%s, thread_ts=%s, event_ts=%s, event_text=%s",
-        channel_id, thread_ts, event_ts, event_text[:100] if event_text else "(empty)"
-    )
-    LOGGER.info(
-        "🔍 config.BOT_USER_ID=%s",
-        config.BOT_USER_ID
-    )
-    
-    history = await _fetch_thread_history(channel_id, thread_ts, bot_token=bot_token)
-    LOGGER.info("🔍 _fetch_thread_history returned %d messages", len(history))
-    
-    # Debug: log each message in history
-    for i, msg in enumerate(history):
-        LOGGER.info(
-            "🔍 history[%d]: ts=%s, user=%s, bot_id=%s, text=%s",
-            i, msg.get("ts"), msg.get("user"), msg.get("bot_id"), 
-            (msg.get("text", "")[:50] + "...") if msg.get("text") else "(no text)"
-        )
-    
-    included = []
-    for msg in reversed(history):
-        msg_bot_id = msg.get("bot_id")
-        LOGGER.info(
-            "🔍 Checking msg: bot_id=%s, comparing to config.BOT_USER_ID=%s, match=%s",
-            msg_bot_id, config.BOT_USER_ID, msg_bot_id == config.BOT_USER_ID
-        )
-        if msg_bot_id == config.BOT_USER_ID:
-            LOGGER.info("🔍 Breaking on bot message")
-            break
-        included.append(msg)
-    
-    LOGGER.info("🔍 After filtering: included has %d messages", len(included))
-    
-    # ══════════════════════════════════════════════════════════════════════════
-    # FIX: If history doesn't include the current event, add it
-    # This happens for new messages that aren't indexed as threads yet,
-    # or when conversations_replies returns empty for a fresh message
-    # ══════════════════════════════════════════════════════════════════════════
-    current_event_in_included = any(msg.get("ts") == event_ts for msg in included)
-    LOGGER.info(
-        "🔍 current_event_in_included=%s (event_ts=%s)", 
-        current_event_in_included, event_ts
-    )
-    
-    if not current_event_in_included and event_text:
-        LOGGER.info("🔍 Adding current event to included (wasn't in history)")
-        included.insert(0, event)
-    
-    LOGGER.info("🔍 Final included count: %d", len(included))
-    
-    all_user_ids = set()
-    for msg in included:
-        all_user_ids.add(msg.get("user", "unknown"))
-        all_user_ids.update(MENTION_REGEX.findall(msg.get("text", "")))
-    
-    all_user_ids.add(event["user"])
-    all_user_ids.update(MENTION_REGEX.findall(event.get("text", "")))
-    
-    user_names = await _fetch_user_names(all_user_ids, bot_token=bot_token)
-    
-    def format_message(msg: SlackMessageData) -> str:
-        text = msg.get("text", "")
-        user_id = msg.get("user", "unknown")
-        
-        def repl(match: re.Match) -> str:
-            uid = match.group(1)
-            return user_names.get(uid, uid)
-        
-        replaced_text = MENTION_REGEX.sub(repl, text)
-        speaker_name = user_names.get(user_id, user_id)
-        return f'<slackMessage user="{speaker_name}">{replaced_text}</slackMessage>'
-    
-    context_parts = [format_message(msg) for msg in reversed(included)]
-    LOGGER.info("🔍 context_parts has %d items", len(context_parts))
-    
-    new_message = context_parts[-1] if context_parts else ""
-    preceding_context = "\n".join(context_parts[:-1]) if len(context_parts) > 1 else ""
-    
-    LOGGER.info(
-        "🔍 new_message length=%d, preview=%s",
-        len(new_message), new_message[:100] if new_message else "(empty)"
-    )
-    
-    contextual_message = (
-        (("Preceding context:\n" + preceding_context) if preceding_context else "")
-        + "\n\nNew message:\n"
-        + new_message
-    )
-    
-    LOGGER.info(
-        "🔍 Final contextual_message length=%d, preview=%s",
-        len(contextual_message), contextual_message[:150]
-    )
-    
-    return contextual_message
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FastAPI App Setup

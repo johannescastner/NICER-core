@@ -56,6 +56,8 @@ from langgraph.store.base.batch import (
 )
 from langmem import create_manage_memory_tool, create_search_memory_tool
 
+from pro.canonical.bq_batch import merge_upsert_json_rows
+
 
 import src.langgraph_slack.patch_typing  # must run before any Pydantic model loading
 
@@ -613,8 +615,11 @@ class Fact(BaseModel):
         return v
 
     content: str
-    importance: Optional[str] = None
-    category: Optional[str] = None
+    # Phase-3 (C2): ``importance`` and ``category`` dropped.
+    # They were declared but never populated — only 5 of 731 production
+    # rows in Viebeg's semantic memory had either set, and no code
+    # consumed them. Per the Phase-3 diagnosis (Item 6) and user
+    # decision, these are removed rather than formalized.
 
 class Episode(BaseModel):
     """
@@ -921,6 +926,197 @@ class PatchedBigQueryVectorStore(BigQueryVectorStore):
             self._logger.debug("Table %s validated", self.full_table_id)
         return table_ref
 
+
+# =============================================================================
+# Helpers for asearch namespace_prefix → SQL filter translation (B0 fix)
+# =============================================================================
+#
+# Background: ``BaseStore.asearch``'s ``namespace_prefix`` argument is documented
+# as scoping the search to items whose stored namespace tuple starts with that
+# prefix (``langgraph.store.base.BaseStore.asearch`` docstring; reference
+# ``InMemoryStore._filter_items``). Our store persists the namespace as a
+# ``.``-joined STRING column (see ``aput``: ``data["namespace"] = ".".join(namespace)``,
+# matched by ``ns_join`` at module top), so tuple-prefix matching becomes a
+# string-prefix match. ``BigQueryVectorStore._create_filters`` accepts
+# ``filter`` either as a dict (column = value equality only) OR a literal SQL
+# WHERE-clause string. We exploit the latter to combine namespace scoping +
+# caller's optional Mongo-style filter into a single SQL string.
+#
+# Uses ``STARTS_WITH`` (GoogleSQL) for prefix matching — no LIKE wildcards to
+# worry about. Strings are escaped against SQL injection (single-quote doubling
+# + backslash doubling per BQ string-literal grammar).
+# =============================================================================
+
+import sqlglot.expressions as _sqlglot_exp
+
+
+def _column_expression(name: str) -> _sqlglot_exp.Column:
+    """Build a sqlglot ``Column`` expression for ``name``, backtick-quoted at
+    render time. Rejects only the one character (backtick) that breaks
+    backtick-quoted identifiers in BQ's lexical grammar; everything else
+    — unicode, spaces, hyphens, digits, underscores — flows through cleanly.
+
+    Replaces the old regex-based ``[A-Za-z_][A-Za-z0-9_]*`` validation that
+    was over-restrictive (rejected unicode column names like ``列``).
+    """
+    if not isinstance(name, str):
+        raise ValueError(
+            f"BQ identifier must be a string, got {type(name).__name__}"
+        )
+    if not name:
+        raise ValueError("BQ identifier must be non-empty")
+    if "`" in name:
+        raise ValueError(
+            f"BQ identifier {name!r} contains a backtick, the one character "
+            "BQ's grammar disallows inside backtick-quoted identifiers"
+        )
+    return _sqlglot_exp.column(name, quoted=True)
+
+
+def _namespace_prefix_to_sql(
+    namespace_prefix: tuple[str, ...],
+) -> _sqlglot_exp.Expression | None:
+    """Build a sqlglot ``Expression`` matching items whose stored ``namespace``
+    column starts with ``namespace_prefix``.
+
+    Uses ``ns_join`` to serialize the prefix the same way ``aput`` serializes
+    stored namespaces — single source of truth. Combines an exact-equals
+    branch with ``STARTS_WITH`` so the root of the subtree (e.g. ``"a.b"``
+    when prefix is ``("a", "b")``) is included alongside descendants.
+
+    Returns ``None`` for empty prefix (matches everything).
+
+    The Expression is rendered by ``_combine_sql_clauses`` (single rendering
+    site) — sqlglot's BQ dialect handles all string-literal escaping
+    (backslash form, per BQ's lexical grammar) and identifier quoting
+    (backtick form) automatically. No manual escape, no regex, no string
+    concatenation.
+    """
+    if not namespace_prefix:
+        return None
+    prefix_str = ns_join(namespace_prefix)
+    col = _column_expression("namespace")
+    eq = _sqlglot_exp.EQ(
+        this=col, expression=_sqlglot_exp.Literal.string(prefix_str)
+    )
+    sw = _sqlglot_exp.func(
+        "STARTS_WITH",
+        col,
+        _sqlglot_exp.Literal.string(prefix_str + "."),
+    )
+    return _sqlglot_exp.Paren(
+        this=_sqlglot_exp.Or(this=eq, expression=sw)
+    )
+
+
+def _filter_dict_to_sql(
+    filter: dict[str, Any],
+) -> _sqlglot_exp.Expression | None:
+    """Build a sqlglot ``Expression`` from a LangMem-style filter dict.
+
+    Supported per the LangMem reference (``langmem/graph_rag.py`` examples
+    and ``InMemoryStore._compare_values``):
+
+      * bare value     ``{"k": "v"}``                → ``k = 'v'``
+      * ``$eq``        ``{"k": {"$eq": "v"}}``        → ``k = 'v'``
+      * ``$ne``        ``{"k": {"$ne": "v"}}``        → ``k != 'v'``
+      * ``$in``        ``{"k": {"$in": [a, b, c]}}``  → ``k IN ('a','b','c')``
+      * ``$prefix``    ``{"k": {"$prefix": "p"}}``    → ``STARTS_WITH(k, 'p')``
+
+    Multiple keys combine with AND. Empty ``$in`` list yields the FALSE
+    literal (matches LangMem reference semantics: empty set in ⇒ no rows).
+    Unknown operators raise ``ValueError`` to surface typos at first call
+    rather than silently dropping filter intent.
+
+    All identifier quoting and string-literal escaping is delegated to
+    sqlglot's BQ-dialect rendering (called by ``_combine_sql_clauses``).
+    Identifiers can be unicode (``列``), contain spaces (``KPI IMPACT
+    METRICS``), or hyphens (``viebeg-data-vault``) — anything BQ's grammar
+    accepts inside backtick quotes.
+
+    Returns ``None`` for empty filter.
+    """
+    if not filter:
+        return None
+    clauses: list[_sqlglot_exp.Expression] = []
+    for key, val in filter.items():
+        col = _column_expression(key)  # raises on backtick / non-string / empty
+        if isinstance(val, dict):
+            for op, op_val in val.items():
+                clauses.append(_filter_op_expression(col, op, op_val, key))
+        else:
+            clauses.append(
+                _sqlglot_exp.EQ(
+                    this=col, expression=_sqlglot_exp.Literal.string(str(val))
+                )
+            )
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return _sqlglot_exp.and_(*clauses)
+
+
+def _filter_op_expression(
+    col: _sqlglot_exp.Column,
+    op: str,
+    op_val: Any,
+    key: str,
+) -> _sqlglot_exp.Expression:
+    """Build the sqlglot Expression for one (col, op, op_val) triple."""
+    if op == "$eq":
+        return _sqlglot_exp.EQ(
+            this=col, expression=_sqlglot_exp.Literal.string(str(op_val))
+        )
+    if op == "$ne":
+        return _sqlglot_exp.NEQ(
+            this=col, expression=_sqlglot_exp.Literal.string(str(op_val))
+        )
+    if op == "$in":
+        if not isinstance(op_val, (list, tuple)):
+            raise ValueError(
+                f"filter $in expects list, got {type(op_val).__name__}"
+            )
+        if not op_val:
+            return _sqlglot_exp.false()
+        items = [_sqlglot_exp.Literal.string(str(v)) for v in op_val]
+        return _sqlglot_exp.In(this=col, expressions=items)
+    if op == "$prefix":
+        if not isinstance(op_val, str):
+            raise ValueError(
+                f"filter $prefix expects string, got {type(op_val).__name__}"
+            )
+        return _sqlglot_exp.func(
+            "STARTS_WITH", col, _sqlglot_exp.Literal.string(op_val)
+        )
+    raise ValueError(
+        f"unsupported filter operator {op!r} for key {key!r}; "
+        "supported: $eq $ne $in $prefix"
+    )
+
+
+def _combine_sql_clauses(
+    *clauses: _sqlglot_exp.Expression | None,
+) -> str:
+    """AND-combine sqlglot ``Expression`` objects and render to BQ SQL.
+
+    Returns ``'TRUE'`` when all clauses are ``None`` —
+    ``BigQueryVectorStore._create_filters`` interpolates the result into
+    ``WHERE {id_expr} AND {where_filter_expr}``, so an empty filter must
+    evaluate to ``TRUE`` to leave the upstream conjunct intact.
+
+    Single rendering site: sqlglot's BQ dialect emits backslash-escaped
+    string literals and backtick-quoted identifiers per BQ's lexical
+    grammar. Verified empirically (``test_real_bq_*`` coverage).
+    """
+    valid = [c for c in clauses if c is not None]
+    if not valid:
+        return "TRUE"
+    if len(valid) == 1:
+        return valid[0].sql(dialect="bigquery")
+    return _sqlglot_exp.and_(*valid).sql(dialect="bigquery")
+
+
 class BigQueryMemoryStore(AsyncBatchedBaseStore):
     """
     This gives persistence of memory directly into Bigquery.
@@ -1091,7 +1287,20 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         logger.debug("[aput] Raw content retrieved: %s", raw_content)
 
         if raw_content is None:
-            logger.error("Content for %s is None. This is not expected.", self.content_field)
+            # Diagnostic: when content is None, capture enough context to
+            # identify which caller produced the malformed value. Truncated
+            # repr keeps the log readable even for large state objects.
+            value_keys = sorted(value.keys()) if isinstance(value, dict) else None
+            namespace_str = ".".join(namespace) if namespace else None
+            logger.error(
+                "Content for %s is None. This is not expected. "
+                "namespace=%s doc_id=%s value_keys=%s value_repr=%s",
+                self.content_field,
+                namespace_str,
+                key,
+                value_keys,
+                repr(value)[:500],
+            )
             return
 
         actual_content = raw_content
@@ -1140,12 +1349,143 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
 
         doc = Document(page_content=embedding_content, metadata=data, id=key)
 
-        # IMPORTANT: offload the blocking BigQuery call to a worker thread
+        # IMPORTANT: offload the blocking BigQuery call to a worker thread.
+        # ``BigQueryVectorStore.add_documents`` is APPEND-only — it doesn't
+        # replace existing rows with the same doc_id. Per the BaseStore
+        # contract, ``put(namespace, key, value)`` must REPLACE (so callers
+        # using LangMem's ``action="update"`` see a single row, not a
+        # duplicate). Delete by id first, then insert. The delete is best-
+        # effort: NotFound and similar exceptions are expected on the
+        # create path (no prior row to delete) and ignored.
         loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                self.vectorstore.delete,
+                [key],
+            )
+        except Exception as exc:
+            logger.debug(
+                "[aput] pre-insert delete for doc_id=%s failed (likely no existing "
+                "row): %s",
+                key, exc,
+            )
         await loop.run_in_executor(
             None,
             self.vectorstore.add_documents,
             [doc],
+        )
+
+    def _build_row_for_batch(
+        self,
+        namespace: Tuple[str, ...],
+        key: str,
+        value: dict,
+    ) -> Optional[Tuple[dict, str]]:
+        """Build a row dict + embedding text for one item, mirroring ``aput``'s
+        per-item logic without the BQ writes. Returns ``None`` when the value
+        is malformed (already logged via the same diagnostic as aput).
+
+        The returned row dict includes everything except the embedding —
+        ``aput_batch`` adds that after a single batched embed call.
+        """
+        _validate_namespace(namespace)
+        data: dict = {"namespace": ".".join(namespace), "doc_id": key}
+
+        raw_content = value.get("content")
+        if raw_content is None:
+            value_keys = sorted(value.keys()) if isinstance(value, dict) else None
+            logger.error(
+                "Content for %s is None. This is not expected. "
+                "namespace=%s doc_id=%s value_keys=%s value_repr=%s",
+                self.content_field,
+                ".".join(namespace) if namespace else None,
+                key,
+                value_keys,
+                repr(value)[:500],
+            )
+            return None
+
+        actual_content = raw_content
+
+        # Episodic-specific: extract or generate timestamp.
+        if self.content_field == "episode":
+            if isinstance(raw_content, dict) and "episode" in raw_content:
+                actual_content = raw_content["episode"]
+                if "timestamp" in raw_content:
+                    ts = raw_content["timestamp"]
+                    if isinstance(ts, datetime):
+                        data["timestamp"] = ts.isoformat()
+                    elif isinstance(ts, str):
+                        data["timestamp"] = ts
+            if "timestamp" not in data and "timestamp" in value:
+                ts = value["timestamp"]
+                if isinstance(ts, datetime):
+                    data["timestamp"] = ts.isoformat()
+                elif isinstance(ts, str):
+                    data["timestamp"] = ts
+            if "timestamp" not in data:
+                data["timestamp"] = datetime.now(timezone.utc).isoformat()
+
+        text = self._normalize_structured_field(actual_content)
+        embedding_text = json.dumps(text)
+        data[self.content_field] = text
+        return data, embedding_text
+
+    async def aput_batch(
+        self,
+        items: List[Tuple[Tuple[str, ...], str, dict]],
+    ) -> None:
+        """Batched upsert for ``aput`` operations. Replaces the per-row
+        DELETE+INSERT pattern (1 DML per row) with a single LOAD-staging +
+        MERGE (1 DML for any batch size).
+
+        Each ``items`` entry is ``(namespace, key, value)`` — same shape as
+        ``aput``'s arguments. Items with malformed values are skipped (logged
+        via the same diagnostic as ``aput``); the remaining items are written
+        in one batched MERGE.
+
+        Duplicate keys within the batch are deduplicated last-wins, mirroring
+        ``aput``'s REPLACE semantics; this also avoids BigQuery's MERGE
+        "multiple source rows match a single target row" error.
+        """
+        if not items:
+            return
+
+        # Build rows + embedding texts; drop malformed items.
+        rows_with_texts: List[Tuple[dict, str]] = []
+        for namespace, key, value in items:
+            built = self._build_row_for_batch(namespace, key, value)
+            if built is not None:
+                rows_with_texts.append(built)
+
+        if not rows_with_texts:
+            return
+
+        # Last-wins dedup on doc_id within this batch.
+        deduped: dict[str, Tuple[dict, str]] = {}
+        for data, text in rows_with_texts:
+            deduped[data["doc_id"]] = (data, text)
+        ordered = list(deduped.values())
+
+        rows = [d for d, _ in ordered]
+        texts = [t for _, t in ordered]
+
+        # One batched embed call → list of embedding vectors aligned with rows.
+        embeddings = self.vectorstore.embedding.embed_documents(texts)
+        for row, emb in zip(rows, embeddings):
+            row[self.vectorstore.embedding_field] = emb
+
+        # Single LOAD-staging + MERGE — one DML regardless of batch size.
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: merge_upsert_json_rows(
+                self.vectorstore._bq_client,
+                self.vectorstore.full_table_id,
+                rows,
+                merge_keys=[self.vectorstore.doc_id_field],
+            ),
         )
 
     async def aget(
@@ -1167,7 +1507,21 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             return None
         doc = docs[0]
         metadata = doc.metadata
-        ns = tuple(metadata.get("namespace", "").split("."))
+
+        # Per BaseStore.aget contract, the (namespace, key) pair identifies one
+        # item: returning a doc whose stored namespace doesn't match the caller's
+        # namespace would violate the contract and could leak across scopes.
+        # Reuse ``ns_join`` so the comparison is symmetric with ``aput``'s write.
+        stored_ns_str = metadata.get("namespace", "")
+        expected_ns_str = ns_join(namespace)
+        if stored_ns_str != expected_ns_str:
+            logger.debug(
+                "[aget] doc_id=%s found but namespace mismatch (stored=%r, expected=%r)",
+                key, stored_ns_str, expected_ns_str,
+            )
+            return None
+        ns = tuple(stored_ns_str.split(".")) if stored_ns_str else ()
+
         content_val = doc.page_content
         if isinstance(content_val, str) and self.content_model:
             try:
@@ -1230,12 +1584,20 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         refresh_ttl: bool | None = None,   # accepted; not used here
     ) -> list[SearchItem]:
         logger.info(
-            "[asearch] ns_prefix=%s, query=%r, limit=%d, offset=%d",
-            namespace_prefix, query, limit, offset
+            "[asearch] ns_prefix=%s, query=%r, filter=%r, limit=%d, offset=%d",
+            namespace_prefix, query, filter, limit, offset
         )
 
-        if not query:
-            return []
+        # ── Build the combined SQL WHERE clause ────────────────────────────
+        # Per BaseStore.asearch contract, namespace_prefix scopes the search
+        # to items whose stored namespace tuple starts with that prefix.
+        # ``BigQueryVectorStore._create_filters`` accepts ``filter`` either as
+        # a dict (column = value equality only) OR a literal SQL string. We
+        # take the latter path so we can express prefix matching + Mongo-style
+        # operators in one combined clause.
+        ns_clause = _namespace_prefix_to_sql(namespace_prefix)
+        user_clause = _filter_dict_to_sql(filter) if filter else None
+        combined_sql = _combine_sql_clauses(ns_clause, user_clause)
 
         # If caller gave a dict (or you have a content_model), preserve its shape
         if isinstance(query, dict) or self.content_model:
@@ -1249,11 +1611,28 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
                 query = str(query)
 
         loop = asyncio.get_running_loop()
-        # Offload vectorstore similarity search to avoid blocking
+
+        # ── Filter-only path (query=None) ──────────────────────────────────
+        # Per BaseStore.asearch contract, ``query=None`` is a valid filter-only
+        # search. ``similarity_search_with_score`` requires a query string, so
+        # we bypass it and run a direct SELECT against the vectorstore's table.
+        if not query:
+            return await loop.run_in_executor(
+                None,
+                self._search_filter_only,
+                combined_sql,
+                limit,
+                offset,
+            )
+
+        # ── Standard similarity-search path ────────────────────────────────
+        # Pass combined_sql as the ``filter`` arg — ``BigQueryVectorStore``'s
+        # ``_create_filters`` treats non-dict filter values as a literal SQL
+        # WHERE clause, which is exactly what we want.
         hits = await loop.run_in_executor(
             None,
             lambda: self.vectorstore.similarity_search_with_score(
-                query=query, filter=filter, k=limit + offset
+                query=query, filter=combined_sql, k=limit + offset
             ),
         )
         hits = hits[offset:]
@@ -1297,6 +1676,70 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
                     updated_at=updated_at,
                 )
             )
+        return out
+
+    def _search_filter_only(
+        self, where_sql: str, limit: int, offset: int
+    ) -> list[SearchItem]:
+        """Filter-only search path for ``asearch(query=None)``.
+
+        Bypasses ``similarity_search_with_score`` (which requires a query
+        string) and runs a direct SELECT against the underlying BQ table.
+        Reuses the same ``namespace`` STRING column the embedding path reads,
+        and the same ``content_field`` / ``doc_id_field`` the vectorstore knows.
+
+        Returns ``SearchItem`` objects with ``score=0.0`` since there's no
+        similarity ranking in filter-only mode (callers can sort by other
+        metadata if they want order).
+        """
+        bq_client = self.vectorstore._bq_client
+        full_table = self.vectorstore.full_table_id
+        embedding_field = self.vectorstore.embedding_field
+        doc_id_field = self.vectorstore.doc_id_field
+        sql = (
+            f"SELECT * EXCEPT ({embedding_field}) "
+            f"FROM `{full_table}` "
+            f"WHERE {where_sql} "
+            f"LIMIT {int(limit)} OFFSET {int(offset)}"
+        )
+        logger.debug("[asearch:filter-only] sql=%s", sql)
+        job = bq_client.query(sql)
+        out: list[SearchItem] = []
+        for row in job:
+            row_dict = dict(row.items())
+            ns = tuple((row_dict.get("namespace") or "").split(".")) \
+                if row_dict.get("namespace") else ()
+            key = row_dict.get(doc_id_field) or ""
+            raw_content = row_dict.get(self.content_field)
+            try:
+                content = (
+                    json.loads(raw_content)
+                    if isinstance(raw_content, str)
+                    else raw_content
+                )
+            except Exception:
+                content = raw_content
+            md = dict(row_dict)
+            md[self.content_field] = content
+
+            def _to_dt(x):
+                if isinstance(x, datetime):
+                    return x
+                if isinstance(x, str):
+                    try:
+                        return datetime.fromisoformat(x)
+                    except Exception:
+                        pass
+                return datetime.now(timezone.utc)
+
+            out.append(SearchItem(
+                namespace=ns,
+                key=key,
+                value=md,
+                score=0.0,  # no similarity ranking in filter-only mode
+                created_at=_to_dt(md.get("created_at")),
+                updated_at=_to_dt(md.get("updated_at")),
+            ))
         return out
 
     def search(
@@ -1558,11 +2001,26 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
     async def abatch(self, ops: Iterable[Op]) -> List[Result]:
         ops_list = list(ops)
         logger.info("[abatch] Executing %s batch operations", len(ops_list))
+
+        # Collect PutOp positions so we can dispatch them as one merged
+        # write when there are 2+ — collapses N DMLs into 1.
+        put_indices = [i for i, op in enumerate(ops_list) if isinstance(op, PutOp)]
+        if len(put_indices) >= 2:
+            put_items = [
+                (ops_list[i].namespace, ops_list[i].key, ops_list[i].value)
+                for i in put_indices
+            ]
+            await self.aput_batch(put_items)
+
         results: List[Result] = []
-        for op in ops_list:
+        for idx, op in enumerate(ops_list):
             if isinstance(op, PutOp):
-                await self.aput(op.namespace, op.key, op.value, index=op.index, ttl=op.ttl)
-                results.append(None)
+                if len(put_indices) >= 2:
+                    # Already handled by the batched aput_batch call above.
+                    results.append(None)
+                else:
+                    await self.aput(op.namespace, op.key, op.value, index=op.index, ttl=op.ttl)
+                    results.append(None)
             elif isinstance(op, GetOp):
                 item = await self.aget(op.namespace, op.key, refresh_ttl=op.refresh_ttl)
                 results.append(item)
@@ -1699,19 +2157,27 @@ async def get_memory_tools(
     )
     # 2. For each namespace_template, build both a manage‐tool and a search‐tool
     for base_key, ns_template in namespace_templates.items():
-        # Determine which store to hook up:
-        if base_key == "semantic":
+        # Determine which physical store to hook up. ``base_key`` may be the
+        # bare memory-type name (``semantic`` / ``episodic`` / ``procedural``)
+        # or a Phase-3 level-specific extension (``semantic_dataset``,
+        # ``semantic_table``, ``semantic_column``, ``semantic_fact``,
+        # ``semantic_edge``). All ``semantic_*`` keys share the same physical
+        # ``semantic_memory`` BQ table — they differ only in the namespace
+        # shape used at write/search time, allowing per-level scoping via
+        # ``BigQueryMemoryStore.asearch``'s namespace_prefix matching (B0).
+        if base_key == "semantic" or base_key.startswith("semantic_"):
             store = semantic_memory_store
             schema_model = Fact
-        elif base_key == "episodic":
+        elif base_key == "episodic" or base_key.startswith("episodic_"):
             store = episodic_memory_store
             schema_model = PYDANTIC_MODELS[CONTENT_FIELDS[EPISODIC_TABLE]]
-        elif base_key == "procedural":
+        elif base_key == "procedural" or base_key.startswith("procedural_"):
             store = procedural_memory_store
             schema_model = PYDANTIC_MODELS[CONTENT_FIELDS[PROCEDURAL_TABLE]]
         else:
-            # If you have some other base_key (e.g. "www", "dbt_model"), choose
-            # to either re‐use semantic_store or create your own. For now:
+            # Unknown base_key — fall back to semantic_store with Fact schema
+            # (preserves pre-Phase-3 behavior for any caller registering
+            # extension keys we haven't anticipated).
             store = semantic_memory_store
             schema_model = Fact
 

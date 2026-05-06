@@ -224,3 +224,11 @@ print("   ✅ Pydantic deprecation warnings suppressed")
 print("   ✅ Async task warnings suppressed (cosmetic)")
 print("   ✅ TypedDict compatibility ensured")
 print("   ✅ System is functionally perfect")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LANGMEM ORPHAN-TOOL_CALLS PATCH
+# Mirrors langchain-ai/langmem PR #141 (open, not merged). Repairs missing
+# ToolMessage pairings in summarization slices. Delete the import below once
+# we upgrade to a langmem version that includes the fix.
+# ═══════════════════════════════════════════════════════════════════════════
+import src.langgraph_slack.langmem_patch  # noqa: F401, E402

@@ -69,8 +69,18 @@ ALLOW_ORIGIN_REGEX = os.getenv(
     r"^https://[a-z0-9-]+\.trycloudflare\.com$",
 )
 
-USER_NAME_CACHE: dict[str, str] = {}
 TASK_QUEUE: asyncio.Queue = asyncio.Queue()
+
+# Shared with src/langgraph_slack/server_mit.py via the canonical module.
+# Approach C (May 2026 fix for the VIEBEG bug) lives there; see that
+# module's docstring.
+from src.langgraph_slack.contextual_message import (  # noqa: E402
+    MENTION_REGEX,
+    USER_NAME_CACHE,
+    build_contextual_message,
+    fetch_user_names,
+    resolve_user_mentions,
+)
 
 # Interrupt/resume: Slack thread_ts → {thread_id, channel_id, bot_token, ...}
 _INTERRUPT_THREAD_MAP: dict[str, dict[str, Any]] = {}
@@ -180,7 +190,7 @@ async def _process_task(task: dict):
             
         if is_mention or _is_dm(event):
             # NEW: Pass bot_token for user name resolution
-            text_with_names = await _build_contextual_message(event, bot_token=bot_token)
+            text_with_names = await build_contextual_message(event, bot_token=bot_token)
         else:
             LOGGER.info("Skipping non-mention message")
             return
@@ -445,7 +455,6 @@ APP_HANDLER = AsyncSlackRequestHandler(AsyncApp(
     token="xoxb-placeholder-for-multi-tenant-router",
     logger=LOGGER
 ))
-MENTION_REGEX = re.compile(r"<@([A-Z0-9]+)>")
 USER_ID_PATTERN = re.compile(rf"<@{config.BOT_USER_ID}>")
 APP_HANDLER.app.event("message")(ack=just_ack, lazy=[handle_message])
 APP_HANDLER.app.event("app_mention")(
@@ -731,151 +740,11 @@ def _is_dm(event: SlackMessageData):
     return False
 
 
-async def _fetch_thread_history(
-    channel_id: str, thread_ts: str, *, bot_token: Optional[str] = None
-) -> list[SlackMessageData]:
-    """
-    Fetch all messages in a Slack thread, following pagination if needed.
-    
-    NEW: Accepts optional bot_token for multi-tenant support.
-    """
-    LOGGER.info(
-        "Fetching thread history for channel=%s, thread_ts=%s (bot_token: %s)", 
-        channel_id,
-        thread_ts,
-        "provided" if bot_token else "global",
-    )
-    
-    # Use provided token or fall back to global client
-    if bot_token:
-        client = AsyncWebClient(token=bot_token)
-    else:
-        client = APP_HANDLER.app.client
-    
-    all_messages = []
-    cursor = None
-
-    while True:
-        try:
-            if cursor:
-                response = await client.conversations_replies(
-                    channel=channel_id,
-                    ts=thread_ts,
-                    inclusive=True,
-                    limit=150,
-                    cursor=cursor,
-                )
-            else:
-                response = await client.conversations_replies(
-                    channel=channel_id,
-                    ts=thread_ts,
-                    inclusive=True,
-                    limit=150,
-                )
-            all_messages.extend(response["messages"])
-            if not response.get("has_more"):
-                break
-            cursor = response["response_metadata"]["next_cursor"]
-        except Exception as exc:
-            LOGGER.exception(
-                "Error fetching thread messages: %s",
-                exc
-            )
-            break
-
-    return all_messages
-
-
-async def _fetch_user_names(
-    user_ids: set[str], *, bot_token: Optional[str] = None
-) -> dict[str, str]:
-    """
-    Fetch and cache Slack display names for user IDs.
-    
-    NEW: Accepts optional bot_token for multi-tenant support.
-    """
-    # Use provided token or fall back to global client
-    if bot_token:
-        client = AsyncWebClient(token=bot_token)
-    else:
-        client = APP_HANDLER.app.client
-    
-    uncached_ids = [uid for uid in user_ids if uid not in USER_NAME_CACHE]
-    if uncached_ids:
-        tasks = [client.users_info(user=uid) for uid in uncached_ids]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for uid, result in zip(uncached_ids, results):
-            if isinstance(result, Exception):
-                LOGGER.warning(
-                    "Failed to fetch user info for %s: %s",
-                    uid,
-                    result
-                )
-                continue
-            user_obj = result.get("user", {})
-            profile = user_obj.get("profile", {})
-            display_name = (
-                profile.get("display_name") or profile.get("real_name") or uid
-            )
-            USER_NAME_CACHE[uid] = display_name
-    return {uid: USER_NAME_CACHE[uid] for uid in user_ids if uid in USER_NAME_CACHE}
-
-
-async def _build_contextual_message(
-    event: SlackMessageData, *, bot_token: Optional[str] = None
-) -> str:
-    """
-    Build a message with thread context, using display names for all users.
-    
-    NEW: Accepts optional bot_token for multi-tenant support.
-    """
-    thread_ts = event.get("thread_ts") or event["ts"]
-    channel_id = event["channel"]
-
-    # Pass bot_token to helper functions
-    history = await _fetch_thread_history(channel_id, thread_ts, bot_token=bot_token)
-    included = []
-    for msg in reversed(history):
-        if msg.get("bot_id") == config.BOT_USER_ID:
-            break
-        included.append(msg)
-
-    all_user_ids = set()
-    for msg in included:
-        all_user_ids.add(msg.get("user", "unknown"))
-        all_user_ids.update(MENTION_REGEX.findall(msg["text"]))
-
-    all_user_ids.add(event["user"])
-    all_user_ids.update(MENTION_REGEX.findall(event["text"]))
-
-    # Pass bot_token to user name fetcher
-    user_names = await _fetch_user_names(all_user_ids, bot_token=bot_token)
-
-    def format_message(msg: SlackMessageData) -> str:
-        text = msg["text"]
-        user_id = msg.get("user", "unknown")
-
-        def repl(match: re.Match) -> str:
-            uid = match.group(1)
-            return user_names.get(uid, uid)
-
-        replaced_text = MENTION_REGEX.sub(repl, text)
-        speaker_name = user_names.get(user_id, user_id)
-
-        return (
-            f'<slackMessage user="{speaker_name}">' f"{replaced_text}" "</slackMessage>"
-        )
-
-    context_parts = [format_message(msg) for msg in reversed(included)]
-    new_message = context_parts[-1]
-    preceding_context = "\n".join(context_parts[:-1])
-
-    contextual_message = (
-        (("Preceding context:\n" + preceding_context) if preceding_context else "")
-        + "\n\nNew message:\n"
-        + new_message
-    )
-    return contextual_message
+# Note: _fetch_thread_history / _fetch_user_names / _build_contextual_message
+# used to live here. Approach C (May 2026) consolidated them into
+# src/langgraph_slack/contextual_message.py and dropped the thread-history
+# wrapping. The LangGraph checkpointer keeps prior turns in state.messages
+# across messages — see that module's docstring for full context.
 
 
 if __name__ == "__main__":
