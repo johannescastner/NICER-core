@@ -1271,110 +1271,36 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         *,
         ttl: float | None | NotProvided = NOT_PROVIDED,
     ) -> None:
-        # Validate namespace consistently with BaseStore expectations
-        _validate_namespace(namespace)
+        """REPLACE-semantics put — delegates to ``aput_batch`` for atomic
+        MERGE-by-doc_id (LOAD-staging + MERGE in one DML).
 
+        Why delegate rather than do per-row DELETE + INSERT here:
+
+        * ``aput_batch``'s MERGE satisfies ``BaseStore.put``'s REPLACE
+          contract atomically — no DELETE-INSERT race window where
+          concurrent writers see ``Could not serialize access`` (BQ DML
+          serialization conflict on the same row).
+        * Single source of truth: row construction lives in
+          ``_build_row_for_batch``; BQ DML lives in
+          ``merge_upsert_json_rows``. This method is just the
+          single-key entry point of the BaseStore contract.
+        * Halves DML rate-limit pressure even for single writes:
+          1 MERGE vs. 1 DELETE + 1 LOAD.
+
+        See ``aput_batch`` for the implementation; row schemas plus
+        episodic-timestamp handling are centralised in
+        ``_build_row_for_batch``.
+        """
+        # Validate eagerly so misuse fails fast rather than at the BQ
+        # boundary; ``_build_row_for_batch`` re-validates each item, but
+        # the duplicate call is cheap and useful for stack-trace clarity.
+        _validate_namespace(namespace)
         logger.info(
             "[aput] Inserting doc_id=%s into namespace=%s",
             key,
             ".".join(namespace),
         )
-        data = {"namespace": ".".join(namespace), "doc_id": key}
-        logger.debug("[aput] initial data: %s", json.dumps(data, indent=2))
-        logger.debug("[aput] Using content field: %s", self.content_field)
-
-        raw_content = value.get("content")
-        logger.debug("[aput] Raw content retrieved: %s", raw_content)
-
-        if raw_content is None:
-            # Diagnostic: when content is None, capture enough context to
-            # identify which caller produced the malformed value. Truncated
-            # repr keeps the log readable even for large state objects.
-            value_keys = sorted(value.keys()) if isinstance(value, dict) else None
-            namespace_str = ".".join(namespace) if namespace else None
-            logger.error(
-                "Content for %s is None. This is not expected. "
-                "namespace=%s doc_id=%s value_keys=%s value_repr=%s",
-                self.content_field,
-                namespace_str,
-                key,
-                value_keys,
-                repr(value)[:500],
-            )
-            return
-
-        actual_content = raw_content
-
-        # ─── EPISODIC-SPECIFIC HANDLING ───
-        # Only episodic table has a timestamp column (REQUIRED).
-        # Semantic and procedural tables do NOT have timestamp.
-        if self.content_field == "episode":
-            # Handle wrapped structure: {"episode": {...}, "timestamp": ...}
-            # This happens when caller sends: {"episode": Episode(...), "timestamp": datetime}
-            if isinstance(raw_content, dict) and "episode" in raw_content:
-                actual_content = raw_content["episode"]  # Unwrap to get Episode fields only
-                logger.debug("[aput] Unwrapped episode content from nested structure")
-                
-                # Extract timestamp from content level if present
-                if "timestamp" in raw_content:
-                    ts = raw_content["timestamp"]
-                    if isinstance(ts, datetime):
-                        data["timestamp"] = ts.isoformat()
-                    elif isinstance(ts, str):
-                        data["timestamp"] = ts
-                    logger.debug("[aput] Extracted timestamp from raw_content: %s", data.get("timestamp"))
-            
-            # Fallback: check value level (in case timestamp passed at invoke level)
-            if "timestamp" not in data and "timestamp" in value:
-                ts = value["timestamp"]
-                if isinstance(ts, datetime):
-                    data["timestamp"] = ts.isoformat()
-                elif isinstance(ts, str):
-                    data["timestamp"] = ts
-                logger.debug("[aput] Extracted timestamp from value: %s", data.get("timestamp"))
-            
-            # Final fallback: generate timestamp if still missing (field is REQUIRED in schema)
-            if "timestamp" not in data:
-                data["timestamp"] = datetime.now(timezone.utc).isoformat()
-                logger.debug("[aput] Generated fallback timestamp: %s", data["timestamp"])
-        # ─── END EPISODIC-SPECIFIC HANDLING ───
-        # For semantic/procedural: actual_content = raw_content unchanged, no timestamp added
-
-        text = self._normalize_structured_field(actual_content)
-        embedding_content = json.dumps(text)
-        logger.debug("[aput] Normalized content: %s", text)
-        data[self.content_field] = text
-        logger.debug("[aput] Value being inserted: %s", json.dumps(data, indent=2, default=str))
-        logger.debug("[aput] the type(data[self.content_field]): %s", type(data[self.content_field]))
-
-        doc = Document(page_content=embedding_content, metadata=data, id=key)
-
-        # IMPORTANT: offload the blocking BigQuery call to a worker thread.
-        # ``BigQueryVectorStore.add_documents`` is APPEND-only — it doesn't
-        # replace existing rows with the same doc_id. Per the BaseStore
-        # contract, ``put(namespace, key, value)`` must REPLACE (so callers
-        # using LangMem's ``action="update"`` see a single row, not a
-        # duplicate). Delete by id first, then insert. The delete is best-
-        # effort: NotFound and similar exceptions are expected on the
-        # create path (no prior row to delete) and ignored.
-        loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(
-                None,
-                self.vectorstore.delete,
-                [key],
-            )
-        except Exception as exc:
-            logger.debug(
-                "[aput] pre-insert delete for doc_id=%s failed (likely no existing "
-                "row): %s",
-                key, exc,
-            )
-        await loop.run_in_executor(
-            None,
-            self.vectorstore.add_documents,
-            [doc],
-        )
+        await self.aput_batch([(namespace, key, value)])
 
     def _build_row_for_batch(
         self,
@@ -1430,6 +1356,19 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         text = self._normalize_structured_field(actual_content)
         embedding_text = json.dumps(text)
         data[self.content_field] = text
+
+        # ``stored_at`` is part of every memory table's schema (see
+        # ``SCHEMAS`` below). Setting it here means ``merge_upsert_json_rows``
+        # will include it in the MERGE's UPDATE clause, refreshing it on
+        # every put — preserving the semantics that the legacy DELETE +
+        # INSERT path produced via the column's ``CURRENT_TIMESTAMP()``
+        # default. Activity-rate views that aggregate ``DATE(stored_at)``
+        # see fresh-on-update behaviour. (For first-stored / discovery-rate
+        # semantics, add a separate ``updated_at`` column rather than
+        # changing ``stored_at``'s meaning — see master plan's ambient-
+        # agent observability migration task.)
+        data["stored_at"] = datetime.now(timezone.utc).isoformat()
+
         return data, embedding_text
 
     async def aput_batch(
@@ -1999,13 +1938,20 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         )
 
     async def abatch(self, ops: Iterable[Op]) -> List[Result]:
+        """Single dispatch path for write/read ops.
+
+        Every ``PutOp`` — whether 1 or N — flows through ``aput_batch``.
+        That keeps a single source of truth for upsert (LOAD-staging +
+        MERGE-by-doc_id, atomic, no DELETE-INSERT race) regardless of
+        batch size. ``aput_batch`` itself is a no-op on empty input.
+        ``GetOp`` / ``SearchOp`` / ``ListNamespacesOp`` go individually
+        because they don't share a batched primitive.
+        """
         ops_list = list(ops)
         logger.info("[abatch] Executing %s batch operations", len(ops_list))
 
-        # Collect PutOp positions so we can dispatch them as one merged
-        # write when there are 2+ — collapses N DMLs into 1.
         put_indices = [i for i, op in enumerate(ops_list) if isinstance(op, PutOp)]
-        if len(put_indices) >= 2:
+        if put_indices:
             put_items = [
                 (ops_list[i].namespace, ops_list[i].key, ops_list[i].value)
                 for i in put_indices
@@ -2013,14 +1959,10 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             await self.aput_batch(put_items)
 
         results: List[Result] = []
-        for idx, op in enumerate(ops_list):
+        for op in ops_list:
             if isinstance(op, PutOp):
-                if len(put_indices) >= 2:
-                    # Already handled by the batched aput_batch call above.
-                    results.append(None)
-                else:
-                    await self.aput(op.namespace, op.key, op.value, index=op.index, ttl=op.ttl)
-                    results.append(None)
+                # Handled by the single ``aput_batch`` call above.
+                results.append(None)
             elif isinstance(op, GetOp):
                 item = await self.aget(op.namespace, op.key, refresh_ttl=op.refresh_ttl)
                 results.append(item)
