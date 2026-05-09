@@ -309,7 +309,12 @@ MODEL_PROVIDERS = {
         "import_class": "ChatOpenAI",
         "import_module": "langchain_openai",
         "api_key_env": "OPENAI_API_KEY",
-        "base_url": None
+        "base_url": None,
+        # Capability flags. Read by `provider_supports(capability,
+        # provider)` (below). Single source of truth for what each
+        # provider can do — eliminates literal provider-name string
+        # matching scattered through the codebase.
+        "supports_response_format": True,
     },
     "deepseek": {
         "chat": "deepseek-chat",
@@ -318,7 +323,13 @@ MODEL_PROVIDERS = {
         "import_class": "ChatDeepSeek",
         "import_module": "langchain_deepseek",
         "api_key_env": "DEEPSEEK_API_KEY",
-        "base_url": "https://api.deepseek.com/v1"
+        "base_url": "https://api.deepseek.com/v1",
+        # DeepSeek supports response_format={"type":"json_object"} on
+        # its OpenAI-compatible chat completions endpoint. Verified
+        # empirically against api.deepseek.com 2026-05-08.
+        # ChatDeepSeek extends BaseChatOpenAI which unpacks
+        # ``model_kwargs`` into the wire request body.
+        "supports_response_format": True,
     }
 }
 
@@ -445,15 +456,53 @@ def create_llm(
 
 # ───── Convenience Functions ─────
 def get_current_provider_info():
-    """Get information about the current model provider."""
+    """Get information about the current model provider.
+
+    Returns the keys consumed by callers in ``pro/`` and ``src/``:
+    ``provider``, ``model_type``, ``model``, ``full_model``,
+    ``api_key_set``. A previous ``cost_efficiency`` field with a
+    hardcoded ``"14x cheaper" if CURRENT_PROVIDER == "deepseek"
+    else "standard"`` was removed (Bug 22) — it had zero consumers,
+    its claim was stale, and it was the last remaining
+    provider-name string-match in capability-shaped code (Bug G
+    cleaned up the rest in ``tracked_llm``).
+    """
     return {
         "provider": CURRENT_PROVIDER,
         "model_type": CURRENT_MODEL_TYPE,
         "model": PROVIDER_CONFIG[CURRENT_MODEL_TYPE],
         "full_model": DEFAULT_MODEL,
         "api_key_set": bool(environ.get(PROVIDER_CONFIG["api_key_env"])),
-        "cost_efficiency": "14x cheaper" if CURRENT_PROVIDER == "deepseek" else "standard"
     }
+
+
+def provider_supports(capability: str, provider: Optional[str] = None) -> bool:
+    """Check whether a provider declares support for a named capability.
+
+    Capability flags are declared per-provider in ``MODEL_PROVIDERS``
+    (e.g. ``"supports_response_format": True``). This helper is the
+    single source of truth for capability gating — code that needs
+    to branch on provider behaviour should call this rather than
+    matching on provider-name strings, so that adding a new provider
+    is a one-place declarative change.
+
+    Args:
+        capability: Flag name (e.g. ``"response_format"``). The
+            corresponding key in ``MODEL_PROVIDERS`` is
+            ``"supports_<capability>"``.
+        provider: Provider name (case-insensitive). When omitted,
+            uses the currently-active ``CURRENT_PROVIDER``.
+
+    Returns:
+        ``True`` only if the provider entry exists AND declares
+        ``supports_<capability>: True``. Returns ``False`` for unknown
+        providers, unknown capabilities, or providers that explicitly
+        declare ``False``. Defensive by design — callers can assume
+        a missing flag means "not supported".
+    """
+    provider_lc = (provider or CURRENT_PROVIDER or "").lower()
+    config = MODEL_PROVIDERS.get(provider_lc, {})
+    return bool(config.get(f"supports_{capability}", False))
 
 def switch_provider(provider, model_type="chat"):
     """

@@ -32,6 +32,7 @@ Tracking issues:
 """
 from __future__ import annotations
 
+import uuid
 from dataclasses import replace as _dataclass_replace
 from typing import Any
 
@@ -43,6 +44,31 @@ from langmem.short_term import summarization as _ls
 _original_preprocess = _ls._preprocess_messages
 
 
+def _sanitize_message_ids(messages: list) -> list:
+    """Return a NEW list where every message has a non-None ``id``.
+
+    langmem's ``_preprocess_messages`` (line 171) raises
+    ``ValueError("Messages are required to have ID field.")`` when ANY
+    message has ``id is None``. v22's eval surfaced this in a code
+    path the wrapper at ``pro/ensemble/summarization_service.py:560``
+    catches and silently degrades to "summarization skipped" — losing
+    summarization on that turn AND corrupting the DSPy "did we
+    summarize?" metric.
+
+    Mirrors the defensive UUID-assignment pattern from ryoma 0.8.1's
+    ``_format_messages`` fix. Does NOT mutate input messages in place
+    (callers may hold references); returns a new list with new
+    instances for any message that needed an id.
+    """
+    sanitized: list = []
+    for m in messages:
+        if getattr(m, "id", None) is None:
+            sanitized.append(m.model_copy(update={"id": str(uuid.uuid4())}))
+        else:
+            sanitized.append(m)
+    return sanitized
+
+
 def _patched_preprocess_messages(
     messages: list,
     running_summary: Any,
@@ -51,17 +77,28 @@ def _patched_preprocess_messages(
     max_summary_tokens: int,
     token_counter,
 ):
-    """Wraps the original ``_preprocess_messages`` and repairs orphan
-    tool-call pairings in the returned ``messages_to_summarize``.
+    """Wraps the original ``_preprocess_messages`` with two repairs:
 
-    Algorithm (mirrors PR #141):
-      1. Delegate to the original to get the slice + token bookkeeping.
-      2. Build a ``tool_call_id → ToolMessage`` map from the FULL source
-         ``messages`` list (so we can find missing tool results).
-      3. For every ``AIMessage(tool_calls)`` in the slice, append any
+      A. ID sanitization (this patch's v22 extension): assign UUIDs
+         to any id-less message before delegating to the strict
+         original — prevents the ValueError raise + silent
+         degradation surfaced in IntellAgent v22.
+      B. Orphan tool-call pairing (mirrors PR #141): post-process the
+         original's slice to append any matching ``ToolMessage`` from
+         the source conversation that's missing for an
+         ``AIMessage(tool_calls)``.
+
+    Algorithm:
+      1. Sanitize ids on the input ``messages`` list (return new list).
+      2. Delegate to the original to get the slice + token bookkeeping.
+      3. Build a ``tool_call_id → ToolMessage`` map from the FULL
+         (sanitized) source list.
+      4. For every ``AIMessage(tool_calls)`` in the slice, append any
          matching ``ToolMessage`` that isn't already present.
-      4. Update ``n_tokens_to_summarize`` to account for appended messages.
+      5. Update ``n_tokens_to_summarize`` to account for appended msgs.
     """
+    messages = _sanitize_message_ids(messages)
+
     result = _original_preprocess(
         messages=messages,
         running_summary=running_summary,

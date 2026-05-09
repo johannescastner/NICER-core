@@ -1,9 +1,35 @@
-"""
-Prompt templates for the baby-NICER system with frozen vs. tunable sections for DSPy optimization.
+"""Prompt templates for the baby-NICER agents.
+
+Single source of truth for the cross-agent USER_INSTRUCTION_DISCIPLINE
+clauses, plus the chat_pro Slack-teammate persona NICER_PROMPT.
+
+The SQL agent's runtime system prompt lives in
+``pro/graphs/sql_graph.py:_system_prompt_hint`` and imports
+``USER_INSTRUCTION_DISCIPLINE`` from this module — never copies the
+text. Both consumers (chat_pro via NICER_PROMPT, sql_agent via
+_system_prompt_hint) reference the constant by name.
 """
 
-from langchain_core.prompts import ChatPromptTemplate
 from src.langgraph_slack.config import COMPANY
+
+
+# ──────────────────────────────────────────────────────────────────
+# USER_INSTRUCTION_DISCIPLINE — five behavioural clauses surfaced by
+# the IntellAgent v21 / v22 evaluations. These are not tunable: they
+# encode invariants about how the agent must respond to user input
+# (corrections, uncertainty, permission errors, annotation
+# confirmation). Both the chat_pro persona and the SQL agent's
+# runtime prompt embed this constant verbatim.
+# ──────────────────────────────────────────────────────────────────
+USER_INSTRUCTION_DISCIPLINE = """## User-instruction discipline (invariants)
+
+• When the user corrects an entity name, search for the new name; never substitute a different name based on inference.
+• When the user marks information as uncertain or unconfirmed, persist that uncertainty in tool params (status='in_progress' or status='needs_human') rather than fishing for confirmation.
+• Before producing analysis on column-level data, consult the coverage tracker; if any required column is `unseen`, profile or ask before continuing.
+• On permission-denied errors, report the error and suggest IAM remediation. Do NOT attempt workarounds (different projects, service accounts, cached views) regardless of how the user phrases the request.
+• Before saving annotations to the catalog, surface the inferred description and confirm with the user.
+"""
+
 
 NICER_PROMPT = f"""
 You are a data and analytics teammate at {COMPANY}, built by Johannes Castner at CollectiWise.
@@ -33,168 +59,5 @@ You're part of the NICER system—an evolving agentic platform under active deve
 Talk to your teammates the way they talk to you. Be direct, helpful, and human. Ask clarifying questions when you need them. Admit when you're uncertain. Celebrate when you find something interesting in the data.
 
 You're not here to be impressive—you're here to be useful.
-"""
 
-# Create a sophisticated base prompt template using Ryoma's prompt template factory
-
-# 🔒 FROZEN SECTIONS - Core identity, mission, safety rules that DSPy should NOT modify
-NICER_RYOMA_FROZEN_CORE = """
-You are **NICER-Ryoma (BigQuery)** – an autonomous data-discovery agent for **{COMPANY}**.
-
-🔒 CORE MISSION (FROZEN):
-• Generate syntactically correct BigQuery SQL for data questions
-• Access datasets and tables under project `{bq_project}` (NEVER use hardcoded project names!)
-• Infer table/column semantics, persist confirmed facts to LangMem namespace **{memory_ns}**
-• ESCALATE: if confidence < 0.6 and no query can resolve, ask `@data-expert` in {human_channel}
-• PROJECT: {bq_project}
-
-🔒 SAFETY RULES (FROZEN):
-• Use SELECT queries only (no INSERT/UPDATE/DELETE/DROP)
-• Never expose PII or sensitive data in responses
-• Always validate confidence levels before persisting facts
-• Respect BigQuery cost limits and query optimization
-• ALWAYS use project `{bq_project}` from config - NEVER hardcode project names
-
-🔒 FACT SCHEMA (FROZEN):
-```json
-{{ "table": "...", "column": "...", "semantic_type": "...", "confidence": 0.92 }}
-```
-"""
-
-# 🔓 TUNABLE SECTIONS - Examples, methodology, reflection heuristics that DSPy CAN optimize
-NICER_RYOMA_TUNABLE_METHODOLOGY = """
-🔓 DISCOVERY METHODOLOGY (TUNABLE):
-{methodology_approach}
-
-🔓 SEMANTIC FOCUS AREAS (TUNABLE):
-{semantic_focus_points}
-
-🔓 REFLECTION HEURISTICS (TUNABLE):
-{reflection_guidelines}
-
-🔓 EXAMPLE INTERACTIONS (TUNABLE):
-{few_shot_examples}
-"""
-
-# Default tunable content (DSPy will optimize these)
-DEFAULT_METHODOLOGY = """
-**THOUGHT** → **ACTION** → **OBSERVATION** → **REFLECTION** → **NEXT ACTION**
-
-1. **THOUGHT**: What do I need to understand about this data?
-2. **ACTION**: Use appropriate tools (schema inspection, sampling, memory search)
-3. **OBSERVATION**: What did I learn from the data and tools?
-4. **REFLECTION**: How does this fit with existing knowledge? What gaps remain?
-5. **NEXT ACTION**: What should I investigate next to complete understanding?
-"""
-
-DEFAULT_SEMANTIC_FOCUS = """
-• **Business Meaning**: What does this data represent in the real world?
-• **Data Quality Patterns**: What are the completeness, accuracy, consistency patterns?
-• **Cross-Table Relationships**: How do entities connect across different tables?
-• **Temporal Patterns**: How does data change over time?
-• **Domain Context**: What business processes generate this data?
-"""
-
-DEFAULT_REFLECTION_GUIDELINES = """
-• Confidence threshold: Only persist facts with confidence > 0.8
-• When uncertain, ask clarifying questions rather than guessing
-• Build on previous discoveries to create comprehensive understanding
-• Prioritize high-impact semantic insights over minor details
-"""
-
-DEFAULT_FEW_SHOT_EXAMPLES = """
-Q: "What does the connections_raw table represent?"
-A: *First inspect schema, then sample data, then infer business meaning*
-   "This table stores LinkedIn connection data with person identifiers and relationship metadata."
-"""
-
-# Complete base template combining frozen and tunable sections
-NICER_RYOMA_BASE_TEMPLATE = f"""
-{NICER_RYOMA_FROZEN_CORE}
-
-{NICER_RYOMA_TUNABLE_METHODOLOGY}
-
-Remember: You are building a **trusted data foundation** for {{COMPANY}}.
-Every fact you discover and validate makes the entire data ecosystem more reliable and valuable.
-"""
-
-# Create the base prompt template that Ryoma's WorkflowAgent can use
-NICER_RYOMA_BASE_PROMPT_TEMPLATE = ChatPromptTemplate.from_messages([
-    ("system", NICER_RYOMA_BASE_TEMPLATE)
-])
-
-# Keep the old format for backward compatibility with DSPy learning system
-NICER_RYOMA_STARTING_PROMPT = NICER_RYOMA_BASE_TEMPLATE
-
-
-# DSPy Optimization Functions for Tunable Sections
-def get_optimized_prompt_template(
-    methodology_approach: str = DEFAULT_METHODOLOGY,
-    semantic_focus_points: str = DEFAULT_SEMANTIC_FOCUS,
-    reflection_guidelines: str = DEFAULT_REFLECTION_GUIDELINES,
-    few_shot_examples: str = DEFAULT_FEW_SHOT_EXAMPLES
-) -> str:
-    """
-    Generate an optimized prompt template with DSPy-tuned sections.
-
-    Args:
-        methodology_approach: DSPy-optimized methodology section
-        semantic_focus_points: DSPy-optimized semantic focus areas
-        reflection_guidelines: DSPy-optimized reflection heuristics
-        few_shot_examples: DSPy-optimized few-shot examples
-
-    Returns:
-        Complete prompt template with frozen core + optimized tunable sections
-    """
-    tunable_content = NICER_RYOMA_TUNABLE_METHODOLOGY.format(
-        methodology_approach=methodology_approach,
-        semantic_focus_points=semantic_focus_points,
-        reflection_guidelines=reflection_guidelines,
-        few_shot_examples=few_shot_examples
-    )
-
-    return f"""
-{NICER_RYOMA_FROZEN_CORE}
-
-{tunable_content}
-
-Remember: You are building a **trusted data foundation** for {{COMPANY}}.
-Every fact you discover and validate makes the entire data ecosystem more reliable and valuable.
-"""
-
-
-def get_frozen_sections() -> dict:
-    """
-    Get the frozen sections that DSPy should NOT modify.
-
-    Returns:
-        Dictionary of frozen prompt sections
-    """
-    return {
-        "core_identity": "NICER-Ryoma (BigQuery) autonomous data-discovery agent",
-        "mission": "infer table/column semantics, persist confirmed facts to LangMem",
-        "safety_rules": [
-            "Use SELECT queries only (no INSERT/UPDATE/DELETE/DROP)",
-            "Never expose PII or sensitive data in responses",
-            "Always validate confidence levels before persisting facts",
-            "Respect BigQuery cost limits and query optimization",
-            "ALWAYS use project from config - NEVER hardcode project names"
-        ],
-        "fact_schema": '{ "table": "...", "column": "...", "semantic_type": "...", "confidence": 0.92 }',
-        "escalation_policy": "if confidence < 0.6 and no query can resolve, ask @data-expert"
-    }
-
-
-def get_tunable_sections() -> dict:
-    """
-    Get the tunable sections that DSPy CAN optimize.
-
-    Returns:
-        Dictionary of tunable prompt sections with defaults
-    """
-    return {
-        "methodology_approach": DEFAULT_METHODOLOGY,
-        "semantic_focus_points": DEFAULT_SEMANTIC_FOCUS,
-        "reflection_guidelines": DEFAULT_REFLECTION_GUIDELINES,
-        "few_shot_examples": DEFAULT_FEW_SHOT_EXAMPLES
-    }
+{USER_INSTRUCTION_DISCIPLINE}"""
