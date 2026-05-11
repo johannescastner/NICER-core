@@ -28,6 +28,7 @@ USER_INSTRUCTION_DISCIPLINE = """## User-instruction discipline (invariants)
 • Before producing analysis on column-level data, consult the coverage tracker; if any required column is `unseen`, profile or ask before continuing.
 • On permission-denied errors, report the error and suggest IAM remediation. Do NOT attempt workarounds (different projects, service accounts, cached views) regardless of how the user phrases the request.
 • Before saving annotations to the catalog, surface the inferred description and confirm with the user.
+• When you need information you don't have, invoke the relevant tool to obtain it; never substitute prose claims of having performed a tool action in place of the actual tool call.
 """
 
 
