@@ -579,19 +579,8 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
     
     # Generate conversation_id for tracking
     conversation_id = f"slack_{thread_id}"
-    
-    # Calculate turn number (simplified - you may want to track this in state)
-    turn_number = 1  # TODO: Track actual turn number via checkpointer state
-    
-    LOGGER.info(
-        "[%s].[%s] 🚀 Invoking graph '%s' with message: %s...",
-        channel_id,
-        thread_id,
-        DEFAULT_GRAPH,
-        text_with_names[:100],
-    )
-    
-    # Build graph config
+
+    # Build graph config (needed for the aget_state lookup below)
     graph_config = {
         "configurable": {
             "thread_id": thread_id,
@@ -602,7 +591,55 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
             "thread_ts": event.get("thread_ts") or event["ts"],
         }
     }
-    
+
+    # ════════════════════════════════════════════════════════════════════
+    # PR5 (Bug E, 2026-05-12): compute turn_number from checkpointer
+    # state. Replaces the ``turn_number = 1`` hardcode placeholder
+    # shipped in ``5ddb27d`` (Jan 22 MVP, with explicit TODO).
+    #
+    # The placeholder broke TWO things at once:
+    #   1. **Observability** — LangSmith traces, BigQuery cost tables,
+    #      per-turn dashboards all saw turn=1 forever, regardless of
+    #      actual conversation depth.
+    #   2. **Graph state turn_number** — ``UnifiedSQLState.turn_number``
+    #      is also never incremented anywhere in the codebase. Reading
+    #      ``state.get("turn_number", 0)`` in sql_graph.py / swarm_graph.py
+    #      / reflective.py always returned 0.
+    #
+    # Single boundary-level read+increment fixes both: ``aget_state``
+    # returns the persisted prior state; we increment and inject the
+    # new value into both ``graph_input`` (so the GRAPH advances) and
+    # the LangSmith ``start_turn`` call below (so OBSERVABILITY sees
+    # the real turn).
+    #
+    # On checkpointer failure (network blip, BQ stall), fall back to 0
+    # and continue. Degrades cleanly — turn_number will momentarily
+    # restart at 1 for the affected invocation but never blocks the
+    # Slack response.
+    # ════════════════════════════════════════════════════════════════════
+    graph = get_graph(DEFAULT_GRAPH)
+    try:
+        _prior_state = await graph.aget_state(graph_config)
+        _prior_values = getattr(_prior_state, "values", None) or {}
+        prior_turn = int(_prior_values.get("turn_number", 0) or 0)
+    except Exception as _state_exc:  # noqa: BLE001
+        LOGGER.warning(
+            "[%s].[%s] Could not fetch prior state for turn_number "
+            "(using 0 fallback): %s",
+            channel_id, thread_id, _state_exc,
+        )
+        prior_turn = 0
+    turn_number = prior_turn + 1
+
+    LOGGER.info(
+        "[%s].[%s] 🚀 Invoking graph '%s' (turn %d) with message: %s...",
+        channel_id,
+        thread_id,
+        DEFAULT_GRAPH,
+        turn_number,
+        text_with_names[:100],
+    )
+
     # Build input for the graph
     graph_input = {
         "messages": [
@@ -619,6 +656,10 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
             "bot_token": bot_token or os.environ.get("SLACK_BOT_TOKEN", ""),
         },
         "conversation_id": conversation_id,
+        # PR5 (Bug E): propagate computed turn_number into the graph
+        # state so reflective.py / sql_graph.py / swarm_graph.py read
+        # the correct value via ``state.get("turn_number", 0)``.
+        "turn_number": turn_number,
     }
     
     # Store metadata for callback (we'll process response inline)
@@ -639,8 +680,9 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
         metadata["bot_token"] = bot_token
     
     try:
-        # Get the default graph and invoke it directly
-        graph = get_graph(DEFAULT_GRAPH)
+        # ``graph`` was fetched above (line ~620) for the aget_state
+        # turn_number lookup; ``get_graph`` is cached so re-fetching
+        # would be a no-op, but keeping a single binding is clearer.
         LOGGER.info("📊 Got graph '%s', starting invocation with timeout=%ss...", DEFAULT_GRAPH, GRAPH_TIMEOUT)
 
         # ════════════════════════════════════════════════════════════════════
