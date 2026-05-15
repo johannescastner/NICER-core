@@ -29,6 +29,26 @@ Tracking issues:
   * https://github.com/langchain-ai/langmem/pull/141 (the fix)
   * https://github.com/langchain-ai/langmem/issues/126 (parallel tool calls)
   * https://github.com/langchain-ai/langmem/issues/112 (truncation breaks pairing)
+
+VERSION-DRIFT GUARD (PR-A0-3g, Latent-A):
+The patch targets the private symbol ``_preprocess_messages``. If langmem
+is upgraded past 0.0.30 in a way that renames or removes that symbol —
+or if a venv has the wrong version installed (e.g., 0.0.17, 13 minor
+versions behind the ``langmem>=0.0.30,<0.1.0`` pin in pyproject.toml) —
+the bare attribute access at line 44 would crash at IMPORT time with a
+cryptic ``AttributeError`` deep inside ``patch_typing.py``'s import chain.
+
+The defensive guard below uses ``getattr`` (a structural attribute-presence
+check, NOT regex / string-version-matching) and raises an explicit
+``ImportError`` that names: (a) the upstream PR this patch mirrors,
+(b) the pin version, (c) the diagnostic action. Per the lessons-learned
+"Bugs Should Scream" principle: fail loudly at startup with actionable
+context, not silently mid-execution.
+
+Verified at PR-A0-3g time:
+  * .venv/lib (0.0.30): _preprocess_messages EXISTS — patch applies cleanly
+  * env/lib   (0.0.17): _preprocess_messages MISSING — guard fires
+  * Production deploys use the pinned 0.0.30 — patch always applies in prod
 """
 from __future__ import annotations
 
@@ -41,7 +61,32 @@ from langmem.short_term import summarization as _ls
 
 
 # Preserve a reference to the original so we can delegate to it.
-_original_preprocess = _ls._preprocess_messages
+# Defensive guard (PR-A0-3g, Latent-A): if installed langmem version
+# lacks this private symbol — typically because a venv drifted off the
+# ``langmem>=0.0.30,<0.1.0`` pin or because upstream eventually renamed
+# or removed the helper after merging PR #141 — fail LOUDLY at import
+# with actionable context rather than crash mid-execution with a cryptic
+# AttributeError. Pure attribute presence check via ``getattr`` (no
+# regex, no string-version matching).
+_original_preprocess = getattr(_ls, "_preprocess_messages", None)
+if _original_preprocess is None:
+    import langmem as _langmem
+    raise ImportError(
+        "src/langgraph_slack/langmem_patch.py: vendored fix for upstream "
+        "langmem PR #141 cannot apply — the private symbol "
+        "``langmem.short_term.summarization._preprocess_messages`` is not "
+        f"present in the installed langmem version "
+        f"{getattr(_langmem, '__version__', '<unknown>')!r}. "
+        "Expected version range per pyproject.toml: ``langmem>=0.0.30,<0.1.0``. "
+        "If upstream PR #141 (https://github.com/langchain-ai/langmem/pull/141) "
+        "has merged into a newer langmem release, DELETE this entire module "
+        "and the import at the bottom of src/langgraph_slack/patch_typing.py. "
+        "If the venv has drifted off the pin, run ``pip install -e .`` or "
+        "the equivalent to restore the pinned version. "
+        "Failing loudly here per the 'Bugs Should Scream' lessons-learned "
+        "discipline — silent fallback would let the patched behaviour "
+        "(orphan tool-call repair) silently regress in production."
+    )
 
 
 def _sanitize_message_ids(messages: list) -> list:

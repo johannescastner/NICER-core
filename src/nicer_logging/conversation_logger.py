@@ -11,6 +11,9 @@ This module is now persistence-agnostic. It focuses on:
 ✅ FAST STARTUP: 5-10s instead of 60-180s
 ✅ LOW MEMORY: 1Gi instead of 4Gi
 """
+import atexit
+import concurrent.futures
+import functools
 import json
 import asyncio
 import logging
@@ -21,6 +24,7 @@ from typing import (
     Dict,
     List,
     Any,
+    NamedTuple,
     Optional,
 )
 from dataclasses import dataclass, asdict, fields
@@ -42,9 +46,42 @@ from pro.ml_inference.client import (
     analyze_tone as _analyze_tone_api,
     generate_embedding as _generate_embedding_api,
 )
+# Reuse the ONE shared embedding cache (keyed (model, text)) that
+# ModalEmbeddings uses for memory asearch/aput — consolidating the two
+# previously-independent embed caches into one. src→src import (allowed);
+# memory.py does not import this module, so no cycle.
+from src.graphs.memory import _embed_cache_get, _embed_cache_put
 
 # Set up logging
 logger = logging.getLogger(__name__)
+
+
+# Bounded executor for conversation-logger telemetry writes (BQ inserts +
+# error logging). Mirrors PR-A0-3a / PR-A0-3e / PR-A0-3f pattern with
+# atexit shutdown(wait=False, cancel_futures=True).
+#
+# Bug #79 root cause: ``asyncio.to_thread`` lands work on the default
+# executor, whose 300s ``shutdown_default_executor`` timeout closes the
+# event loop while callbacks are still queued. Routing through a
+# dedicated executor keeps the default empty.
+#
+# Defined LOCALLY in src/ to preserve the src/→pro/ dependency
+# direction: src/ is the open-source surface, pro/ is proprietary,
+# pro/ may depend on src/ but NEVER the reverse. Sized to match
+# pro/persistence.py::_TELEMETRY_EXECUTOR (max_workers=3) since the
+# write profiles are identical (post-hoc BQ inserts, per-turn,
+# idempotent on re-run).
+_CONVERSATION_LOGGER_EXECUTOR: concurrent.futures.ThreadPoolExecutor = (
+    concurrent.futures.ThreadPoolExecutor(
+        max_workers=3,
+        thread_name_prefix="conversation-logger",
+    )
+)
+atexit.register(
+    _CONVERSATION_LOGGER_EXECUTOR.shutdown,
+    wait=False,
+    cancel_futures=True,
+)
 
 # Tone analysis token cap
 _TONE_MAX_LENGTH_ENV = "CONVERSATION_TONE_MAX_TOKENS"
@@ -90,6 +127,27 @@ def _sanitize_for_json(value: Any) -> Any:
         return repr(value)
 
 
+class EmbeddingAttempt(NamedTuple):
+    """Outcome of a single ``generate_embedding`` call.
+
+    PR-A0-13b (2026-05-14, Bug #77b fix): replaces the prior
+    silent ``return []`` pattern. Explicit two-channel result:
+
+    * ``embedding`` is the vector on success, ``None`` on failure.
+    * ``status`` is ``None`` on success, otherwise the underlying
+      exception class name (``"HTTPStatusError"``,
+      ``"TimeoutException"``, ``"NetworkError"``, ``"RuntimeError"``,
+      etc.) — Modal client's typed exceptions ARE the failure
+      vocabulary; we don't need a separate envelope class.
+
+    Stored in the conversation_turns row's ``embedding_generation_status``
+    column so post-hoc queries can identify rows that need re-embedding
+    AND distinguish failure modes by class name.
+    """
+    embedding: Optional[List[float]]
+    status: Optional[str]
+
+
 @dataclass
 class ConversationTurn:
     """Represents a single turn in a conversation with comprehensive tone analysis."""
@@ -102,6 +160,11 @@ class ConversationTurn:
     message_type: str  # 'question', 'response', 'tool_call', 'error'
     metadata: Dict[str, Any]
     embedding: Optional[List[float]] = None
+    # PR-A0-13b: None on success; exception class name on failure
+    # (e.g. "HTTPStatusError", "TimeoutException"). Lets downstream
+    # cosine-search queries filter ``WHERE embedding_generation_status
+    # IS NULL`` to skip rows where Modal embedding failed.
+    embedding_generation_status: Optional[str] = None
     langsmith_trace_id: Optional[str] = None
     error_details: Optional[Dict[str, Any]] = None
     # Context tracking
@@ -249,19 +312,43 @@ class ConversationLogger:
 
         return tone
 
-    async def generate_embedding(self, text: str) -> List[float]:
+    async def generate_embedding(self, text: str) -> EmbeddingAttempt:
         """
-        Generate semantic embedding for text.
-        
-        Uses Modal-hosted bge-base-en-v1.5 model (768 dimensions).
-        22% better retrieval quality than MiniLM.
+        Generate semantic embedding for text via Modal bge-base-en-v1.5
+        (768 dimensions).
+
+        PR-A0-13b: returns an explicit ``EmbeddingAttempt`` (embedding,
+        status). On success: ``(vector, None)``. On failure: ``(None,
+        type(exc).__name__)``. The prior silent ``return []`` pattern
+        wrote rows with empty embedding arrays that downstream cosine
+        search treated as zero-distance — silent semantic-memory
+        corruption (43 rows in v38's Modal storm window).
+
+        Modal client's typed exceptions ARE the failure vocabulary:
+        ``HTTPStatusError`` (4xx/5xx after retry), ``TimeoutException``,
+        ``NetworkError``, ``RemoteProtocolError``, ``RuntimeError``
+        (Modal retry exhaustion). PR-A0-13a (commit a05fa31) made the
+        Modal client honour ``Retry-After`` up to 180s in both sync
+        and async paths, so this failure should be rare in v39+.
         """
         try:
+            # Shared-cache hit → no Modal call at all (de-dup: a text already
+            # embedded by memory search/write is reused here, and vice versa).
+            cached = _embed_cache_get("bge-base", text)
+            if cached is not None:
+                return EmbeddingAttempt(embedding=cached, status=None)
+            # Miss → circuit-breaker-protected _call_modal path (unchanged),
+            # then populate the shared cache on success only.
             embedding = await _generate_embedding_api(text, model="bge-base")
-            return embedding
+            _embed_cache_put("bge-base", text, embedding)
+            return EmbeddingAttempt(embedding=embedding, status=None)
         except Exception as e:
-            logger.error("Failed to generate embedding: %s", e)
-            return []
+            status = type(e).__name__
+            logger.error(
+                "Failed to generate embedding (status=%s): %s",
+                status, e,
+            )
+            return EmbeddingAttempt(embedding=None, status=status)
 
     async def log_turn(
             self,
@@ -326,8 +413,11 @@ class ConversationLogger:
             agent_name
         )
 
-        # Generate embedding via Modal API (non-blocking HTTP call)
-        embedding = await self.generate_embedding(safe_content)
+        # Generate embedding via Modal API (non-blocking HTTP call).
+        # PR-A0-13b: result is an explicit ``EmbeddingAttempt`` —
+        # on failure, embedding is None (not []) and status carries
+        # the exception class name for the audit trail.
+        embed_result = await self.generate_embedding(safe_content)
 
         # Validate turn_number
         if not isinstance(turn_number, int) or turn_number < 1:
@@ -344,7 +434,8 @@ class ConversationLogger:
             content=safe_content,
             message_type=message_type,
             metadata=meta or {},
-            embedding=embedding,
+            embedding=embed_result.embedding,
+            embedding_generation_status=embed_result.status,
             langsmith_trace_id=langsmith_trace_id,
             error_details=error_details or {},
             memory_token_length=memory_token_length,
@@ -421,13 +512,18 @@ class ConversationLogger:
             run_id = conversation_id
 
         try:
-            await asyncio.to_thread(
-                self.pm.log_cognitive_error,
-                run_id=run_id,
-                module="conversation",
-                error_type=error_type,
-                error_message=error_message,
-                operation_context=error_data,
+            # PR-A0-13c: bounded local executor (Bug #79).
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                _CONVERSATION_LOGGER_EXECUTOR,
+                functools.partial(
+                    self.pm.log_cognitive_error,
+                    run_id=run_id,
+                    module="conversation",
+                    error_type=error_type,
+                    error_message=error_message,
+                    operation_context=error_data,
+                ),
             )
         except (OSError, RuntimeError, ValueError) as exc:
             logger.warning(
@@ -471,11 +567,12 @@ class ConversationLogger:
             if self.project_id and self.dataset_id
             else "conversation_metrics"
         )
-        await asyncio.to_thread(
+        # PR-A0-13c: bounded local executor (Bug #79).
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            _CONVERSATION_LOGGER_EXECUTOR,
             self.pm.insert_rows,
-            table_id,
-            [metric_data],
-            [metric_id],
+            table_id, [metric_data], [metric_id],
         )
 
         logger.debug(
@@ -536,11 +633,12 @@ class ConversationLogger:
             if self.project_id and self.dataset_id
             else "conversations"
         )
-        await asyncio.to_thread(
+        # PR-A0-13c: bounded local executor (Bug #79).
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            _CONVERSATION_LOGGER_EXECUTOR,
             self.pm.insert_rows,
-            table_id,
-            [data],
-            [data["conversation_id"]],
+            table_id, [data], [data["conversation_id"]],
         )
 
     async def _store_turn(
@@ -601,9 +699,10 @@ class ConversationLogger:
             if self.project_id and self.dataset_id
             else "conversation_turns"
         )
-        await asyncio.to_thread(
+        # PR-A0-13c: bounded local executor (Bug #79).
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            _CONVERSATION_LOGGER_EXECUTOR,
             self.pm.insert_rows,
-            table_id,
-            [data],
-            [data["turn_id"]],
+            table_id, [data], [data["turn_id"]],
         )

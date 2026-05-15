@@ -308,6 +308,42 @@ async def _process_task(task: dict):
             result
         )
 
+    elif event_type == "file_upload":
+        # Phase A.0 Stage 3 (PR-A0-4): Slack ``file_shared`` event for
+        # expert YAML assumption uploads. All real work — files_info,
+        # HTTP download, parse, BQ write, Block Kit response — lives in
+        # ``pro.slack_app.file_upload.process_file_upload``. The
+        # hot-path lazy handler ``handle_file_shared_dispatch`` only
+        # dedups by file_id and enqueues here.
+        from pro.slack_app.file_upload import process_file_upload
+        await process_file_upload(event, bot_token)
+
+    elif event_type == "assumptions_command":
+        # Phase A.0 Stage 4 (PR-A0-5): ``/assumptions`` slash command for
+        # inspecting the impact_assumptions BQ store. Subcommands:
+        # ``list``, ``show <scenario_id>``, ``help``. All real work — BQ
+        # queries, Block Kit rendering, response_url POST — lives in
+        # ``pro.slack_app.assumption_commands.process_assumptions_command``.
+        # The hot-path lazy handler parses the subcommand structurally
+        # and enqueues here.
+        from pro.slack_app.assumption_commands import (
+            process_assumptions_command,
+        )
+        await process_assumptions_command(event, bot_token)
+
+    elif event_type == "impact_report_command":
+        # Phase A.0 Stage 5 (PR-A0-6d): ``/make-impact-report
+        # <scenario_id>``. Background processor renders the impact-
+        # report prompt template (the load-bearing artifact at
+        # ``pro/prompts/impact_report.py``) and feeds it to the agent
+        # via ``LANGGRAPH_CLIENT.runs.create`` — same path Slack
+        # messages take. The agent's reply flows back through the
+        # existing webhook / chat path.
+        from pro.slack_app.impact_report_commands import (
+            process_impact_report_command,
+        )
+        await process_impact_report_command(event, bot_token)
+
     elif event_type == "callback":
         LOGGER.info(
             "Processing LangGraph callback: %s",
@@ -460,6 +496,57 @@ APP_HANDLER.app.event("message")(ack=just_ack, lazy=[handle_message])
 APP_HANDLER.app.event("app_mention")(
     ack=just_ack,
     lazy=[],
+)
+
+# Phase A.0 Stage 3 (PR-A0-4): Slack ``file_shared`` event handler for
+# expert YAML assumption uploads. The lazy handler is intentionally tiny
+# (file_id dedup + enqueue); all real work happens in the background
+# task via ``_process_task``'s ``file_upload`` branch.
+#
+# Prerequisite: the bot must have the Slack ``files:read`` scope granted
+# in the workspace app definition (Slack dashboard, not in code). Without
+# it, ``client.files_info`` raises and the user sees an error message.
+from pro.slack_app.file_upload import handle_file_shared_dispatch as _handle_file_shared_dispatch  # noqa: E402
+APP_HANDLER.app.event("file_shared")(
+    ack=just_ack,
+    lazy=[_handle_file_shared_dispatch],
+)
+
+# Phase A.0 Stage 4 (PR-A0-5): ``/assumptions`` slash command for
+# inspecting the impact_assumptions BQ store. The lazy handler is
+# intentionally tiny (subcommand parse + enqueue); all real work
+# (BQ queries, response_url POST) happens in the background task via
+# ``_process_task``'s ``assumptions_command`` branch.
+#
+# Prerequisite: the ``/assumptions`` slash command MUST be registered
+# in the Slack app dashboard (workspace admin task — not in code). The
+# command's request URL points at this app's /events/slack endpoint;
+# Slack delivers slash-command invocations through the same event
+# pipeline as message/file_shared events.
+from pro.slack_app.assumption_commands import handle_assumptions_command_dispatch as _handle_assumptions_command_dispatch  # noqa: E402
+APP_HANDLER.app.command("/assumptions")(
+    ack=just_ack,
+    lazy=[_handle_assumptions_command_dispatch],
+)
+
+# ── /make-impact-report slash command registration (PR-A0-6d) ──────
+# Phase A.0 Stage 5 — the final visible feature on the SPARQL-native
+# foundation. User types ``/make-impact-report <scenario_id>``; the
+# hot-path handler enqueues a ``impact_report_command`` task; the
+# background processor renders the impact-report prompt template and
+# feeds it to the agent via ``LANGGRAPH_CLIENT.runs.create`` (same
+# entry path as Slack messages). The agent's reply flows back through
+# the existing webhook/chat path.
+#
+# Prerequisite: the ``/make-impact-report`` slash command MUST be
+# registered in the Slack app dashboard (workspace admin task — not
+# in code). The command's request URL points at this app's
+# /events/slack endpoint; Slack delivers slash-command invocations
+# through the same event pipeline as other commands.
+from pro.slack_app.impact_report_commands import handle_impact_report_command_dispatch as _handle_impact_report_command_dispatch  # noqa: E402
+APP_HANDLER.app.command("/make-impact-report")(
+    ack=just_ack,
+    lazy=[_handle_impact_report_command_dispatch],
 )
 
 def _log_task_result(task: asyncio.Task) -> None:

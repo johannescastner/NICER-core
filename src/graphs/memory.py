@@ -6,7 +6,9 @@ which connects the langmem longrun memory system to BigQuery.
 from __future__ import annotations
 from functools import lru_cache
 import asyncio
+import atexit
 import concurrent.futures
+import os
 import time
 from collections.abc import Iterable as IterableABC
 import uuid
@@ -69,6 +71,72 @@ from src.langgraph_slack.config import (
 
 NamespaceTemplate = Tuple[str, ...]
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MEMORY STORE EXECUTOR — module-scope, dedicated to BQ vector-store I/O.
+#
+# Bug 6 / Bug 7 high-leverage closure (PR-A0-3f). Bug 6 fires from
+# ``/usr/lib/python3.12/asyncio/base_events.py:607`` inside
+# ``BaseEventLoop.shutdown_default_executor(THREAD_JOIN_TIMEOUT=300)`` —
+# triggered ONLY for ``loop._default_executor`` (the executor used by
+# ``loop.run_in_executor(None, ...)``).
+#
+# v35 traceback context (line 4086 of build_logv35_full.txt) — the 30 lines
+# BEFORE the warning fire show 4× ``[asearch]`` + 4× ``[abatch]`` calls,
+# i.e. memory.py was hammering BQ via the default executor at the moment
+# ``asyncio.run()`` exited a per-scenario boundary. By routing every
+# ``run_in_executor`` call in this file through a dedicated bounded
+# executor, the default executor stays empty for memory I/O and
+# ``shutdown_default_executor`` has nothing to drain — eliminating the
+# 300s join warning and the downstream ``StreamMessagesHandler.
+# on_llm_new_token`` callback flood (Bug 7, 1281 firings in v35).
+#
+# Sizing rationale:
+#   * ``max_workers=6`` matches the empirical peak observed in v34/v35
+#     (6 concurrent ``[asearch]`` ops in a single 5-second window during
+#     scenario fanout).
+#   * Right-sized for actual demand under Cloud Run regional-quota
+#     pressure — generous enough to cover observed fanout, conservative
+#     enough that 6 threads × ~8MB stack = ~48MB doesn't bloat per-instance
+#     memory budget. (Per the user's "unrestrict, not restrict" principle:
+#     covers actual demand without preemptively bounding hypothetical
+#     futures.)
+#   * Mirrors the canonical sizing rationale of
+#     ``_HIERARCHICAL_SUMMARIZER_EXECUTOR(max_workers=8)`` and
+#     ``_SUMMARIZATION_EXECUTOR(max_workers=4)``.
+#
+# Lifecycle:
+#   * Module-scope singleton — created once at import; shared across all
+#     ``BigQueryMemoryStore`` instances and across all 12 executor-using
+#     sites in this file (9 ``run_in_executor(None, ...)`` calls + 3
+#     per-call ``with ThreadPoolExecutor(max_workers=1)`` blocks lifted
+#     in PR-A0-3f).
+#   * ``atexit.register(... wait=False, cancel_futures=True)``: at process
+#     exit, drop pending memory writes rather than blocking on them. Memory
+#     writes are structurally idempotent (atomic MERGE-via-staging path
+#     established in commit ``a2fd219``, 2026-05-07) — re-running an aborted
+#     write reproduces the same row.
+#   * No ``.result()`` timeout on lifted call sites — preserves the
+#     ``e079fd7`` principle ("no arbitrary cutoffs on legitimate
+#     intelligent work"). The previous per-call ``with ... as ex:``
+#     pattern's blocking ``__exit__`` shutdown is what the lift replaces.
+#
+# Mirror of ``pro/agents/reflective.py::_SUMMARIZATION_EXECUTOR`` and
+# ``pro/persistence.py::_TELEMETRY_EXECUTOR`` (added in PR-A0-3e).
+# ═════════════════════════════════════════════════════════════════════════════
+_MEMORY_STORE_EXECUTOR: concurrent.futures.ThreadPoolExecutor = (
+    concurrent.futures.ThreadPoolExecutor(
+        max_workers=6,
+        thread_name_prefix="memory-store",
+    )
+)
+atexit.register(
+    _MEMORY_STORE_EXECUTOR.shutdown,
+    wait=False,
+    cancel_futures=True,
+)
+
+
 # =============================================================================
 # FIX: Table schema pre-creation to prevent "No schema specified" errors
 # =============================================================================
@@ -128,7 +196,7 @@ logger.setLevel(logging.DEBUG)
 #   * bounded exponential-backoff retry for transient network errors
 #     (ReadTimeout, ConnectTimeout, NetworkError, PoolTimeout) and HTTP
 #     429 / 5xx.  Retry-After header honoured (delta-seconds or HTTP-date)
-#     when present, capped at _MAX_EMBED_RETRY_WAIT seconds per attempt.
+#     when present, capped at _RETRY_AFTER_MAX_EMBED seconds per attempt.
 #   * per-``(model, text)`` result cache: embeddings are deterministic, so
 #     caching the Pydantic "test" probe means second + third probes never
 #     touch Modal at all — eliminating the connection-pool amplification
@@ -151,32 +219,30 @@ def _embed_cache_put(model: str, text: str, embedding):
     _embed_cache[(model, text)] = embedding
 
 
-def _parse_embed_retry_after(hdr, fallback: float) -> float:
-    """Parse RFC 7231 Retry-After (delta-seconds or HTTP-date).
-    Mirrors the helper in ``pro/canonical/wikidata_client.py``.
-    """
-    if not hdr:
-        return fallback
-    hdr_s = hdr.strip() if isinstance(hdr, str) else str(hdr).strip()
-    try:
-        return float(hdr_s)
-    except ValueError:
-        pass
-    try:
-        from email.utils import parsedate_to_datetime
-        import datetime as _dt
-        target = parsedate_to_datetime(hdr_s)
-        now = (
-            _dt.datetime.now(target.tzinfo)
-            if target.tzinfo is not None
-            else _dt.datetime.utcnow()
-        )
-        return max((target - now).total_seconds(), 0.0)
-    except Exception:
-        return fallback
+# Retry-After parsing consolidated into shared helper 2026-05-14 (Bundle E
+# Fix 2B). The local ``_parse_embed_retry_after`` here was byte-identical
+# (modulo isinstance guard) with ``_parse_retry_after`` in
+# pro/canonical/wikidata_client.py — the docstring explicitly noted they
+# should mirror each other. Both now import from pro.http.retry_after.
+# Module-level alias preserves the existing
+# ``_parse_embed_retry_after`` name for any external references.
+from pro.http.retry_after import parse_retry_after as _parse_embed_retry_after
 
 
-_MAX_EMBED_RETRY_WAIT = 60.0
+# Upper bound on a single Retry-After wait for Modal embedding.
+#
+# Modal returns 429 with multi-minute ``Retry-After`` during embedding
+# capacity bursts (v38: 870× firings, Bug #77 storm). Embedding is BATCH
+# (called from validator probes + async embed_documents); user isn't
+# waiting inline, so latency-tolerant. Previous 60.0 cap defeated the
+# server's hint and exhausted retries before Modal recovered.
+#
+# PR-A0-13a (2026-05-14): renamed from _MAX_EMBED_RETRY_WAIT, raised
+# default 60→180s, added env-var override. Distinct from exponential-
+# backoff fallback (still capped at the same value via min(2^n, cap)
+# below — both share this ceiling because the embedding loop doesn't
+# separately track an exponential ceiling).
+_RETRY_AFTER_MAX_EMBED = float(os.getenv("MODAL_EMBED_RETRY_AFTER_MAX", "180.0"))
 _EMBED_MAX_RETRIES = 4
 
 
@@ -214,9 +280,16 @@ def _sync_modal_post_with_retry(client, url: str, payload: dict):
                         response.headers.get("Retry-After"),
                         fallback=2 ** (attempt + 1),
                     ),
-                    _MAX_EMBED_RETRY_WAIT,
+                    _RETRY_AFTER_MAX_EMBED,
                 )
-                logger.warning(
+                # Bundle E Fix 3 (2026-05-14, PR-A0-9): demoted from
+                # WARNING to DEBUG. The per-attempt message fired 870×
+                # in v38's Modal embed storm (Bug #77) — pure log spam.
+                # The give-up signal ("Sync embed_documents failed
+                # after retries") stays at ERROR, preserving storm
+                # visibility at the right level (one event per failure,
+                # not one per attempt).
+                logger.debug(
                     "Modal embed HTTP %d (attempt %d/%d), retrying in %.1fs",
                     response.status_code, attempt + 1, _EMBED_MAX_RETRIES, wait,
                 )
@@ -228,8 +301,10 @@ def _sync_modal_post_with_retry(client, url: str, payload: dict):
             if not _is_transient_http_exc(e) or attempt >= _EMBED_MAX_RETRIES - 1:
                 raise
             last_exc = e
-            wait = min(2 ** (attempt + 1), _MAX_EMBED_RETRY_WAIT)
-            logger.warning(
+            wait = min(2 ** (attempt + 1), _RETRY_AFTER_MAX_EMBED)
+            # Same Bundle E Fix 3 reasoning: transient-network retries
+            # don't deserve WARNING-per-attempt either.
+            logger.debug(
                 "Modal embed transient %s (attempt %d/%d), retrying in %.1fs: %s",
                 type(e).__name__, attempt + 1, _EMBED_MAX_RETRIES, wait, e,
             )
@@ -254,9 +329,10 @@ async def _async_modal_post_with_retry(client, url: str, payload: dict):
                         response.headers.get("Retry-After"),
                         fallback=2 ** (attempt + 1),
                     ),
-                    _MAX_EMBED_RETRY_WAIT,
+                    _RETRY_AFTER_MAX_EMBED,
                 )
-                logger.warning(
+                # Bundle E Fix 3 (2026-05-14, PR-A0-9): see sync sibling.
+                logger.debug(
                     "Modal embed HTTP %d (attempt %d/%d), retrying in %.1fs",
                     response.status_code, attempt + 1, _EMBED_MAX_RETRIES, wait,
                 )
@@ -268,8 +344,8 @@ async def _async_modal_post_with_retry(client, url: str, payload: dict):
             if not _is_transient_http_exc(e) or attempt >= _EMBED_MAX_RETRIES - 1:
                 raise
             last_exc = e
-            wait = min(2 ** (attempt + 1), _MAX_EMBED_RETRY_WAIT)
-            logger.warning(
+            wait = min(2 ** (attempt + 1), _RETRY_AFTER_MAX_EMBED)
+            logger.debug(
                 "Modal embed transient %s (attempt %d/%d), retrying in %.1fs: %s",
                 type(e).__name__, attempt + 1, _EMBED_MAX_RETRIES, wait, e,
             )
@@ -1251,7 +1327,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             # If it's a string, wrap it into the content model
             return {"content":raw}
         elif self.content_model is not None and isinstance(raw, self.content_model):
-            return raw.dict()  # Already in the correct format
+            return raw.model_dump()  # Already in the correct format
         else:
             raise ValueError(
                 "%s must be a dict, str, or %s — got: %s"
@@ -1418,7 +1494,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         # Single LOAD-staging + MERGE — one DML regardless of batch size.
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            None,
+            _MEMORY_STORE_EXECUTOR,
             lambda: merge_upsert_json_rows(
                 self.vectorstore._bq_client,
                 self.vectorstore.full_table_id,
@@ -1438,7 +1514,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
 
         loop = asyncio.get_running_loop()
         docs = await loop.run_in_executor(
-            None,
+            _MEMORY_STORE_EXECUTOR,
             self.vectorstore.get_documents,
             [key],
         )
@@ -1543,7 +1619,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             try:
                 model_cls = self.content_model
                 if model_cls and isinstance(query, dict):
-                    query = json.dumps(model_cls(**query).dict())
+                    query = json.dumps(model_cls(**query).model_dump())
                 elif isinstance(query, dict):
                     query = json.dumps(query)
             except Exception:
@@ -1557,7 +1633,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         # we bypass it and run a direct SELECT against the vectorstore's table.
         if not query:
             return await loop.run_in_executor(
-                None,
+                _MEMORY_STORE_EXECUTOR,
                 self._search_filter_only,
                 combined_sql,
                 limit,
@@ -1569,7 +1645,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         # ``_create_filters`` treats non-dict filter values as a literal SQL
         # WHERE clause, which is exactly what we want.
         hits = await loop.run_in_executor(
-            None,
+            _MEMORY_STORE_EXECUTOR,
             lambda: self.vectorstore.similarity_search_with_score(
                 query=query, filter=combined_sql, k=limit + offset
             ),
@@ -1715,7 +1791,11 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             # No running loop: safe to create one and run to completion
             return asyncio.run(_runner())
 
-        # Already in an event loop: hop to a worker thread with its own loop
+        # Already in an event loop: hop to a worker thread with its own loop.
+        # The shared ``_MEMORY_STORE_EXECUTOR`` (module-scope, atexit-shutdown)
+        # replaces the prior per-call ``with ThreadPoolExecutor(max_workers=1)``
+        # whose ``__exit__`` blocked on ``shutdown(wait=True)`` and contributed
+        # to the Bug 6 cascade (PR-A0-3f lift).
         def _thread_runner() -> list[SearchItem]:
             new_loop = asyncio.new_event_loop()
             try:
@@ -1724,8 +1804,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             finally:
                 new_loop.close()
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            return ex.submit(_thread_runner).result()
+        return _MEMORY_STORE_EXECUTOR.submit(_thread_runner).result()
 
     async def adelete(self, namespace: Tuple[str, ...], key: str) -> None:
         logger.info("[adelete] Deleting doc_id=%s from namespace=%s", key, namespace)
@@ -1740,7 +1819,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             raise NotImplementedError("Vector store does not support delete/adelete")
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, delete, [key])
+        await loop.run_in_executor(_MEMORY_STORE_EXECUTOR, delete, [key])
 
     def mget(self, keys: Sequence[str]) -> List[Optional[dict]]:
         """
@@ -1760,7 +1839,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            None, self.vectorstore.get_documents, list(keys)
+            _MEMORY_STORE_EXECUTOR, self.vectorstore.get_documents, list(keys)
         )
 
     def mset(self, key_value_pairs: Sequence[Tuple[str, dict]]) -> None:
@@ -1789,7 +1868,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         ]
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            None,
+            _MEMORY_STORE_EXECUTOR,
             self.vectorstore.add_documents,
             documents
         )
@@ -1821,7 +1900,10 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             return
 
         # If we're *already* in an event loop, hop to a worker thread that owns
-        # its own loop so we don't try to nest event loops and explode.
+        # its own loop so we don't try to nest event loops and explode. Uses
+        # the shared ``_MEMORY_STORE_EXECUTOR`` (module-scope, atexit-shutdown)
+        # in place of a per-call ``with ThreadPoolExecutor(max_workers=1)``
+        # whose blocking ``__exit__`` contributed to the Bug 6 cascade.
         def _runner() -> None:
             loop = asyncio.new_event_loop()
             try:
@@ -1830,8 +1912,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             finally:
                 loop.close()
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            ex.submit(_runner).result()
+        _MEMORY_STORE_EXECUTOR.submit(_runner).result()
 
     async def amdelete(self, keys: Sequence[str]) -> None:
         """
@@ -1850,7 +1931,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             raise NotImplementedError("Vector store does not support delete/adelete")
 
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, delete, list(keys))
+        await loop.run_in_executor(_MEMORY_STORE_EXECUTOR, delete, list(keys))
 
     def yield_keys(self, prefix: Optional[str] = None) -> Iterator[str]:
         "yields keys"
@@ -1863,7 +1944,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         """
         loop = asyncio.get_running_loop()
         keys = await loop.run_in_executor(
-            None, lambda: list(self.vectorstore.yield_keys(prefix=prefix))
+            _MEMORY_STORE_EXECUTOR, lambda: list(self.vectorstore.yield_keys(prefix=prefix))
         )
         for key in keys:
             yield key
@@ -1885,6 +1966,8 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         except RuntimeError:
             return asyncio.run(_runner())
 
+        # Lifted to shared ``_MEMORY_STORE_EXECUTOR`` (PR-A0-3f) — same Bug 6
+        # rationale as ``search`` / ``mdelete`` sync wrappers above.
         def _thread_runner() -> list[Result]:
             new_loop = asyncio.new_event_loop()
             try:
@@ -1893,8 +1976,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             finally:
                 new_loop.close()
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            return ex.submit(_thread_runner).result()
+        return _MEMORY_STORE_EXECUTOR.submit(_thread_runner).result()
 
     def get(
         self,
@@ -2049,8 +2131,15 @@ async def _build_store_in_thread(
             schema=schema,
         )
 
-    # run in default ThreadPoolExecutor
-    return await asyncio.to_thread(_builder)
+    # PR-A0-13c: route through the bounded _MEMORY_STORE_EXECUTOR
+    # (module-scope, already used for all memory-store I/O at lines
+    # 1497, 1517, 1636, 1648, 1807, 1822, 1842). Bug #79: default
+    # executor floods callbacks at loop close. _MEMORY_STORE_EXECUTOR
+    # is the right choice — it's in this module (no cross-module
+    # circular-import risk with memory_tools.py which imports FROM
+    # this module).
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_MEMORY_STORE_EXECUTOR, _builder)
 
 #---------------------------------get memory tools--------------------------------
 async def get_memory_tools(
