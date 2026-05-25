@@ -150,7 +150,7 @@ class SQLAgentPerformanceEvaluator:
             logger.info(f"Loaded {len(self.ground_truth_knowledge)} ground truth facts")
             
         except Exception as e:
-            logger.error(f"Failed to load ground truth: {e}")
+            logger.error(f"Failed to load ground truth: {e}", exc_info=True)
     
     def _define_knowledge_patterns(self) -> None:
         """Define patterns for discoverable vs undiscoverable knowledge."""

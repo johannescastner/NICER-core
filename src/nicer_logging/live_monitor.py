@@ -70,8 +70,8 @@ class ConversationMonitor:
             logger.info("BigQuery client initialized successfully with service account credentials")
 
         except Exception as e:
-            logger.error(f"Failed to initialize BigQuery client: {e}")
-            logger.error("Make sure GCP_SERVICE_ACCOUNT_BASE64 environment variable is set")
+            logger.error(f"Failed to initialize BigQuery client: {e}", exc_info=True)
+            logger.error("Make sure GCP_SERVICE_ACCOUNT_BASE64 environment variable is set", exc_info=True)
             raise
     
     async def monitor_conversation(self, conversation_id: str, refresh_interval: int = 5):
@@ -123,7 +123,7 @@ class ConversationMonitor:
                 logger.info("Monitoring stopped by user")
                 break
             except Exception as e:
-                logger.error(f"Error during monitoring: {e}")
+                logger.error(f"Error during monitoring: {e}", exc_info=True)
                 await asyncio.sleep(refresh_interval)
     
     async def monitor_all_active(self, refresh_interval: int = 10):
@@ -170,7 +170,7 @@ class ConversationMonitor:
                 logger.info("Monitoring stopped by user")
                 break
             except Exception as e:
-                logger.error(f"Error during monitoring: {e}")
+                logger.error(f"Error during monitoring: {e}", exc_info=True)
                 await asyncio.sleep(refresh_interval)
     
     async def search_conversations_live(self, query: str, focus_area: Optional[str] = None):
@@ -613,7 +613,7 @@ class ConversationMonitor:
             logger.info(f"  📈 ECOSYSTEM STATS: {len(metrics)} total metrics across {total_categories} categorized metrics from {len(set(m['conversation_id'] for m in metrics))} conversations")
 
         except Exception as e:
-            logger.error(f"Error displaying comprehensive metrics: {e}")
+            logger.error(f"Error displaying comprehensive metrics: {e}", exc_info=True)
 
     def _format_timestamp(self, timestamp):
         """Format timestamp for display."""
@@ -695,7 +695,7 @@ async def main():
     except KeyboardInterrupt:
         logger.info("Monitoring stopped by user")
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Error: {e}", exc_info=True)
 
 
 if __name__ == "__main__":

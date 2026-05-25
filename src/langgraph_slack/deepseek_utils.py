@@ -245,8 +245,8 @@ def deepseek_exponential_backoff(
                         cfg.max_retries,
                         (code if code is not None else "?"),
                         type(e).__name__,
-                        sleep
-                    )
+                        sleep, 
+                    exc_info=True)
                     time.sleep(sleep)
                     delay = min(delay * cfg.factor, cfg.max_delay)
                     continue
@@ -296,8 +296,8 @@ async def async_deepseek_exponential_backoff(
                 cfg.max_retries,
                 (code if code is not None else "?"),
                 type(e).__name__,
-                sleep
-            )
+                sleep, 
+            exc_info=True)
             await asyncio.sleep(sleep)
             delay = min(delay * cfg.factor, cfg.max_delay)
             continue

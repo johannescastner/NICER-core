@@ -812,8 +812,8 @@ async def _is_mention_with_token(event: SlackMessageData, bot_token: str) -> boo
     except Exception as exc:
         LOGGER.warning(
             "Failed to check mention with bot_token: %s. Falling back to global check.",
-            exc
-        )
+            exc, 
+        exc_info=True)
         return await _is_mention(event)
 
 

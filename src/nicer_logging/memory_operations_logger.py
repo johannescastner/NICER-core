@@ -130,8 +130,8 @@ class MemoryOperationsLogger:
             logger.debug(f"✅ Logged {operation_type} operation for {memory_type} memory: {doc_id}")
 
         except Exception as e:
-            logger.error(f"❌ Failed to log memory operation: {e}")
-            logger.error(f"   Operation: {operation_type} {memory_type} {doc_id}")
+            logger.error(f"❌ Failed to log memory operation: {e}", exc_info=True)
+            logger.error(f"   Operation: {operation_type} {memory_type} {doc_id}", exc_info=True)
             # Don't raise - logging failures shouldn't break the main operation
             
         return operation_id

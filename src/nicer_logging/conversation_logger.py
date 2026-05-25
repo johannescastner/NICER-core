@@ -308,7 +308,7 @@ class ConversationLogger:
             tone["agent_name"] = agent_name if spk == "assistant" else None
             
         except Exception as exc:
-            logger.warning("⚠️ Tone analysis failed: %s", exc)
+            logger.warning("⚠️ Tone analysis failed: %s", exc, exc_info=True)
 
         return tone
 
@@ -347,7 +347,7 @@ class ConversationLogger:
             logger.error(
                 "Failed to generate embedding (status=%s): %s",
                 status, e,
-            )
+            exc_info=True)
             return EmbeddingAttempt(embedding=None, status=status)
 
     async def log_turn(

@@ -73,6 +73,20 @@ CONFIG = environ.get("CONFIG") or "{}"
 DEPLOYMENT_URL = environ.get("DEPLOYMENT_URL", "")
 SLACK_CHANNEL_ID = environ.get("SLACK_CHANNEL_ID")
 
+# Unit 4 — uploader authorization. Comma-separated allowlist of Slack
+# channel IDs permitted to upload expert-assumption YAML via the
+# file_shared ingest path. FAIL-CLOSED: unset/empty ⇒ NO uploads
+# accepted (must be set explicitly at client onboarding). Dedicated var,
+# NOT overloading SLACK_CHANNEL_ID (that is the bot's callback channel —
+# a distinct policy; conflating them couples two concerns). Structural
+# comma-split (same idiom as pro/superset/boot/register_bigquery.py:96
+# et al.) — no regex, no string matching.
+SLACK_FILE_UPLOAD_CHANNEL_ALLOWLIST = frozenset(
+    c.strip()
+    for c in (environ.get("SLACK_FILE_UPLOAD_CHANNEL_ALLOWLIST") or "").split(",")
+    if c.strip()
+)
+
 # Google Cloud project details
 PROJECT_ID = environ.get("GCP_PROJECT_ID", "default_project_id")
 DATASET_ID = environ.get("GCP_DATASET_ID", "agent_system_memory")
@@ -124,7 +138,7 @@ try:
         CW_CREDENTIALS = None
         CW_PROJECT_ID = "collectiwise-nicer"
 except Exception as e:
-    LOGGER.error("Failed to load CollectiWise central SA: %s", e)
+    LOGGER.error("Failed to load CollectiWise central SA: %s", e, exc_info=True)
     CW_CREDENTIALS = None
     CW_PROJECT_ID = "collectiwise-nicer"
 
@@ -568,7 +582,7 @@ if HF_CACHE_DIR:
     try:
         os.makedirs(HF_CACHE_DIR, exist_ok=True)
     except Exception as e:
-        LOGGER.warning("Could not create HF cache directory %s: %s", HF_CACHE_DIR, e)
+        LOGGER.warning("Could not create HF cache directory %s: %s", HF_CACHE_DIR, e, exc_info=True)
 else:
     LOGGER.info("HF cache directory not set; falling back to library defaults.")
 

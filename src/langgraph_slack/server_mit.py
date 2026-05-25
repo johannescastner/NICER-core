@@ -81,7 +81,7 @@ try:
     LOGGER.info("✅ LangSmith tracing initialized (project: %s)", _LSI.project_name)
 except Exception as e:
     _LSI = None
-    LOGGER.warning("⚠️ LangSmith tracing not available: %s", e)
+    LOGGER.warning("⚠️ LangSmith tracing not available: %s", e, exc_info=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Graph Registry & Checkpointer Setup
@@ -143,7 +143,7 @@ async def _detect_interrupt(graph, config: dict) -> tuple[bool, Any]:
                     return True, intr.value
             return True, None
     except Exception as exc:
-        LOGGER.warning("Failed to check graph state for interrupt: %s", exc)
+        LOGGER.warning("Failed to check graph state for interrupt: %s", exc, exc_info=True)
     return False, None
 
 async def _handle_interrupt(
@@ -372,7 +372,7 @@ async def _cleanup_checkpointer():
             await _connection_pool.close()
             LOGGER.info("✅ Connection pool closed")
         except Exception as e:
-            LOGGER.warning("⚠️ Error closing connection pool: %s", e)
+            LOGGER.warning("⚠️ Error closing connection pool: %s", e, exc_info=True)
         _connection_pool = None
     
     _checkpointer = None
@@ -627,7 +627,7 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
             "[%s].[%s] Could not fetch prior state for turn_number "
             "(using 0 fallback): %s",
             channel_id, thread_id, _state_exc,
-        )
+        exc_info=True)
         prior_turn = 0
     turn_number = prior_turn + 1
 
@@ -873,7 +873,7 @@ async def _send_slack_response(
         LOGGER.error(
             "[%s].[%s] ❌ Failed to send Slack message (%d chars): %s",
             channel_id, thread_ts, len(cleaned_text), slack_err,
-        )
+        exc_info=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -979,7 +979,7 @@ async def lifespan(app: FastAPI):
                 config.BOT_USER_ID = auth_result["user_id"]
                 LOGGER.info("✅ BOT_USER_ID initialized: %s", config.BOT_USER_ID)
             except Exception as e:
-                LOGGER.warning("⚠️ Failed to initialize BOT_USER_ID: %s", e)
+                LOGGER.warning("⚠️ Failed to initialize BOT_USER_ID: %s", e, exc_info=True)
         
         asyncio.create_task(_init_bot_user_id(), name="init_bot_user_id")
 

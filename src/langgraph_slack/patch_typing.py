@@ -75,8 +75,8 @@ except AttributeError as e:
     logger.warning("Font scanning will be slow (~168 seconds per deployment)")
 except Exception as e:
     # Catch any other errors to prevent breaking the app
-    logger.warning(f"matplotlib font scanning patch failed: {e}")
-    logger.warning("Font scanning will be slow (~168 seconds per deployment)")
+    logger.warning(f"matplotlib font scanning patch failed: {e}", exc_info=True)
+    logger.warning("Font scanning will be slow (~168 seconds per deployment)", exc_info=True)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # END MATPLOTLIB FIX - Original patch_typing.py code continues below

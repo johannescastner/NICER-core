@@ -444,7 +444,7 @@ class ModalEmbeddings(Embeddings):
             data = response.json()
             fetched = self._parse_batch_response(data)
         except Exception as e:
-            logger.error("Sync embed_documents failed after retries: %s", e)
+            logger.error("Sync embed_documents failed after retries: %s", e, exc_info=True)
             raise
 
         for local_i, global_i in enumerate(missing_idx):
@@ -472,7 +472,7 @@ class ModalEmbeddings(Embeddings):
             data = response.json()
             embedding = self._parse_single_response(data)
         except Exception as e:
-            logger.error("Sync embed_query failed after retries: %s", e)
+            logger.error("Sync embed_query failed after retries: %s", e, exc_info=True)
             raise
         _embed_cache_put(self.model, text, embedding)
         return embedding
@@ -502,7 +502,7 @@ class ModalEmbeddings(Embeddings):
             data = response.json()
             fetched = self._parse_batch_response(data)
         except Exception as e:
-            logger.error("Async aembed_documents failed after retries: %s", e)
+            logger.error("Async aembed_documents failed after retries: %s", e, exc_info=True)
             raise
 
         for local_i, global_i in enumerate(missing_idx):
@@ -528,7 +528,7 @@ class ModalEmbeddings(Embeddings):
             data = response.json()
             embedding = self._parse_single_response(data)
         except Exception as e:
-            logger.error("Async aembed_query failed after retries: %s", e)
+            logger.error("Async aembed_query failed after retries: %s", e, exc_info=True)
             raise
         _embed_cache_put(self.model, text, embedding)
         return embedding

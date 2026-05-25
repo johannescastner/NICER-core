@@ -160,7 +160,7 @@ class RealMetricsIntegrator:
             logger.info(f"✅ Logged {len(discovered_facts)} facts and {len(questions)} questions metrics to BigQuery")
             
         except Exception as e:
-            logger.error(f"Failed to log knowledge discovery metrics: {e}")
+            logger.error(f"Failed to log knowledge discovery metrics: {e}", exc_info=True)
             await self.conversation_logger.log_error(
                 conversation_id, "metrics_integration_error", str(e),
                 {"system": "knowledge_discovery", "focus_area": focus_area}
@@ -204,7 +204,7 @@ class RealMetricsIntegrator:
             logger.info(f"✅ Logged self-discovery metrics: {optimization_cycles} cycles, {tool_accuracy:.3f} accuracy")
             
         except Exception as e:
-            logger.error(f"Failed to log self-discovery metrics: {e}")
+            logger.error(f"Failed to log self-discovery metrics: {e}", exc_info=True)
             await self.conversation_logger.log_error(
                 conversation_id, "metrics_integration_error", str(e),
                 {"system": "self_discovery", "focus_area": focus_area}
@@ -252,7 +252,7 @@ class RealMetricsIntegrator:
             logger.info(f"✅ Logged learning metrics: {facts_learned} facts, {application_success_rate:.3f} success rate")
             
         except Exception as e:
-            logger.error(f"Failed to log learning system metrics: {e}")
+            logger.error(f"Failed to log learning system metrics: {e}", exc_info=True)
             await self.conversation_logger.log_error(
                 conversation_id, "metrics_integration_error", str(e),
                 {"system": "learning_system", "focus_area": focus_area}
@@ -306,7 +306,7 @@ class RealMetricsIntegrator:
             logger.info(f"✅ Logged memory metrics: {retrieval_accuracy:.3f} retrieval accuracy, {consolidation_rate:.3f} consolidation rate")
             
         except Exception as e:
-            logger.error(f"Failed to log memory integration metrics: {e}")
+            logger.error(f"Failed to log memory integration metrics: {e}", exc_info=True)
             await self.conversation_logger.log_error(
                 conversation_id, "metrics_integration_error", str(e),
                 {"system": "memory_integration", "focus_area": focus_area}
@@ -326,7 +326,7 @@ class RealMetricsIntegrator:
             logger.debug(f"✅ Logged custom metric: {metric_name} = {metric_value}")
 
         except Exception as e:
-            logger.error(f"Failed to log custom metric {metric_name}: {e}")
+            logger.error(f"Failed to log custom metric {metric_name}: {e}", exc_info=True)
             await self.conversation_logger.log_error(
                 conversation_id, "custom_metric_error", str(e),
                 {"metric_name": metric_name, "metric_value": metric_value}
@@ -375,7 +375,7 @@ class RealMetricsIntegrator:
             logger.info(f"✅ Logged completeness metrics: {completeness_metrics.get('total_completeness', 0.0):.3f} total completeness")
 
         except Exception as e:
-            logger.error(f"Failed to log completeness metrics: {e}")
+            logger.error(f"Failed to log completeness metrics: {e}", exc_info=True)
             await self.conversation_logger.log_error(
                 conversation_id, "completeness_metrics_error", str(e),
                 {"system": "knowledge_completeness", "focus_area": focus_area}

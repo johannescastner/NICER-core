@@ -157,7 +157,16 @@ class SQLAgentPerformanceEvaluator:
             logger.info(f"Loaded {len(self.verified_facts)} verified facts from IntellAgent")
             
         except Exception as e:
-            logger.error(f"Failed to load IntellAgent knowledge: {e}")
+            # Full traceback so we can pinpoint the offending ``.join`` /
+            # type-mismatch site downstream in search_tool.invoke or the
+            # memory tool's serializer. Without exc_info the message
+            # "sequence item 0: expected str instance, dict found" hides
+            # which file/line raised — Layer 7 (2026-05-21) had this
+            # firing in test_custom_metrics with the bare-str-log losing
+            # everything actionable.
+            logger.error(
+                "Failed to load IntellAgent knowledge: %s", e, exc_info=True,
+            )
     
     async def classify_knowledge_type(self, fact_content: str) -> KnowledgeType:
         """
@@ -231,7 +240,7 @@ class SQLAgentPerformanceEvaluator:
             return self._fallback_classify_knowledge_type(fact_content)
 
         except Exception as e:
-            logger.error(f"Error in knowledge classification: {e}")
+            logger.error(f"Error in knowledge classification: {e}", exc_info=True)
             return self._fallback_classify_knowledge_type(fact_content)
 
     def classify_knowledge_type_sync(self, fact_content: str) -> KnowledgeType:
@@ -362,7 +371,7 @@ class SQLAgentPerformanceEvaluator:
                 return MetadataArea.COMPREHENSIVE_COVERAGE
 
         except Exception as e:
-            logger.error(f"Error in metadata area classification: {e}")
+            logger.error(f"Error in metadata area classification: {e}", exc_info=True)
             return self._fallback_classify_metadata_area(fact_content, category)
 
     def _fallback_classify_metadata_area(self, fact_content: str, category: str) -> MetadataArea:
@@ -644,7 +653,7 @@ class SQLAgentPerformanceEvaluator:
                         if results:
                             area_targets_available[area] += len(results)
                     except Exception as e:
-                        logger.warning(f"Error searching for {keyword}: {e}")
+                        logger.warning(f"Error searching for {keyword}: {e}", exc_info=True)
 
             # Count discovered facts that match each area
             for fact in discovered_facts:
@@ -694,7 +703,7 @@ class SQLAgentPerformanceEvaluator:
             return coverage
 
         except Exception as e:
-            logger.error(f"Error calculating metadata area coverage: {e}")
+            logger.error(f"Error calculating metadata area coverage: {e}", exc_info=True)
             return self._fallback_calculate_coverage(discovered_facts)
 
     def _fallback_calculate_coverage(self, discovered_facts: List[DiscoveredFact]) -> Dict[str, float]:
@@ -858,7 +867,7 @@ def log_metadata_metrics_to_langsmith(metrics: SQLAgentMetadataLearningMetrics, 
         logger.info(f"SQL Agent Metadata Learning Metrics: {json.dumps(metrics_dict, indent=2)}")
 
     except Exception as e:
-        logger.error(f"Failed to log metadata metrics to LangSmith: {e}")
+        logger.error(f"Failed to log metadata metrics to LangSmith: {e}", exc_info=True)
 
 
 def get_metadata_learning_optimization_targets(metrics: SQLAgentMetadataLearningMetrics) -> Dict[str, float]:
@@ -979,7 +988,7 @@ def log_metrics_to_langsmith(metrics, session_id: str) -> None:
         logger.info(f"SQL Agent Session Metrics: {json.dumps(metrics_with_session, indent=2)}")
 
     except Exception as e:
-        logger.error(f"Failed to log metrics to LangSmith: {e}")
+        logger.error(f"Failed to log metrics to LangSmith: {e}", exc_info=True)
 
 
 def get_dspy_optimization_targets(metrics) -> Dict[str, float]:
