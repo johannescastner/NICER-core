@@ -194,11 +194,86 @@ async def _handle_interrupt(
             "channel_id": channel_id,
             "bot_token": bot_token,
             "graph_config": graph_config,
+            "question": question,  # the agent's own clarifying question (ack context)
         }
         # DM fallback: a 1:1 top-level reply resumes by channel (see resume site).
         _CHANNEL_PENDING_INTERRUPT[channel_id] = key
     LOGGER.info("[%s] Interrupt: posted_ts=%s → thread_id=%s", channel_id, key, thread_id)
     return True
+
+def _compact_working_context(messages, *, limit: int = 6, per_msg: int = 300) -> str:
+    """Render the agent's RECENT working context (last few messages) compactly for
+    the resume ack — bounded so the ack stays fast/cheap (the agent's working
+    context, not the full raw thread). Best-effort over heterogeneous message
+    shapes (LangChain objects / dicts)."""
+    out = []
+    for m in (messages or [])[-limit:]:
+        role = (getattr(m, "type", None) or getattr(m, "role", None)
+                or (m.get("role") if isinstance(m, dict) else None)
+                or m.__class__.__name__)
+        content = getattr(m, "content", None)
+        if content is None and isinstance(m, dict):
+            content = m.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                str(b.get("text", "")) for b in content if isinstance(b, dict))
+        text = str(content or "").strip().replace("\n", " ")
+        if text:
+            out.append(f"{role}: {text[:per_msg]}")
+    return "\n".join(out)
+
+
+async def _post_resume_ack(
+    channel_id: str,
+    thread_ts: Optional[str],
+    bot_token: Optional[str],
+    user_reply: str,
+    question: Optional[str] = None,
+    working_context=None,
+) -> None:
+    """Immediately acknowledge the human's reply on resume — as the SAME agent,
+    continuing the conversation — BEFORE the (multi-minute) resumed work, so they
+    aren't left in silence (UX, 2026-05-25).
+
+    FIXED invariant (deterministic): an ask_human answer is ALWAYS the human input
+    that unblocks the agent, so the ack ALWAYS (a) thanks them for it and (b)
+    warns it's now at work and will take a little time. FLEXIBLE (the LLM owns it):
+    the exact wording, in the USER'S language, grounded on the agent's WORKING
+    CONTEXT (recent conversation) + the actual question it asked — so it fits ANY
+    ask_human situation, never assuming a task type. No fixed user-facing string
+    (the prompt is LLM INPUT; the post is the model's output via the guarded sink).
+    Best-effort: never block or fail the resume.
+    """
+    try:
+        from langchain_core.messages import (
+            HumanMessage as _HM, SystemMessage as _SM,
+        )
+        _prompt = [_SM(content=(
+            "You are continuing a conversation as the same assistant: a human just "
+            "answered a clarifying question that was BLOCKING your work, so you can "
+            "now resume. In ONE or TWO short sentences, in the SAME LANGUAGE as "
+            "their reply: warmly thank them for the answer that unblocks you, and "
+            "let them know you're now working on it and it will take a little time. "
+            "Be specific to what was actually being clarified (use the conversation "
+            "context + the question below); do NOT assume a task type, and do not "
+            "promise specific numbers or results you don't yet have."
+        ))]
+        _ctx = _compact_working_context(working_context)
+        if _ctx:
+            _prompt.append(_SM(content=f"Recent conversation context:\n{_ctx}"))
+        if question:
+            _prompt.append(_SM(content=f"The clarifying question you had asked: {question}"))
+        _prompt.append(_HM(content=(user_reply or "")[:500]))
+        _resp = await config.create_llm().ainvoke(_prompt)
+        _ack = (_resp.content or "").strip()[:400] if hasattr(_resp, "content") else ""
+        if _ack:
+            await _send_slack_response(
+                channel_id=channel_id, thread_ts=thread_ts,
+                text=_ack, bot_token=bot_token,
+            )
+    except Exception:
+        LOGGER.warning("[%s] resume ack failed (non-fatal)", channel_id, exc_info=True)
+
 
 async def _resume_interrupted_graph(
     event: dict,
@@ -217,6 +292,26 @@ async def _resume_interrupted_graph(
     LOGGER.info(
         "[%s] Resuming interrupted graph thread_id=%s with: %s...",
         channel_id, mapping["thread_id"], user_reply[:100],
+    )
+
+    # UX: as the SAME agent, thank the human for the unblocking answer + warn that
+    # work is now underway and will take a bit — BEFORE the (multi-minute) resumed
+    # work, grounded on what the agent is ACTUALLY doing (its recent working
+    # context). Best-effort; never block the resume. _send_slack_response guards
+    # the thread_ts (real ts → threaded under the question; else un-threaded).
+    _working_ctx = []
+    try:
+        _st = await get_graph(DEFAULT_GRAPH).aget_state(graph_config)
+        _working_ctx = (getattr(_st, "values", None) or {}).get("messages", []) or []
+    except Exception:
+        _working_ctx = []
+    await _post_resume_ack(
+        channel_id=channel_id,
+        thread_ts=parent_ts,
+        bot_token=effective_token,
+        user_reply=user_reply,
+        question=mapping.get("question"),
+        working_context=_working_ctx,
     )
 
     resume_value = {
@@ -912,17 +1007,9 @@ async def _handle_callback(event: dict):
     )
 
 
-def _valid_slack_ts(ts) -> bool:
-    """True iff ``ts`` is a real Slack message timestamp (``<digits>.<digits>``).
-
-    A real Slack ts comes FROM DATA — the inbound event or a post's API response.
-    A fabricated/synthetic value (our ``impact-<scenario>`` langgraph checkpointer
-    anchor) is NOT a Slack ts and must never be sent as ``thread_ts`` (Slack
-    rejects it: ``invalid_thread_ts``). Regex-free (workspace rule)."""
-    if not isinstance(ts, str) or "." not in ts:
-        return False
-    whole, _, frac = ts.partition(".")
-    return whole.isdigit() and frac.isdigit()
+# Single source of truth for "is this a real Slack ts?" — shared by every Slack
+# post sink (server_mit, server, reflective ack) so the rule cannot drift.
+from pro.slack_app.slack_ts import valid_slack_ts as _valid_slack_ts  # noqa: E402
 
 
 async def _send_slack_response(

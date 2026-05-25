@@ -98,13 +98,48 @@ _INTERRUPT_THREAD_MAP: dict[str, dict[str, Any]] = {}
 _CHANNEL_PENDING_INTERRUPT: dict[str, str] = {}
 
 
-def _valid_slack_ts(ts) -> bool:
-    """True iff ``ts`` is a real Slack message timestamp (``<digits>.<digits>``);
-    a fabricated/synthetic anchor is NOT and must never be sent to Slack. Regex-free."""
-    if not isinstance(ts, str) or "." not in ts:
-        return False
-    whole, _, frac = ts.partition(".")
-    return whole.isdigit() and frac.isdigit()
+# Single source of truth for "is this a real Slack ts?" — shared by every Slack
+# post sink (server, server_mit, reflective ack) so the rule cannot drift.
+from pro.slack_app.slack_ts import valid_slack_ts as _valid_slack_ts  # noqa: E402
+
+
+async def _post_resume_ack(channel_id, thread_ts, bot_token, user_reply, question=None):
+    """Immediately acknowledge the human's reply on resume — as the SAME agent,
+    continuing — BEFORE the long work (UX). FIXED: always thank them for the
+    answer that unblocks the work + warn it's now underway and will take a bit.
+    FLEXIBLE: the wording, in the USER'S language, grounded on the actual question
+    asked (never assuming a task type). AGENT-rendered (no fixed strings — the
+    prompt is LLM INPUT; the post is the model output); thread_ts guarded; best-
+    effort. Cloud variant of server_mit._post_resume_ack. (The cloud thread state
+    is remote, so the working-context enrichment server_mit does is a follow-up
+    here; the question + reply still ground it.)"""
+    try:
+        from langchain_core.messages import (
+            HumanMessage as _HM, SystemMessage as _SM,
+        )
+        _prompt = [_SM(content=(
+            "You are continuing a conversation as the same assistant: a human just "
+            "answered a clarifying question that was BLOCKING your work, so you can "
+            "now resume. In ONE or TWO short sentences, in the SAME LANGUAGE as "
+            "their reply: warmly thank them for the answer that unblocks you, and "
+            "let them know you're now working on it and it will take a little time. "
+            "Be specific to what was actually being clarified; do NOT assume a task "
+            "type, and do not promise specific numbers or results you don't have."
+        ))]
+        if question:
+            _prompt.append(_SM(content=f"The clarifying question you had asked: {question}"))
+        _prompt.append(_HM(content=(user_reply or "")[:500]))
+        _resp = await config.create_llm().ainvoke(_prompt)
+        _ack = (_resp.content or "").strip()[:400] if hasattr(_resp, "content") else ""
+        if _ack:
+            _client = AsyncWebClient(token=bot_token) if bot_token else APP_HANDLER.app.client
+            await _client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts if _valid_slack_ts(thread_ts) else None,
+                text=_ack,
+            )
+    except Exception:
+        LOGGER.warning("[%s] resume ack failed (non-fatal)", channel_id, exc_info=True)
 
 class SlackMessageData(TypedDict):
     user: str
@@ -182,6 +217,12 @@ async def _process_task(task: dict):
             webhook = f"{config.DEPLOYMENT_URL}/callbacks/{resume_thread_id}"
 
             LOGGER.info("[%s] Resuming interrupted run thread_id=%s", channel_id, resume_thread_id)
+
+            # UX: thank the user + say we're continuing, BEFORE the long resumed run.
+            await _post_resume_ack(
+                channel_id, resume_key, effective_token, user_reply,
+                question=mapping.get("question"),
+            )
 
             await LANGGRAPH_CLIENT.runs.create(
                 thread_id=resume_thread_id,
@@ -421,6 +462,7 @@ async def _process_task(task: dict):
                         "thread_id": cb_thread_id,
                         "channel_id": cb_channel,
                         "bot_token": cb_token,
+                        "question": question,  # ack context on resume
                     }
                     # DM fallback: a 1:1 top-level reply resumes by channel.
                     _CHANNEL_PENDING_INTERRUPT[cb_channel] = posted_thread_ts
