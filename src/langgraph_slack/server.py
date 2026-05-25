@@ -32,6 +32,12 @@ from pro.http.ambient import router as ambient_router
 from pro.http.cron_lifecycle import ensure_ambient_cron_exists
 from pro.persistence import close_persistence_manager
 from pro.utils.blocking_detector import install_blocking_detector
+# Impact-report feature surface (kept at PARITY with server_mit — the deployed
+# self-hosted module — so the two receivers do not drift):
+from pro.slack_app.agent_launch import register_agent_launcher
+from pro.slack_app.file_upload import claim_file_for_processing
+from pro.slack_app.impact_report_commands import build_impact_report_task
+from pro.slack_app.assumption_commands import build_assumptions_task
 
 LOGGER = logging.getLogger(__name__)
 LANGGRAPH_CLIENT = get_client(url=config.LANGGRAPH_URL)
@@ -703,7 +709,24 @@ async def slack_event_from_router(req: Request):
     if not event_type:
         LOGGER.warning("No event type in router-forwarded body: %s", body)
         return {"ok": True}  # Ack anyway to satisfy Slack
-    
+
+    # ── File uploads (expert-assumption YAML) — PARITY with server_mit ──
+    # Two carriers: a ``file_shared`` event, OR a ``message``/file_share with a
+    # ``files`` array. Route BOTH to the file_upload task → process_file_upload;
+    # claim_file_for_processing dedups by file_id (ingest once).
+    if event_type == "file_shared" or (
+        event_type == "message" and event.get("files")
+    ):
+        if event.get("bot_id"):
+            return {"ok": True}
+        file_id = await claim_file_for_processing(event)
+        if file_id:
+            LOGGER.info("🔀 Enqueuing router file_upload: file_id=%s", file_id)
+            TASK_QUEUE.put_nowait(
+                {"type": "file_upload", "event": event, "bot_token": bot_token}
+            )
+        return {"ok": True}
+
     # Filter: only process messages and app_mentions
     if event_type not in ("message", "app_mention"):
         LOGGER.info("Ignoring non-message event type: %s", event_type)
@@ -772,6 +795,33 @@ def _clean_markdown(text: str) -> str:
     return text
 
 
+@APP.post("/slack/command")
+async def slack_command_from_router(req: Request):
+    """Multi-tenant router → agent slash-command endpoint (PARITY with
+    server_mit). The slack-router forwards slash commands here as JSON
+    ``{team_id, command, data, bot_token}`` — ``bot_token`` is in the BODY (the
+    command-forward does not send the ``X-Slack-Bot-Token`` header). Map the
+    command to its task via the shared builders and enqueue it.
+    """
+    body = await req.json()
+    bot_token = body.get("bot_token")
+    command = body.get("command")
+    data = body.get("data") or {}
+    LOGGER.info(
+        "🔀 Router-forwarded command: %s, team=%s", command, body.get("team_id")
+    )
+    if command == "/make-impact-report":
+        task = build_impact_report_task(data, bot_token=bot_token)
+    elif command == "/assumptions":
+        task = build_assumptions_task(data, bot_token=bot_token)
+    else:
+        LOGGER.info("Ignoring unknown forwarded command: %s", command)
+        return {"ok": True}
+    if task is not None:
+        TASK_QUEUE.put_nowait(task)
+    return {"ok": True}
+
+
 @APP.post("/callbacks/{thread_id}")
 async def webhook_callback(req: Request):
     """
@@ -819,6 +869,82 @@ async def _is_mention_with_token(event: SlackMessageData, bot_token: str) -> boo
 
 def _get_thread_id(thread_ts: str, channel: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"SLACK:{thread_ts}-{channel}"))
+
+
+async def _launch_agent_turn_cloud(
+    prompt: str,
+    *,
+    channel_id: Optional[str],
+    thread_anchor_ts: str,
+    bot_token: Optional[str] = None,
+    user_id: Optional[str] = None,
+    scenario_id: Optional[str] = None,
+) -> None:
+    """Cloud (LangGraph Platform) agent-turn launcher: feed the rendered prompt
+    as a ``user`` turn via ``LANGGRAPH_CLIENT.runs.create``; the reply flows
+    back through the ``/callbacks`` webhook. Registered with the
+    deployment-agnostic ``launch_agent_turn`` registry. This is the block that
+    used to live inline in ``process_impact_report_command`` — extracted so the
+    processor (and the upload tutorial) are deployment-agnostic. The MIT
+    counterpart (direct graph) is ``server_mit._launch_agent_turn_mit``.
+    """
+    thread_id = _get_thread_id(thread_anchor_ts, channel_id or "")
+    webhook = f"{config.DEPLOYMENT_URL}/callbacks/{thread_id}"
+    conversation_id = f"slack_{thread_id}"
+    effective_bot_token = bot_token or os.environ.get("SLACK_BOT_TOKEN", "")
+
+    updated_config = {**GRAPH_CONFIG}
+    if "configurable" not in updated_config:
+        updated_config["configurable"] = {}
+    updated_config["configurable"]["langgraph_auth_user_id"] = user_id or ""
+    updated_config["configurable"]["bot_token"] = effective_bot_token
+    updated_config["configurable"]["channel_id"] = channel_id or ""
+    updated_config["configurable"]["thread_ts"] = thread_anchor_ts
+    updated_config["configurable"]["conversation_id"] = conversation_id
+    if scenario_id:
+        updated_config["configurable"]["scenario_id"] = scenario_id
+
+    run_metadata = {
+        "event": "slack",
+        "slack_event_type": "agent_turn",
+        "bot_user_id": config.BOT_USER_ID,
+        "slack_user_id": user_id or "",
+        "channel_id": channel_id or "",
+        "channel": channel_id or "",
+        # Deterministic anchor (NOT raw thread_ts, None outside a thread): the
+        # interrupted-callback branch keys ask_human resume on metadata.thread_ts.
+        "thread_ts": thread_anchor_ts,
+        "conversation_id": conversation_id,
+    }
+    if scenario_id:
+        run_metadata["scenario_id"] = scenario_id
+    if effective_bot_token:
+        run_metadata["bot_token"] = effective_bot_token
+
+    await LANGGRAPH_CLIENT.runs.create(
+        thread_id=thread_id,
+        assistant_id=config.ASSISTANT_ID,
+        input={
+            "messages": [{"role": "user", "content": prompt}],
+            "context": {
+                "slack_user_id": user_id or "",
+                "channel_id": channel_id or "",
+                "thread_id": thread_id,
+                "thread_ts": thread_anchor_ts,
+                "bot_token": effective_bot_token,
+            },
+            "conversation_id": conversation_id,
+        },
+        config=updated_config,
+        metadata=run_metadata,
+        multitask_strategy="interrupt",
+        if_not_exists="create",
+        webhook=webhook,
+    )
+
+
+# Register the cloud launcher with the deployment-agnostic registry at import.
+register_agent_launcher(_launch_agent_turn_cloud)
 
 
 def _is_dm(event: SlackMessageData):

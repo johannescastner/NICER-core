@@ -55,6 +55,12 @@ from pro.http.ambient import router as ambient_router
 from pro.http.cron_lifecycle import ensure_ambient_cron_exists
 from pro.persistence import close_persistence_manager
 from pro.utils.blocking_detector import install_blocking_detector
+# Impact-report feature surface (multi-tenant port — server_mit IS the DEPLOYED
+# self-hosted server; the feature was previously only wired in server.py):
+from pro.slack_app.agent_launch import register_agent_launcher
+from pro.slack_app.file_upload import claim_file_for_processing
+from pro.slack_app.impact_report_commands import build_impact_report_task
+from pro.slack_app.assumption_commands import build_assumptions_task
 
 
 
@@ -516,8 +522,62 @@ async def _process_task(task: dict):
         await _handle_slack_message(event, bot_token)
     elif event_type == "callback":
         await _handle_callback(event)
+    elif event_type == "file_upload":
+        # Expert-assumption YAML upload (mirrors server.py:_process_task). Real
+        # work — files_info, download, parse, BQ write, Block Kit + multilingual
+        # tutorial — lives in process_file_upload.
+        from pro.slack_app.file_upload import process_file_upload
+        await process_file_upload(event, bot_token)
+    elif event_type == "assumptions_command":
+        from pro.slack_app.assumption_commands import (
+            process_assumptions_command,
+        )
+        await process_assumptions_command(event, bot_token)
+    elif event_type == "impact_report_command":
+        from pro.slack_app.impact_report_commands import (
+            process_impact_report_command,
+        )
+        await process_impact_report_command(event, bot_token)
     else:
         raise ValueError(f"Unknown event type: {event_type}")
+
+
+async def _launch_agent_turn_mit(
+    prompt: str,
+    *,
+    channel_id: Optional[str],
+    thread_anchor_ts: str,
+    bot_token: Optional[str] = None,
+    user_id: Optional[str] = None,
+    scenario_id: Optional[str] = None,
+) -> None:
+    """MIT deployment's agent-turn launcher (registered with the
+    deployment-agnostic ``launch_agent_turn`` registry at import).
+
+    Feeds the rendered prompt as a synthetic USER turn through the SAME
+    direct-graph path a normal Slack message takes (``_handle_slack_message`` →
+    ``get_graph`` → ``graph.ainvoke`` → reply). Enqueues (does not call inline),
+    so the turn runs as the worker's next task and the agent's reply flows back
+    to Slack normally — in the user's language. Used by ``/make-impact-report``
+    and the post-upload tutorial. ``scenario_id`` is accepted for signature
+    parity with the cloud launcher; the per-(channel, thread) anchor already
+    scopes the run. The cloud counterpart (``runs.create``) lives in server.py.
+    """
+    synthetic_event = {
+        "type": "message",
+        "user": user_id or "system",
+        "channel": channel_id or "",
+        "ts": thread_anchor_ts,
+        "thread_ts": thread_anchor_ts,
+        "text": prompt,
+    }
+    TASK_QUEUE.put_nowait(
+        {"type": "slack_message", "event": synthetic_event, "bot_token": bot_token}
+    )
+
+
+# Register the MIT launcher with the deployment-agnostic registry at import.
+register_agent_launcher(_launch_agent_turn_mit)
 
 
 def _extract_message_content(message) -> str:
@@ -1128,7 +1188,32 @@ async def slack_event_from_router(req: Request, _: None = Depends(verify_request
     if not event_type:
         LOGGER.info("⏭️ No event_type, skipping")
         return {"ok": True}
-    
+
+    # ── File uploads (expert-assumption YAML) ──────────────────────────
+    # Two carriers: a ``file_shared`` event, OR a ``message`` with subtype
+    # file_share carrying a ``files`` array (the DM upload carrier). Route BOTH
+    # to the file_upload task → process_file_upload (the existing fail-closed
+    # ingest pipeline). ``claim_file_for_processing`` dedups by file_id so the
+    # same upload arriving as both carriers ingests exactly once. This wires the
+    # deployed MIT receiver to the file_upload _process_task branch above.
+    if event_type == "file_shared" or (
+        event_type == "message" and event.get("files")
+    ):
+        if event.get("bot_id"):
+            LOGGER.info("⏭️ File event from bot, skipping")
+            return {"ok": True}
+        file_id = await claim_file_for_processing(event)
+        if file_id:
+            LOGGER.info(
+                "🔀 Enqueuing router file_upload: file_id=%s, team=%s",
+                file_id,
+                team_id,
+            )
+            TASK_QUEUE.put_nowait(
+                {"type": "file_upload", "event": event, "bot_token": bot_token}
+            )
+        return {"ok": True}
+
     # Filter events
     if event_type not in ("message", "app_mention"):
         LOGGER.info("⏭️ Event type '%s' not handled, skipping", event_type)
@@ -1165,6 +1250,38 @@ async def slack_event_from_router(req: Request, _: None = Depends(verify_request
         "bot_token": bot_token,
     })
     
+    return {"ok": True}
+
+
+@APP.post("/slack/command")
+async def slack_command_from_router(req: Request, _: None = Depends(verify_request)):
+    """Multi-tenant router → agent slash-command endpoint.
+
+    The slack-router forwards slash commands here (slack-router
+    router.py:forward_command → ``{agent}/slack/command``) as JSON
+    ``{team_id, command, data, bot_token}``. NOTE: ``forward_command`` carries
+    ``bot_token`` in the BODY (it does NOT send the ``X-Slack-Bot-Token`` header
+    that the event path does), so we read it from the body — reading the header
+    here would yield ``None`` and silently route every command's agent turn with
+    the single-tenant env token. Maps the command to its task via the shared
+    builders and enqueues it; the worker runs it through ``_process_task``.
+    """
+    body = await req.json()
+    bot_token = body.get("bot_token")
+    command = body.get("command")
+    data = body.get("data") or {}
+    LOGGER.info(
+        "🔀 Router-forwarded command: %s, team=%s", command, body.get("team_id")
+    )
+    if command == "/make-impact-report":
+        task = build_impact_report_task(data, bot_token=bot_token)
+    elif command == "/assumptions":
+        task = build_assumptions_task(data, bot_token=bot_token)
+    else:
+        LOGGER.info("⏭️ Unknown forwarded command, skipping: %s", command)
+        return {"ok": True}
+    if task is not None:
+        TASK_QUEUE.put_nowait(task)
     return {"ok": True}
 
 
