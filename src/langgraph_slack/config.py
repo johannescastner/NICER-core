@@ -73,19 +73,13 @@ CONFIG = environ.get("CONFIG") or "{}"
 DEPLOYMENT_URL = environ.get("DEPLOYMENT_URL", "")
 SLACK_CHANNEL_ID = environ.get("SLACK_CHANNEL_ID")
 
-# Unit 4 — uploader authorization. Comma-separated allowlist of Slack
-# channel IDs permitted to upload expert-assumption YAML via the
-# file_shared ingest path. FAIL-CLOSED: unset/empty ⇒ NO uploads
-# accepted (must be set explicitly at client onboarding). Dedicated var,
-# NOT overloading SLACK_CHANNEL_ID (that is the bot's callback channel —
-# a distinct policy; conflating them couples two concerns). Structural
-# comma-split (same idiom as pro/superset/boot/register_bigquery.py:96
-# et al.) — no regex, no string matching.
-SLACK_FILE_UPLOAD_CHANNEL_ALLOWLIST = frozenset(
-    c.strip()
-    for c in (environ.get("SLACK_FILE_UPLOAD_CHANNEL_ALLOWLIST") or "").split(",")
-    if c.strip()
-)
+# Unit 4 — uploader authorization. RETIRED 2026-05-25: the static channel
+# allowlist (``SLACK_FILE_UPLOAD_CHANNEL_ALLOWLIST``) is replaced by Superset
+# edit-rights authorization keyed on the uploader's email — see
+# ``pro/slack_app/superset_authz.py`` and ``file_upload._uploader_authorized``.
+# Authorization now derives from the SAME RBAC the client already manages in
+# Superset (the people with editing rights), not a separately-maintained env var.
+# The deploy may drop the SLACK_FILE_UPLOAD_CHANNEL_ALLOWLIST env (now ignored).
 
 # Google Cloud project details
 PROJECT_ID = environ.get("GCP_PROJECT_ID", "default_project_id")
