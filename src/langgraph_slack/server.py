@@ -88,8 +88,23 @@ from src.langgraph_slack.contextual_message import (  # noqa: E402
     resolve_user_mentions,
 )
 
-# Interrupt/resume: Slack thread_ts → {thread_id, channel_id, bot_token, ...}
+# Interrupt/resume: REAL Slack message ts → {thread_id, channel_id, bot_token, ...}
+# (keyed on the real posted ts, never a fabricated anchor — see _valid_slack_ts).
 _INTERRUPT_THREAD_MAP: dict[str, dict[str, Any]] = {}
+# DM fallback: channel_id → the pending interrupt's real posted ts. A 1:1 DM
+# reply is top-level (no thread_ts) so it can't match the ts-keyed map; resume by
+# channel (DM-only). Mirrors server_mit (the two server modules are deliberate
+# deployment variants that each carry their own copies of these helpers).
+_CHANNEL_PENDING_INTERRUPT: dict[str, str] = {}
+
+
+def _valid_slack_ts(ts) -> bool:
+    """True iff ``ts`` is a real Slack message timestamp (``<digits>.<digits>``);
+    a fabricated/synthetic anchor is NOT and must never be sent to Slack. Regex-free."""
+    if not isinstance(ts, str) or "." not in ts:
+        return False
+    whole, _, frac = ts.partition(".")
+    return whole.isdigit() and frac.isdigit()
 
 class SlackMessageData(TypedDict):
     user: str
@@ -152,8 +167,15 @@ async def _process_task(task: dict):
 
         # ═══ Check if this is a reply to an interrupted (paused) graph ═══
         parent_ts = event.get("thread_ts")
+        resume_key = None
         if parent_ts and parent_ts in _INTERRUPT_THREAD_MAP:
-            mapping = _INTERRUPT_THREAD_MAP[parent_ts]
+            resume_key = parent_ts  # threaded reply matches the real posted ts
+        elif not parent_ts and _is_dm(event):
+            # 1:1 DM top-level reply resumes the channel's pending interrupt
+            # (DM-only; a shared channel relies on the thread-ts match above).
+            resume_key = _CHANNEL_PENDING_INTERRUPT.get(event["channel"])
+        if resume_key and resume_key in _INTERRUPT_THREAD_MAP:
+            mapping = _INTERRUPT_THREAD_MAP[resume_key]
             resume_thread_id = mapping["thread_id"]
             user_reply = (event.get("text") or "").strip()
             effective_token = mapping.get("bot_token") or bot_token
@@ -168,14 +190,14 @@ async def _process_task(task: dict):
                     "answers": [user_reply],
                     "status": "answered",
                     "responders": [{"id": event.get("user", "")}],
-                    "thread_ts": parent_ts,
+                    "thread_ts": resume_key,
                 }},
                 config={**GRAPH_CONFIG},
                 metadata={
                     "event": "slack",
                     "channel_id": channel_id,
                     "channel": channel_id,
-                    "thread_ts": parent_ts,
+                    "thread_ts": resume_key,
                     "event_ts": event["ts"],
                     "bot_token": effective_token,
                     "resume": True,
@@ -382,14 +404,27 @@ async def _process_task(task: dict):
                 else:
                     client = APP_HANDLER.app.client
 
-                await client.chat_postMessage(channel=cb_channel, thread_ts=thread_ts, text=question)
-
-                _INTERRUPT_THREAD_MAP[thread_ts] = {
-                    "thread_id": cb_thread_id,
-                    "channel_id": cb_channel,
-                    "bot_token": cb_token,
-                }
-                LOGGER.info("[%s] Interrupt stored: %s → %s", cb_channel, thread_ts, cb_thread_id)
+                # SINK GUARD: never send a fabricated/synthetic ts to Slack
+                # (Slack rejects a non-numeric thread_ts). Post un-threaded if the
+                # metadata thread_ts is our synthetic anchor; capture the REAL
+                # posted ts and key the resume map on THAT, never the anchor.
+                resp = await client.chat_postMessage(
+                    channel=cb_channel,
+                    thread_ts=thread_ts if _valid_slack_ts(thread_ts) else None,
+                    text=question,
+                )
+                posted_thread_ts = (resp.get("ts") if resp else None) or (
+                    thread_ts if _valid_slack_ts(thread_ts) else None
+                )
+                if posted_thread_ts:
+                    _INTERRUPT_THREAD_MAP[posted_thread_ts] = {
+                        "thread_id": cb_thread_id,
+                        "channel_id": cb_channel,
+                        "bot_token": cb_token,
+                    }
+                    # DM fallback: a 1:1 top-level reply resumes by channel.
+                    _CHANNEL_PENDING_INTERRUPT[cb_channel] = posted_thread_ts
+                LOGGER.info("[%s] Interrupt stored: %s → %s", cb_channel, posted_thread_ts, cb_thread_id)
             return
 
         state_values = event["values"]
@@ -443,7 +478,13 @@ async def _process_task(task: dict):
                 },
             )
             
-        # Clean up any stale interrupt mapping for this thread
+        # Clean up the interrupt mapping for this conversation. The map is now
+        # keyed on the REAL posted ts (not the anchor in `thread_ts` here), so
+        # clean up via the channel-pending pointer; also pop the anchor key
+        # defensively (legacy / no-op).
+        real_pending = _CHANNEL_PENDING_INTERRUPT.pop(channel_id, None)
+        if real_pending:
+            _INTERRUPT_THREAD_MAP.pop(real_pending, None)
         if thread_ts:
             _INTERRUPT_THREAD_MAP.pop(thread_ts, None)
 

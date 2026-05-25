@@ -135,6 +135,12 @@ from langgraph.types import Command
 # Slack thread_ts → graph resume metadata. Single-instance safe.
 # For multi-instance Cloud Run, move to Redis or Postgres.
 _INTERRUPT_THREAD_MAP: Dict[str, Dict[str, Any]] = {}
+# DM fallback: channel_id → the real posted ts of its pending interrupt. A 1:1 DM
+# reply is a TOP-LEVEL message (no thread_ts), so it cannot match the ts-keyed map
+# above; we resume the conversation's pending interrupt by channel. Used ONLY for
+# DMs at the resume site (a shared channel uses thread-ts matching, to avoid
+# resuming on an unrelated message).
+_CHANNEL_PENDING_INTERRUPT: Dict[str, str] = {}
 
 async def _detect_interrupt(graph, config: dict) -> tuple[bool, Any]:
     """
@@ -172,18 +178,26 @@ async def _handle_interrupt(
     else:
         question = str(payload) if payload else "I need some clarification before I can continue."
 
-    await _send_slack_response(
+    # Post the question; capture the REAL posted ts (Slack's response). The
+    # passed-in thread_ts may be our synthetic anchor (impact-<scenario>), which
+    # _send_slack_response drops at the sink — so we key the resume map on the
+    # real posted ts, NEVER the anchor (the 2026-05-25 fabricated-id bug).
+    posted_ts = await _send_slack_response(
         channel_id=channel_id, thread_ts=thread_ts,
         text=question, bot_token=bot_token,
     )
 
-    _INTERRUPT_THREAD_MAP[thread_ts] = {
-        "thread_id": thread_id,
-        "channel_id": channel_id,
-        "bot_token": bot_token,
-        "graph_config": graph_config,
-    }
-    LOGGER.info("[%s] Interrupt: thread_ts=%s → thread_id=%s", channel_id, thread_ts, thread_id)
+    key = posted_ts or (thread_ts if _valid_slack_ts(thread_ts) else None)
+    if key:
+        _INTERRUPT_THREAD_MAP[key] = {
+            "thread_id": thread_id,
+            "channel_id": channel_id,
+            "bot_token": bot_token,
+            "graph_config": graph_config,
+        }
+        # DM fallback: a 1:1 top-level reply resumes by channel (see resume site).
+        _CHANNEL_PENDING_INTERRUPT[channel_id] = key
+    LOGGER.info("[%s] Interrupt: posted_ts=%s → thread_id=%s", channel_id, key, thread_id)
     return True
 
 async def _resume_interrupted_graph(
@@ -244,6 +258,7 @@ async def _resume_interrupted_graph(
 
         # Done — clean up and send result
         _INTERRUPT_THREAD_MAP.pop(parent_ts, None)
+        _CHANNEL_PENDING_INTERRUPT.pop(channel_id, None)
 
         messages = result.get("messages", [])
         if messages:
@@ -257,6 +272,7 @@ async def _resume_interrupted_graph(
 
     except asyncio.TimeoutError:
         _INTERRUPT_THREAD_MAP.pop(parent_ts, None)
+        _CHANNEL_PENDING_INTERRUPT.pop(channel_id, None)
         await _send_slack_response(
             channel_id=channel_id, thread_ts=parent_ts,
             text="Sorry, the resumed work timed out.",
@@ -265,6 +281,7 @@ async def _resume_interrupted_graph(
     except Exception as exc:
         LOGGER.exception("[%s] Resume failed: %s", channel_id, exc)
         _INTERRUPT_THREAD_MAP.pop(parent_ts, None)
+        _CHANNEL_PENDING_INTERRUPT.pop(channel_id, None)
         await _send_slack_response(
             channel_id=channel_id, thread_ts=parent_ts,
             text="Sorry, something went wrong while continuing.",
@@ -625,9 +642,17 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
 
     # ═══ Check if this is a reply to an interrupted (paused) graph ═══
     parent_ts = event.get("thread_ts")
+    resume_key = None
     if parent_ts and parent_ts in _INTERRUPT_THREAD_MAP:
+        resume_key = parent_ts  # threaded reply matches the real posted ts
+    elif not parent_ts and _is_dm(event):
+        # 1:1 DM: a top-level reply (no thread_ts) answers the conversation's
+        # pending interrupt. Channel-scoped, DM-only (a shared channel relies on
+        # thread-ts matching above so an unrelated message can't resume).
+        resume_key = _CHANNEL_PENDING_INTERRUPT.get(event["channel"])
+    if resume_key and resume_key in _INTERRUPT_THREAD_MAP:
         await _resume_interrupted_graph(
-            event, _INTERRUPT_THREAD_MAP[parent_ts], parent_ts, bot_token,
+            event, _INTERRUPT_THREAD_MAP[resume_key], resume_key, bot_token,
         )
         return
     
@@ -887,28 +912,49 @@ async def _handle_callback(event: dict):
     )
 
 
+def _valid_slack_ts(ts) -> bool:
+    """True iff ``ts`` is a real Slack message timestamp (``<digits>.<digits>``).
+
+    A real Slack ts comes FROM DATA — the inbound event or a post's API response.
+    A fabricated/synthetic value (our ``impact-<scenario>`` langgraph checkpointer
+    anchor) is NOT a Slack ts and must never be sent as ``thread_ts`` (Slack
+    rejects it: ``invalid_thread_ts``). Regex-free (workspace rule)."""
+    if not isinstance(ts, str) or "." not in ts:
+        return False
+    whole, _, frac = ts.partition(".")
+    return whole.isdigit() and frac.isdigit()
+
+
 async def _send_slack_response(
     channel_id: str,
-    thread_ts: str,
+    thread_ts: Optional[str],
     text: str,
     bot_token: Optional[str] = None,
-):
-    """Send a response to Slack.
-    
+) -> Optional[str]:
+    """Send a response to Slack; RETURN the posted message's real ts (or None).
+
+    SINK GUARD (2026-05-25): ``thread_ts`` is forwarded to Slack ONLY if it is a
+    real Slack ts (``_valid_slack_ts``); a fabricated/synthetic anchor is dropped
+    and the message is posted un-threaded — Slack rejects a non-numeric
+    ``thread_ts`` (``invalid_thread_ts``, the ask_human-undeliverable bug). The
+    returned real ts is what callers key the interrupt-resume map on — never the
+    anchor. See memory feedback_never_fabricate_external_ids.
+
     Catches Slack API errors to prevent cascading failures. If this function
     is called from an error handler (e.g. to send "Sorry, an error occurred"),
     a Slack API failure here must NOT raise — otherwise the outer handler
     would try to send yet another error message, which also fails, etc.
     """
     cleaned_text = _clean_markdown(text)
-    
+    safe_thread_ts = thread_ts if _valid_slack_ts(thread_ts) else None
+
     try:
         if bot_token:
             # Multi-tenant: use workspace-specific token
             LOGGER.info(
                 "[%s].[%s] Using router-provided bot_token for response",
                 channel_id,
-                thread_ts,
+                safe_thread_ts,
             )
             client = AsyncWebClient(token=bot_token)
         else:
@@ -916,24 +962,29 @@ async def _send_slack_response(
             LOGGER.info(
                 "[%s].[%s] Using APP_HANDLER client (no bot_token provided)",
                 channel_id,
-                thread_ts,
+                safe_thread_ts,
             )
             client = APP_HANDLER.app.client
-        
-        await client.chat_postMessage(
+
+        resp = await client.chat_postMessage(
             channel=channel_id,
-            thread_ts=thread_ts,
+            thread_ts=safe_thread_ts,
             text=cleaned_text,
         )
-        
-        LOGGER.info("[%s].[%s] ✅ Sent message to Slack (%d chars)", channel_id, thread_ts, len(cleaned_text))
+
+        LOGGER.info("[%s].[%s] ✅ Sent message to Slack (%d chars)", channel_id, safe_thread_ts, len(cleaned_text))
+        try:
+            return resp.get("ts")  # the REAL posted ts — for interrupt-map keying
+        except Exception:
+            return None
     except Exception as slack_err:
         # Log but do NOT re-raise — this prevents cascading failures
         # when error handlers call _send_slack_response to notify the user.
         LOGGER.error(
             "[%s].[%s] ❌ Failed to send Slack message (%d chars): %s",
-            channel_id, thread_ts, len(cleaned_text), slack_err,
+            channel_id, safe_thread_ts, len(cleaned_text), slack_err,
         exc_info=True)
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
