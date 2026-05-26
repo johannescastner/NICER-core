@@ -297,8 +297,12 @@ async def _resume_interrupted_graph(
     # UX: as the SAME agent, thank the human for the unblocking answer + warn that
     # work is now underway and will take a bit — BEFORE the (multi-minute) resumed
     # work, grounded on what the agent is ACTUALLY doing (its recent working
-    # context). Best-effort; never block the resume. _send_slack_response guards
-    # the thread_ts (real ts → threaded under the question; else un-threaded).
+    # context). Best-effort; never block the resume. The response thread is the
+    # USER'S reply context (_reply_thread_ts: top-level in a DM; the reply's
+    # thread in a channel) — NOT parent_ts, which is the agent's question ts =
+    # the interrupt LOOKUP KEY; threading the ack/report under the question hid
+    # them in a DM (bug #2). Lookup-key ≠ response-thread.
+    reply_ts = _reply_thread_ts(event)
     _working_ctx = []
     try:
         _st = await get_graph(DEFAULT_GRAPH).aget_state(graph_config)
@@ -307,7 +311,7 @@ async def _resume_interrupted_graph(
         _working_ctx = []
     await _post_resume_ack(
         channel_id=channel_id,
-        thread_ts=parent_ts,
+        thread_ts=reply_ts,
         bot_token=effective_token,
         user_reply=user_reply,
         question=mapping.get("question"),
@@ -346,7 +350,7 @@ async def _resume_interrupted_graph(
         # Check for another interrupt (follow-up question)
         did_interrupt = await _handle_interrupt(
             graph, mapping["thread_id"],
-            channel_id, parent_ts, effective_token, graph_config,
+            channel_id, reply_ts, effective_token, graph_config,
         )
         if did_interrupt:
             return
@@ -360,7 +364,7 @@ async def _resume_interrupted_graph(
             content = _extract_message_content(messages[-1])
             await _send_slack_response(
                 channel_id=channel_id,
-                thread_ts=parent_ts,
+                thread_ts=reply_ts,
                 text=_get_text(content),
                 bot_token=effective_token,
             )
@@ -369,7 +373,7 @@ async def _resume_interrupted_graph(
         _INTERRUPT_THREAD_MAP.pop(parent_ts, None)
         _CHANNEL_PENDING_INTERRUPT.pop(channel_id, None)
         await _send_slack_response(
-            channel_id=channel_id, thread_ts=parent_ts,
+            channel_id=channel_id, thread_ts=reply_ts,
             text="Sorry, the resumed work timed out.",
             bot_token=effective_token,
         )
@@ -378,7 +382,7 @@ async def _resume_interrupted_graph(
         _INTERRUPT_THREAD_MAP.pop(parent_ts, None)
         _CHANNEL_PENDING_INTERRUPT.pop(channel_id, None)
         await _send_slack_response(
-            channel_id=channel_id, thread_ts=parent_ts,
+            channel_id=channel_id, thread_ts=reply_ts,
             text="Sorry, something went wrong while continuing.",
             bot_token=effective_token,
         )
@@ -1009,7 +1013,10 @@ async def _handle_callback(event: dict):
 
 # Single source of truth for "is this a real Slack ts?" — shared by every Slack
 # post sink (server_mit, server, reflective ack) so the rule cannot drift.
-from pro.slack_app.slack_ts import valid_slack_ts as _valid_slack_ts  # noqa: E402
+from pro.slack_app.slack_ts import (  # noqa: E402
+    valid_slack_ts as _valid_slack_ts,
+    reply_thread_ts as _reply_thread_ts,
+)
 
 
 async def _send_slack_response(
@@ -1184,7 +1191,7 @@ async def lifespan(app: FastAPI):
         # Post-startup setup (non-blocking)
         async def _post_startup_setup():
             try:
-                if os.getenv("AMBIENT_CRON_ENABLED", "true").lower() in {"1", "true", "yes", "y"}:
+                if os.getenv("AMBIENT_CRON_ENABLED", "false").lower() in {"1", "true", "yes", "y"}:  # Bundle D #7: align with cron_lifecycle.py:34 — default OFF; explicit opt-in required to avoid the disabled-branch cleanup hitting a non-functional SDK client in MIT mode (no LangGraph Cloud loopback)
                     await ensure_ambient_cron_exists()
                     LOGGER.info("✅ ensure_ambient_cron_exists finished")
             except Exception:

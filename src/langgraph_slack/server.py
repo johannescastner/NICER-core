@@ -100,7 +100,10 @@ _CHANNEL_PENDING_INTERRUPT: dict[str, str] = {}
 
 # Single source of truth for "is this a real Slack ts?" — shared by every Slack
 # post sink (server, server_mit, reflective ack) so the rule cannot drift.
-from pro.slack_app.slack_ts import valid_slack_ts as _valid_slack_ts  # noqa: E402
+from pro.slack_app.slack_ts import (  # noqa: E402
+    valid_slack_ts as _valid_slack_ts,
+    reply_thread_ts,
+)
 
 
 async def _post_resume_ack(channel_id, thread_ts, bot_token, user_reply, question=None):
@@ -218,9 +221,16 @@ async def _process_task(task: dict):
 
             LOGGER.info("[%s] Resuming interrupted run thread_id=%s", channel_id, resume_thread_id)
 
+            # The RESPONSE thread is the user's reply context (reply_thread_ts) —
+            # NOT resume_key (the agent's question ts = the interrupt LOOKUP KEY),
+            # which would thread the ack/report under the agent's own message and
+            # hide it in a DM (bug #2). resume_key stays the lookup key + the
+            # resume-payload correlation id; reply_ts drives every Slack POST.
+            reply_ts = reply_thread_ts(event)
+
             # UX: thank the user + say we're continuing, BEFORE the long resumed run.
             await _post_resume_ack(
-                channel_id, resume_key, effective_token, user_reply,
+                channel_id, reply_ts, effective_token, user_reply,
                 question=mapping.get("question"),
             )
 
@@ -238,7 +248,7 @@ async def _process_task(task: dict):
                     "event": "slack",
                     "channel_id": channel_id,
                     "channel": channel_id,
-                    "thread_ts": resume_key,
+                    "thread_ts": reply_ts,
                     "event_ts": event["ts"],
                     "bot_token": effective_token,
                     "resume": True,
@@ -674,7 +684,7 @@ async def lifespan(app: FastAPI):
         async def _post_startup_setup():
             try:
                 # Gate with env so you can disable quickly if needed.
-                if os.getenv("AMBIENT_CRON_ENABLED", "true").lower() in {"1","true","yes","y"}:
+                if os.getenv("AMBIENT_CRON_ENABLED", "false").lower() in {"1","true","yes","y"}:  # Bundle D #7: align with cron_lifecycle.py:34 — default OFF; explicit opt-in required to avoid the disabled-branch cleanup hitting a non-functional SDK client in MIT mode (no LangGraph Cloud loopback)
                     await ensure_ambient_cron_exists()
                     LOGGER.info("✅ ensure_ambient_cron_exists finished")
                 else:
