@@ -635,7 +635,9 @@ async def _process_task(task: dict):
     LOGGER.info("📋 Processing task: type=%s, event_channel=%s", event_type, event.get("channel"))
     
     if event_type == "slack_message":
-        await _handle_slack_message(event, bot_token)
+        await _handle_slack_message(
+            event, bot_token, scenario_id=task.get("scenario_id"),
+        )
     elif event_type == "callback":
         await _handle_callback(event)
     elif event_type == "file_upload":
@@ -676,8 +678,12 @@ async def _launch_agent_turn_mit(
     so the turn runs as the worker's next task and the agent's reply flows back
     to Slack normally — in the user's language. Used by ``/make-impact-report``
     and the post-upload tutorial. ``scenario_id`` is accepted for signature
-    parity with the cloud launcher; the per-(channel, thread) anchor already
-    scopes the run. The cloud counterpart (``runs.create``) lives in server.py.
+    parity with the cloud launcher AND propagated through `_process_task` →
+    `_handle_slack_message` → `graph_config["configurable"]["scenario_id"]` so
+    every downstream consumer (`record_prior_result`, `_grounding_finalizer`'s
+    completeness ledger, the swarm's per-turn scoping) can read it. Cloud
+    parity: ``server.py:997-998``. The cloud counterpart (``runs.create``)
+    lives in server.py.
     """
     synthetic_event = {
         "type": "message",
@@ -687,9 +693,12 @@ async def _launch_agent_turn_mit(
         "thread_ts": thread_anchor_ts,
         "text": prompt,
     }
-    TASK_QUEUE.put_nowait(
-        {"type": "slack_message", "event": synthetic_event, "bot_token": bot_token}
-    )
+    TASK_QUEUE.put_nowait({
+        "type": "slack_message",
+        "event": synthetic_event,
+        "bot_token": bot_token,
+        "scenario_id": scenario_id,
+    })
 
 
 # Register the MIT launcher with the deployment-agnostic registry at import.
@@ -715,12 +724,24 @@ def _extract_message_content(message) -> str:
         return str(message)
 
 
-async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str]):
+async def _handle_slack_message(
+    event: SlackMessageData,
+    bot_token: Optional[str],
+    *,
+    scenario_id: Optional[str] = None,
+):
     """
     Handle a Slack message by invoking the graph directly.
-    
+
     This replaces the langgraph_sdk.runs.create() call with direct graph invocation.
     LangSmith tracing is added for observability (optional but recommended).
+
+    ``scenario_id`` (Bundle A keystone, 2026-05-26): when provided by an
+    upstream launcher (`_launch_agent_turn_mit` → `_process_task` → here), it
+    is threaded into ``graph_config["configurable"]["scenario_id"]`` so that
+    downstream consumers (`record_prior_result`, `_grounding_finalizer`'s
+    completeness ledger, the swarm's per-turn scoping) can read it from the
+    run-configurable plane. Mirrors cloud parity at ``server.py:997-998``.
     """
     LOGGER.info("🔔 _handle_slack_message ENTERED: user=%s, channel=%s, bot_token=%s",
                 event.get("user"), event.get("channel"), bool(bot_token))
@@ -775,6 +796,9 @@ async def _handle_slack_message(event: SlackMessageData, bot_token: Optional[str
             "thread_ts": event.get("thread_ts") or event["ts"],
         }
     }
+    # Bundle A keystone (cloud parity: server.py:997-998).
+    if scenario_id:
+        graph_config["configurable"]["scenario_id"] = scenario_id
 
     # ════════════════════════════════════════════════════════════════════
     # PR5 (Bug E, 2026-05-12): compute turn_number from checkpointer

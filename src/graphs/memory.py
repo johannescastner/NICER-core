@@ -58,7 +58,7 @@ from langgraph.store.base.batch import (
 )
 from langmem import create_manage_memory_tool, create_search_memory_tool
 
-from pro.canonical.bq_batch import merge_upsert_json_rows
+from src.canonical.bq_batch import merge_upsert_json_rows
 
 
 import src.langgraph_slack.patch_typing  # must run before any Pydantic model loading
@@ -226,7 +226,7 @@ def _embed_cache_put(model: str, text: str, embedding):
 # should mirror each other. Both now import from pro.http.retry_after.
 # Module-level alias preserves the existing
 # ``_parse_embed_retry_after`` name for any external references.
-from pro.http.retry_after import parse_retry_after as _parse_embed_retry_after
+from src.http.retry_after import parse_retry_after as _parse_embed_retry_after
 
 
 # Upper bound on a single Retry-After wait for Modal embedding.
@@ -1239,9 +1239,14 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         content_field: str,
         content_model: Optional[Type[BaseModel]] = None,
         schema: Optional[List[bigquery.SchemaField]] = None,
+        bq_client: Optional[bigquery.Client] = None,
         **kwargs,
     ) -> "BigQueryMemoryStore":
-        bq_client = get_bq_client()
+        # b65ed6bf (consolidation, not a third copy): accept an INJECTED client
+        # (e.g. a CW-SA-credentialed, location-matched client) instead of always
+        # using the module-default tenant client; callers needing the central
+        # store reuse this whole builder rather than reimplementing its body.
+        bq_client = bq_client if bq_client is not None else get_bq_client()
 
         # =====================================================================
         # FIX: Detect the dataset's ACTUAL location and use a location-matched
@@ -2230,3 +2235,69 @@ async def get_memory_tools(
         tools.append(search_tool)
 
     return tools
+
+# ── agent-q Piece-4 store-builder seam (NICER-core public seam) ───────────────────────
+class EmbeddingDimMismatchError(RuntimeError):
+    """Raised at agent-q store construction when the store's embedding dim differs
+    from the dim of the existing BQ rows (prevents silent cross-dim vector pollution)."""
+
+
+def _agentq_cw_client():
+    """CW-credentialed, location-matched BigQuery client from ENV
+    (GCP_SERVICE_ACCOUNT_BASE64 -> SA creds; AGENTQ_MEMORY_PROJECT/DATASET overrides).
+    Realizes the b65ed6bf credentials injection for the public agent-q deployment."""
+    import base64 as _b64, json as _json, os as _os
+    from google.oauth2 import service_account as _sa
+    sa_b64 = _os.environ.get("GCP_SERVICE_ACCOUNT_BASE64")
+    if not sa_b64:
+        raise RuntimeError("GCP_SERVICE_ACCOUNT_BASE64 not set (agent-q CW memory store)")
+    info = _json.loads(_b64.b64decode(sa_b64))
+    creds = _sa.Credentials.from_service_account_info(info)
+    project = _os.environ.get("AGENTQ_MEMORY_PROJECT") or info.get("project_id")
+    dataset = _os.environ.get("AGENTQ_MEMORY_DATASET", "agent_system_memory")
+    client = bigquery.Client(credentials=creds, project=project)
+    ds = client.get_dataset("%s.%s" % (project, dataset))
+    if client.location != ds.location:
+        client = bigquery.Client(credentials=creds, project=project, location=ds.location)
+    return client, dataset
+
+
+def _agentq_dim_guard(store, client, project: str, dataset: str, table_name: str) -> None:
+    """Probe ONE existing row's embedding length; raise EmbeddingDimMismatchError if
+    it differs from this store's embedding dim. No-op on empty table / probe error."""
+    try:
+        sql = ("SELECT ARRAY_LENGTH(embedding) AS d FROM `%s.%s.%s` "
+               "WHERE embedding IS NOT NULL LIMIT 1" % (project, dataset, table_name))
+        rows = list(client.query(sql).result())
+    except Exception:
+        return
+    if not rows or rows[0]["d"] is None:
+        return
+    probe_dim = len(store.vectorstore.embedding.embed_query("__dim_probe__"))
+    if rows[0]["d"] != probe_dim:
+        raise EmbeddingDimMismatchError(
+            "%s: existing embedding dim %s != store dim %s"
+            % (table_name, rows[0]["d"], probe_dim)
+        )
+
+
+def _build_agentq_store(table_name: str):
+    client, dataset = _agentq_cw_client()
+    cf = CONTENT_FIELDS[table_name]
+    store = BigQueryMemoryStore.from_client(
+        dataset_name=dataset, table_name=table_name, content_field=cf,
+        content_model=PYDANTIC_MODELS[cf], schema=SCHEMAS[table_name], bq_client=client,
+    )
+    _agentq_dim_guard(store, client, client.project, dataset, table_name)
+    return store
+
+
+def build_agentq_semantic_store():
+    """Public NICER-core seam: the CW semantic store agent-q reads preferences from."""
+    return _build_agentq_store(SEMANTIC_TABLE)
+
+
+def build_agentq_episodic_store():
+    """Public NICER-core seam: the CW episodic store agent-q writes completed-command
+    episodes to."""
+    return _build_agentq_store(EPISODIC_TABLE)
