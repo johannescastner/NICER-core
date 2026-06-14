@@ -28,6 +28,7 @@ from typing import (
     Sequence,
     AsyncIterator,
     Iterator,
+    NamedTuple,
     overload
 )
 from pydantic import BaseModel, model_validator
@@ -1201,12 +1202,23 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
     # Keep this False so BaseStore.put enforces correctness.
     supports_ttl: bool = False
 
+    # Typed ontological discriminator for the three distinct memory kinds.
+    # content_field is the BQ RECORD column name ("fact"/"episode"/"procedure");
+    # memory_kind is the ONTOLOGICAL kind that affordance-branching keys on.
+    _CONTENT_FIELD_TO_KIND = {
+        "fact": "semantic",
+        "episode": "episodic",
+        "procedure": "procedural",
+    }
+    _VALID_MEMORY_KINDS = frozenset({"semantic", "episodic", "procedural"})
+
     def __init__(
         self,
         vectorstore: PatchedBigQueryVectorStore,
         content_field: str,
         content_model: Optional[Type[BaseModel]] = None,
         schema: Optional[List[bigquery.SchemaField]] = None,
+        memory_kind: Optional[str] = None,
     ):
         # AsyncBatchedBaseStore expects to be constructed inside a running
         # event loop. When we build this store in a worker thread (via
@@ -1230,6 +1242,20 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         self.content_field = content_field
         self.content_model = content_model
         self.schema = schema
+        # Typed ontological discriminator (canonical-9 fidelity round-2 fix:
+        # bug_kind=brittle_enumeration_vs_invariant). Derived from content_field
+        # when not supplied, so existing NICER-core / agent-q callers are
+        # unaffected. An EXPLICIT out-of-vocabulary kind fails loudly (no silent
+        # default); an un-derivable content_field with no explicit kind leaves
+        # None (backward-compatible — the episodic affordance simply does not
+        # fire, exactly as the old content_field!="episode" branch behaved).
+        kind = memory_kind if memory_kind is not None else self._CONTENT_FIELD_TO_KIND.get(content_field)
+        if kind is not None and kind not in self._VALID_MEMORY_KINDS:
+            raise ValueError(
+                f"memory_kind must be one of {sorted(self._VALID_MEMORY_KINDS)}; "
+                f"got {kind!r} (memory_kind={memory_kind!r}, content_field={content_field!r})"
+            )
+        self.memory_kind = kind
 
     @classmethod
     def from_client(
@@ -1415,8 +1441,10 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
 
         actual_content = raw_content
 
-        # Episodic-specific: extract or generate timestamp.
-        if self.content_field == "episode":
+        # Episodic-specific: extract or generate timestamp. Keyed on the TYPED
+        # ontological kind (canonical-9 fidelity round-2 fix), not the
+        # content_field string — the affordance belongs to the episodic KIND.
+        if self.memory_kind == "episodic":
             if isinstance(raw_content, dict) and "episode" in raw_content:
                 actual_content = raw_content["episode"]
                 if "timestamp" in raw_content:
@@ -2147,31 +2175,29 @@ async def _build_store_in_thread(
     return await loop.run_in_executor(_MEMORY_STORE_EXECUTOR, _builder)
 
 #---------------------------------get memory tools--------------------------------
-async def get_memory_tools(
-    namespace_templates: Dict[str, NamespaceTemplate]
-) -> List:
+class MemoryBundle(NamedTuple):
+    """In-process result-container (value-object) carrying the langmem tool list
+    together with the 3 distinct ``BigQueryMemoryStore`` instances they were built
+    over. NOT a persisted entity — it exists only to surface the 3 stores to the
+    ``pre_model_hook`` factory at the call site WITHOUT changing
+    ``get_memory_tools``' frozen ``List`` return. Replaces what would otherwise be
+    an untyped ``(tools, sem, epi, proc)`` tuple."""
+    tools: list
+    semantic_store: "BigQueryMemoryStore"
+    episodic_store: "BigQueryMemoryStore"
+    procedural_store: "BigQueryMemoryStore"
+
+
+async def _build_three_stores():
+    """Construct the 3 physically-distinct memory stores ONCE, in worker threads,
+    so the synchronous BigQuery dataset/table validation runs off the main event
+    loop (LangGraph dev's blocking-call detector). Returns
+    ``(semantic_store, episodic_store, procedural_store)``.
+
+    Lifted out of ``get_memory_tools`` so ``get_memory_tools`` and
+    ``get_memory_tools_and_stores`` share ONE construction path (zero duplication).
     """
-    Create pairs of (manage, search) memory tools for each namespace template.
-
-    Args:
-      namespace_templates: a dict where
-         - key = tool‐base‐name (e.g. "semantic", "episodic", "procedural", or anything you choose)
-         - value = a NamespaceTemplate tuple, e.g.
-             ("metadata", "{object_type}", "{langgraph_auth_user_id}", "{object_name}")
-
-    Returns:
-      A list of all created tools (both manage_* and search_*).
-    """
-    tools: List = []
-
-    # Build all three stores in worker threads so that the synchronous
-    # BigQuery API calls (dataset/table validation) do not block the
-    # main asyncio event loop under LangGraph dev.
-    (
-        semantic_memory_store,
-        episodic_memory_store,
-        procedural_memory_store,
-    ) = await asyncio.gather(
+    return await asyncio.gather(
         _build_store_in_thread(
             table_name=SEMANTIC_TABLE,
             content_field=CONTENT_FIELDS[SEMANTIC_TABLE],
@@ -2191,6 +2217,18 @@ async def get_memory_tools(
             schema=SCHEMAS[PROCEDURAL_TABLE],
         ),
     )
+
+
+def _build_tools_for(
+    namespace_templates: Dict[str, NamespaceTemplate],
+    semantic_memory_store: "BigQueryMemoryStore",
+    episodic_memory_store: "BigQueryMemoryStore",
+    procedural_memory_store: "BigQueryMemoryStore",
+) -> list:
+    """The per-namespace (manage, search) tool-pairing loop lifted out of
+    ``get_memory_tools``. Pure store-dispatch + create_manage/create_search; no
+    I/O (the 3 stores are constructed by ``_build_three_stores`` and passed in)."""
+    tools: list = []
     # 2. For each namespace_template, build both a manage‐tool and a search‐tool
     for base_key, ns_template in namespace_templates.items():
         # Determine which physical store to hook up. ``base_key`` may be the
@@ -2235,6 +2273,51 @@ async def get_memory_tools(
         tools.append(search_tool)
 
     return tools
+
+
+async def get_memory_tools(
+    namespace_templates: Dict[str, NamespaceTemplate]
+) -> List:
+    """
+    Create pairs of (manage, search) memory tools for each namespace template.
+
+    Args:
+      namespace_templates: a dict where
+         - key = tool‐base‐name (e.g. "semantic", "episodic", "procedural", or anything you choose)
+         - value = a NamespaceTemplate tuple, e.g.
+             ("metadata", "{object_type}", "{langgraph_auth_user_id}", "{object_name}")
+
+    Returns:
+      A list of all created tools (both manage_* and search_*).
+
+    SIGNATURE + List return UNCHANGED — the body now delegates to the shared
+    ``_build_three_stores`` + ``_build_tools_for`` helpers (construct-ONCE; the 3
+    stores are discarded here, exactly as before). All existing callers are
+    byte-for-byte unaffected.
+    """
+    sem, epi, proc = await _build_three_stores()
+    return _build_tools_for(namespace_templates, sem, epi, proc)
+
+
+async def get_memory_tools_and_stores(
+    namespace_templates: Dict[str, NamespaceTemplate]
+) -> MemoryBundle:
+    """Like ``get_memory_tools`` but ALSO surfaces the 3 underlying stores.
+
+    Shares the SAME ``_build_three_stores`` + ``_build_tools_for`` construction
+    path as ``get_memory_tools`` (no second construction, no duplication). The 3
+    distinct stores are needed by the ``pre_model_hook`` factory (one closure over
+    3 physically-distinct ``BigQueryMemoryStore`` instances), which ``create_react_agent``'s
+    single-``store`` slot cannot carry. Returns a typed ``MemoryBundle``.
+    """
+    sem, epi, proc = await _build_three_stores()
+    tools = _build_tools_for(namespace_templates, sem, epi, proc)
+    return MemoryBundle(
+        tools=tools,
+        semantic_store=sem,
+        episodic_store=epi,
+        procedural_store=proc,
+    )
 
 # ── agent-q Piece-4 store-builder seam (NICER-core public seam) ───────────────────────
 class EmbeddingDimMismatchError(RuntimeError):

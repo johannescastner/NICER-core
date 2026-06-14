@@ -656,6 +656,15 @@ async def _process_task(task: dict):
             process_impact_report_command,
         )
         await process_impact_report_command(event, bot_token)
+    elif event_type == "modal_assumption_write":
+        # Slack-modal assumption submit (Part 3, §12.2). Heavy work — BQ
+        # write + propose_priors + concept resolution — runs here off the
+        # 3 s ack path. ``event`` carries view + scenario_id + slack_user_id
+        # + channel_id (built by _make_modal_task).
+        from pro.slack_app.modal_assumption import (
+            process_modal_assumption_write,
+        )
+        await process_modal_assumption_write(event, bot_token)
     else:
         raise ValueError(f"Unknown event type: {event_type}")
 
@@ -1451,6 +1460,142 @@ async def slack_command_from_router(req: Request, _: None = Depends(verify_reque
         return {"ok": True}
     if task is not None:
         TASK_QUEUE.put_nowait(task)
+    return {"ok": True}
+
+
+def _make_modal_task(
+    view: dict,
+    *,
+    scenario_id: Optional[str],
+    slack_user_id: Optional[str],
+    channel_id: Optional[str],
+    bot_token: Optional[str],
+) -> dict:
+    """Single typed constructor for the ``modal_assumption_write`` task.
+
+    ``_process_task`` reads ``task["event"]`` UNCONDITIONALLY (server_mit.py
+    ``_process_task``), so a task missing ``"event"`` would ``KeyError`` before
+    any branch and the write would be silently lost after the user already saw
+    ``response_action:"clear"``. Routing every enqueue through this constructor
+    makes ``"event"`` (and the fields the worker needs — including ``channel_id``
+    for the agent-rendered async failure notice) STRUCTURALLY always present.
+    """
+    return {
+        "type": "modal_assumption_write",
+        "event": {
+            "view": view,
+            "scenario_id": scenario_id,
+            "slack_user_id": slack_user_id,
+            "channel_id": channel_id,
+        },
+        "bot_token": bot_token,
+    }
+
+
+@APP.post("/slack/interaction")
+async def slack_interaction_from_router(
+    req: Request, _: None = Depends(verify_request)
+):
+    """Multi-tenant router → agent modal-submit endpoint (Part 3, §12.3).
+
+    The slack-router forwards a ``view_submission`` here as JSON
+    ``{team_id, view, slack_user_id, bot_token}`` (the router cannot import
+    ``pro``, so this agent endpoint is the SOLE Pydantic validation authority).
+    Synchronous path (within Slack's 3 s ack): (1) validate the view into a
+    ``TenantAssumption``; (2) authorize the submitter (Superset edit-rights,
+    fail-closed — A4 parity with the YAML upload path, file_upload.py:423-424);
+    (3) enqueue the heavy BQ write OFF the hot path. Returns ``{ok, errors}``
+    which the router maps to ``response_action`` (errors → keep the modal open
+    with inline field errors; clear → close).
+
+    i18n: inline modal ``response_action:errors`` are SYNCHRONOUS — the agent
+    turn that would render them in the user's language is async, so sync
+    field/auth errors carry typed v0 messages. The ASYNC worker failure notice
+    IS agent-rendered (``pro.slack_app.modal_assumption``).
+    """
+    body = await req.json()
+    bot_token = body.get("bot_token")
+    view = body.get("view") or {}
+    slack_user_id = body.get("slack_user_id")
+
+    from pydantic import ValidationError
+    from slack_sdk.web.async_client import AsyncWebClient
+
+    from pro.assumptions.schema import TenantAssumption
+    from pro.assumptions.sources.slack_modal import (
+        _pydantic_to_block_errors,
+        prepare_modal_fields,
+    )
+    from pro.slack_app.file_upload import _resolve_uploader_identity
+    from pro.slack_app.superset_authz import email_has_edit_rights
+
+    # (1) Pydantic validation — the sole verifier-in-loop. ``prepare_modal_fields``
+    # is the SHARED field-prep (also used by the async worker via
+    # ``build_modal_envelope``), so the sync gate and the worker agree — incl.
+    # the blank-ref tenant pre-fill (the sync gate never rejects what the worker
+    # would have accepted).
+    fields = prepare_modal_fields(view, slack_user_id)
+    try:
+        TenantAssumption(**fields)
+    except ValidationError as exc:
+        return {"ok": False, "errors": _pydantic_to_block_errors(exc)}
+
+    # (2) Authorization — fail-closed, A4 parity with the YAML path.
+    client = AsyncWebClient(token=bot_token)
+    email, _locale = await _resolve_uploader_identity(client, slack_user_id)
+    if not (email and await email_has_edit_rights(email)):
+        # i18n-exempt: a sync modal response_action:errors must return within
+        # Slack's 3 s ack, so this denial cannot be agent-rendered in the
+        # user's language (v0 limitation — the async YAML upload-denial notice
+        # IS locale-aware). Keyed to the id block so the modal stays open.
+        return {
+            "ok": False,
+            "errors": {
+                "assumption_id": (
+                    "Not authorized to add assumptions — ask an editor "
+                    "for access."
+                ),
+            },
+        }
+
+    # (3) scenario_id is carried in private_metadata (set at modal-open from the
+    # slash-command text; ``/add-assumption`` with no argument yields an EMPTY
+    # scenario). build_modal_envelope REQUIRES it (A3 identity) and would raise
+    # in the ASYNC worker AFTER the modal already cleared — a confusing
+    # close-then-fail for a problem detectable HERE. Reject synchronously so the
+    # modal stays open (i18n-exempt, like the auth denial above). A forged/
+    # version-skewed private_metadata that is a non-string truthy value (raw dict,
+    # number, list) makes json.loads raise TypeError, NOT JSONDecodeError — catch
+    # BOTH so a hostile payload degrades to meta={} (→ no scenario → clean
+    # field-error) instead of escaping as a 500. The isinstance(meta, dict) guard
+    # below then handles a well-formed-JSON-but-non-object value (e.g. "5", "[]").
+    try:
+        meta = json.loads(view.get("private_metadata") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        meta = {}
+    scenario_id = meta.get("scenario_id") if isinstance(meta, dict) else None
+    if not (isinstance(scenario_id, str) and scenario_id.strip()):
+        return {
+            "ok": False,
+            "errors": {
+                "assumption_id": (
+                    "No scenario selected — reopen the form with "
+                    "/add-assumption <scenario> and try again."
+                ),
+            },
+        }
+
+    # (4) Authorized + valid + scenario present → enqueue the heavy write off
+    # the 3 s path.
+    TASK_QUEUE.put_nowait(
+        _make_modal_task(
+            view,
+            scenario_id=scenario_id.strip(),
+            slack_user_id=slack_user_id,
+            channel_id=meta.get("channel_id"),
+            bot_token=bot_token,
+        )
+    )
     return {"ok": True}
 
 
