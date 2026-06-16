@@ -972,6 +972,7 @@ async def _launch_agent_turn_cloud(
     bot_token: Optional[str] = None,
     user_id: Optional[str] = None,
     scenario_id: Optional[str] = None,
+    run_purpose: Optional[str] = None,
 ) -> None:
     """Cloud (LangGraph Platform) agent-turn launcher: feed the rendered prompt
     as a ``user`` turn via ``LANGGRAPH_CLIENT.runs.create``; the reply flows
@@ -996,6 +997,10 @@ async def _launch_agent_turn_cloud(
     updated_config["configurable"]["conversation_id"] = conversation_id
     if scenario_id:
         updated_config["configurable"]["scenario_id"] = scenario_id
+    # v9 (impact_report_runorigin_launch_path_v3): cloud parity with server_mit B2.f — run_purpose
+    # rides config["configurable"], carried natively into the run by runs.create(config=updated_config).
+    if run_purpose:
+        updated_config["configurable"]["run_purpose"] = run_purpose
 
     run_metadata = {
         "event": "slack",
@@ -1011,6 +1016,10 @@ async def _launch_agent_turn_cloud(
     }
     if scenario_id:
         run_metadata["scenario_id"] = scenario_id
+    # v9 (impact_report_runorigin_launch_path_v3): mirror run_purpose into run_metadata too (cloud
+    # parity with scenario_id), so the cloud run carries it on both the config + metadata planes.
+    if run_purpose:
+        run_metadata["run_purpose"] = run_purpose
     if effective_bot_token:
         run_metadata["bot_token"] = effective_bot_token
 

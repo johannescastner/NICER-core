@@ -637,6 +637,7 @@ async def _process_task(task: dict):
     if event_type == "slack_message":
         await _handle_slack_message(
             event, bot_token, scenario_id=task.get("scenario_id"),
+            run_purpose=task.get("run_purpose"),
         )
     elif event_type == "callback":
         await _handle_callback(event)
@@ -677,6 +678,7 @@ async def _launch_agent_turn_mit(
     bot_token: Optional[str] = None,
     user_id: Optional[str] = None,
     scenario_id: Optional[str] = None,
+    run_purpose: Optional[str] = None,
 ) -> None:
     """MIT deployment's agent-turn launcher (registered with the
     deployment-agnostic ``launch_agent_turn`` registry at import).
@@ -707,6 +709,10 @@ async def _launch_agent_turn_mit(
         "event": synthetic_event,
         "bot_token": bot_token,
         "scenario_id": scenario_id,
+        # v9 (impact_report_runorigin_launch_path_v3): carry run_purpose on the SECOND task
+        # (the slack_message hop) so _process_task -> _handle_slack_message can place it on the
+        # run-configurable plane. Mirrors scenario_id exactly.
+        "run_purpose": run_purpose,
     })
 
 
@@ -738,6 +744,7 @@ async def _handle_slack_message(
     bot_token: Optional[str],
     *,
     scenario_id: Optional[str] = None,
+    run_purpose: Optional[str] = None,
 ):
     """
     Handle a Slack message by invoking the graph directly.
@@ -808,6 +815,11 @@ async def _handle_slack_message(
     # Bundle A keystone (cloud parity: server.py:997-998).
     if scenario_id:
         graph_config["configurable"]["scenario_id"] = scenario_id
+    # v9 (impact_report_runorigin_launch_path_v3): place run_purpose on the run-configurable plane so
+    # origin_payload_fields (read inside the run via get_config()) stamps it on every cognitive_decisions
+    # row of this run. Cloud parity: server.py B2.g.
+    if run_purpose:
+        graph_config["configurable"]["run_purpose"] = run_purpose
 
     # ════════════════════════════════════════════════════════════════════
     # PR5 (Bug E, 2026-05-12): compute turn_number from checkpointer
