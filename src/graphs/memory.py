@@ -356,6 +356,25 @@ async def _async_modal_post_with_retry(client, url: str, payload: dict):
     raise RuntimeError("Modal embed retry loop exhausted without exception")
 
 
+# Known embedding dimensions per model — the typed invariant the memory vector
+# columns are bound to (the bge-base corpus is 768-dim). An embedding that is
+# empty or the wrong length must NEVER propagate to a write: BigQuery
+# VECTOR_SEARCH requires a uniform column dimension, so a single 0-dim (or
+# wrong-dim) row makes the ENTIRE store's recall 400. (2026-07-18: 2 episodic +
+# 1 procedural atoms were written with a 0-dim embedding and broke episodic/
+# procedural recall.) Fail closed at the parse seam every embed path funnels
+# through.
+_MODEL_EMBEDDING_DIMS = {"bge-base": 768, "minilm": 384}
+
+
+class EmbeddingDimensionError(ValueError):
+    """An embedding is empty or not the model's expected dimension.
+
+    Raised at generation time so a corrupt vector can never be persisted to the
+    BQ vector column (which would break VECTOR_SEARCH uniformity for the store).
+    """
+
+
 class ModalEmbeddings(Embeddings):
     """
     LangChain-compatible embeddings wrapper that calls Modal endpoints.
@@ -538,29 +557,53 @@ class ModalEmbeddings(Embeddings):
     # RESPONSE PARSING (shared by sync/async)
     # =========================================================================
     
+    def _validated_embedding(self, vec, *, context: str) -> list:
+        """Fail closed unless ``vec`` is a non-empty vector of the model's
+        expected dimension. The single decidable gate that stops an empty or
+        wrong-dimension embedding from ever being written to the vector column."""
+        if not isinstance(vec, (list, tuple)) or len(vec) == 0:
+            raise EmbeddingDimensionError(
+                f"{context}: embedding generation returned an empty/invalid vector "
+                f"for model {self.model!r} (type={type(vec).__name__}, "
+                f"len={len(vec) if hasattr(vec, '__len__') else 'n/a'}). An empty "
+                f"embedding corrupts the BQ vector column — write refused.")
+        expected = _MODEL_EMBEDDING_DIMS.get(self.model)
+        if expected is not None and len(vec) != expected:
+            raise EmbeddingDimensionError(
+                f"{context}: embedding dimension {len(vec)} != expected {expected} "
+                f"for model {self.model!r}. A wrong-dimension vector breaks "
+                f"VECTOR_SEARCH uniformity — write refused.")
+        return list(vec)
+
     def _parse_batch_response(self, data) -> list[list[float]]:
-        """Parse batch embedding response from Modal."""
+        """Parse batch embedding response from Modal (fail-closed on bad dims)."""
         if isinstance(data, list):
-            return [
-                item.get("embedding", item) if isinstance(item, dict) else item 
+            vecs = [
+                item.get("embedding", item) if isinstance(item, dict) else item
                 for item in data
             ]
-        elif isinstance(data, dict):
-            if "embeddings" in data:
-                return data["embeddings"]
-            elif "results" in data:
-                return [r.get("embedding", r) for r in data["results"]]
-        logger.warning("Unexpected batch response format: %s", type(data))
-        return data
+        elif isinstance(data, dict) and "embeddings" in data:
+            vecs = data["embeddings"]
+        elif isinstance(data, dict) and "results" in data:
+            vecs = [r.get("embedding", r) for r in data["results"]]
+        else:
+            raise EmbeddingDimensionError(
+                f"batch embedding: unexpected response format {type(data).__name__} "
+                f"for model {self.model!r} — cannot extract embeddings; refusing to "
+                f"propagate (would risk persisting a malformed embedding).")
+        return [self._validated_embedding(v, context="batch embedding") for v in vecs]
     
     def _parse_single_response(self, data) -> list[float]:
-        """Parse single embedding response from Modal."""
+        """Parse single embedding response from Modal (fail-closed on bad dims)."""
         if isinstance(data, dict) and "embedding" in data:
-            return data["embedding"]
+            vec = data["embedding"]
         elif isinstance(data, list):
-            return data
-        logger.warning("Unexpected single response format: %s", type(data))
-        return data
+            vec = data
+        else:
+            raise EmbeddingDimensionError(
+                f"single embedding: unexpected response format {type(data).__name__} "
+                f"for model {self.model!r} — refusing to propagate.")
+        return self._validated_embedding(vec, context="single embedding")
     
     # =========================================================================
     # CLEANUP
