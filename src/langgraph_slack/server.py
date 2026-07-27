@@ -191,6 +191,16 @@ async def worker():
 
 
 async def _process_task(task: dict):
+    # A/B/C blinded evaluation fan-out (no Slack "event" payload; handled first).
+    if task.get("type") == "eval_compare":
+        from pro.evaluation.server_integration import default_deps, run_eval_compare_task
+        try:
+            state = await run_eval_compare_task(task, deps=default_deps())
+            LOGGER.info("eval_compare %s -> %s", task.get("evaluation_id"), state)
+        except Exception:
+            LOGGER.exception("eval_compare task failed for %s", task.get("evaluation_id"))
+        return
+
     event = task["event"]
     event_type = task["type"]
     
@@ -913,6 +923,33 @@ async def slack_command_from_router(req: Request):
     if task is not None:
         TASK_QUEUE.put_nowait(task)
     return {"ok": True}
+
+
+@APP.post("/slack/eval-interaction")
+async def slack_eval_interaction(req: Request):
+    """A/B/C blinded-evaluation RATING submission, forwarded by the slack-router
+    under the signed B2 envelope. A DISTINCT path from the existing
+    ``/slack/interaction`` (assumptions modal): the evaluation endpoints
+    authenticate SOLELY via B2 and never consult the forgeable router header/UA
+    (§14.10). The RAW request bytes are digested BEFORE any parse (B2)."""
+    from fastapi.responses import JSONResponse
+    from pro.evaluation.server_integration import default_deps, handle_interaction
+    raw = await req.body()                       # exact original bytes (B2)
+    status, body = await handle_interaction(dict(req.headers), raw, deps=default_deps())
+    return JSONResponse(status_code=status, content=body)
+
+
+@APP.post("/slack/eval-compare")
+async def slack_eval_compare(req: Request):
+    """A/B/C blinded-evaluation COMPARISON entry, forwarded by the slack-router
+    under the signed B2 envelope. RAW bytes → ``admit_fan_out``; a newly-created
+    comparison enqueues one ``eval_compare`` fan-out task on the existing queue."""
+    from fastapi.responses import JSONResponse
+    from pro.evaluation.server_integration import default_deps, handle_eval_compare_ingress
+    raw = await req.body()                       # exact original bytes (B2)
+    deps = default_deps(enqueue=TASK_QUEUE.put_nowait)
+    status, body = await handle_eval_compare_ingress(dict(req.headers), raw, deps=deps)
+    return JSONResponse(status_code=status, content=body)
 
 
 @APP.post("/callbacks/{thread_id}")

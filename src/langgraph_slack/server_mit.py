@@ -628,6 +628,16 @@ async def worker():
 
 async def _process_task(task: dict):
     """Process a task from the queue."""
+    # A/B/C blinded evaluation fan-out (no Slack "event" payload; handled first).
+    if task.get("type") == "eval_compare":
+        from pro.evaluation.server_integration import default_deps, run_eval_compare_task
+        try:
+            state = await run_eval_compare_task(task, deps=default_deps())
+            LOGGER.info("eval_compare %s -> %s", task.get("evaluation_id"), state)
+        except Exception:
+            LOGGER.exception("eval_compare task failed for %s", task.get("evaluation_id"))
+        return
+
     event = task["event"]
     event_type = task["type"]
     bot_token: Optional[str] = task.get("bot_token")
@@ -1609,6 +1619,35 @@ async def slack_interaction_from_router(
         )
     )
     return {"ok": True}
+
+
+@APP.post("/slack/eval-interaction")
+async def slack_eval_interaction(req: Request):
+    """A/B/C blinded-evaluation RATING submission (DEPLOYED self-hosted server).
+    A DISTINCT path from ``/slack/interaction`` (assumptions modal, ``verify_request``):
+    the evaluation endpoints authenticate SOLELY via the B2 envelope and never
+    consult the forgeable router header / Slackbot UA (§14.10). The RAW request
+    bytes are digested BEFORE any parse (B2); all verification/authorization/
+    persistence is delegated to the reviewed stepped admission."""
+    from fastapi.responses import JSONResponse
+    from pro.evaluation.server_integration import default_deps, handle_interaction
+    raw = await req.body()                       # exact original bytes (B2)
+    status, body = await handle_interaction(dict(req.headers), raw, deps=default_deps())
+    return JSONResponse(status_code=status, content=body)
+
+
+@APP.post("/slack/eval-compare")
+async def slack_eval_compare(req: Request):
+    """A/B/C blinded-evaluation COMPARISON entry (DEPLOYED self-hosted server),
+    forwarded by the slack-router under the signed B2 envelope. RAW bytes →
+    ``admit_fan_out``; a newly-created comparison enqueues one ``eval_compare``
+    fan-out task on the existing queue. B2 only; never the forgeable header/UA."""
+    from fastapi.responses import JSONResponse
+    from pro.evaluation.server_integration import default_deps, handle_eval_compare_ingress
+    raw = await req.body()                       # exact original bytes (B2)
+    deps = default_deps(enqueue=TASK_QUEUE.put_nowait)
+    status, body = await handle_eval_compare_ingress(dict(req.headers), raw, deps=deps)
+    return JSONResponse(status_code=status, content=body)
 
 
 @APP.post("/callbacks/{thread_id}")
