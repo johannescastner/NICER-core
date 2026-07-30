@@ -1672,6 +1672,33 @@ async def slack_eval_compare(req: Request):
     return JSONResponse(status_code=status, content=body)
 
 
+@APP.post("/eval/external-answer")
+async def eval_external_answer(req: Request):
+    """A/B/C EXTERNAL-arm ANSWER submission (DEPLOYED self-hosted server).
+
+    Release contract §1 places Claude OUTSIDE Cloud Run — it answers in Johannes's own
+    session through its own Drive connector — so this is the ONLY surface over which arm
+    C's answer can enter. Without it the admission seam is unreachable, arm C can only
+    reach a terminal TIMEOUT, and every comparison refuses to publish.
+
+    NOT under ``/slack``: this submission does not come from Slack and is not forwarded by
+    the router. It carries its own destination-bound B2 envelope, so an envelope minted
+    for ``/slack/eval-compare`` or ``/slack/eval-interaction`` cannot be replayed here.
+    Like its two siblings it authenticates SOLELY via that envelope and never consults the
+    forgeable router header or Slackbot UA (§14.10), and the RAW request bytes are
+    digested BEFORE any parse.
+
+    No queue and no fan-out: admitting an answer creates no work — the comparison's own
+    fan-out picks it up when the arm reads it."""
+    from fastapi.responses import JSONResponse
+    from pro.evaluation.server_integration import (
+        default_deps, handle_external_answer_ingress)
+    raw = await req.body()                       # exact original bytes (B2)
+    status, body = await handle_external_answer_ingress(
+        dict(req.headers), raw, deps=default_deps())
+    return JSONResponse(status_code=status, content=body)
+
+
 @APP.post("/callbacks/{thread_id}")
 async def webhook_callback(req: Request):
     """Handle webhook callbacks (backward compatibility)."""
