@@ -1253,7 +1253,29 @@ async def lifespan(app: FastAPI):
                 LOGGER.exception("❌ Post-startup setup failed")
         
         asyncio.create_task(_post_startup_setup(), name="post_startup_setup")
-        
+
+        # A/B/C evaluation durability recovery — two recoveries of the same crash from
+        # the two durable substrates. `evaluation_task` records work a predecessor
+        # instance never finished (a Slack redelivery is REPLAY and can never re-enqueue
+        # it), and `evaluation_outbox` records events still owed to BigQuery. The work is
+        # blocking (psycopg), so it is offloaded to a thread; it never blocks or fails
+        # start-up — `recover_and_export` logs and swallows its own failures.
+        async def _recover_eval_durability():
+            try:
+                from pro.evaluation.server_integration import (
+                    default_deps, recover_and_export)
+                deps = default_deps(enqueue=TASK_QUEUE.put_nowait)
+                resumed, exported = await asyncio.to_thread(
+                    recover_and_export, deps=deps,
+                    locked_by=f"startup:{os.environ.get('K_REVISION', 'local')}")
+                LOGGER.info("✅ eval recovery: %d task(s) resumed, %d event(s) exported",
+                            resumed, exported)
+            except Exception:
+                LOGGER.exception("⚠️ eval durability recovery failed (non-fatal)")
+
+        asyncio.create_task(_recover_eval_durability(),
+                            name="recover_eval_durability")
+
         yield
         
     except Exception:
