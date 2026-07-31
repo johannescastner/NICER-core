@@ -1264,7 +1264,24 @@ async def lifespan(app: FastAPI):
             try:
                 from pro.evaluation.server_integration import (
                     default_deps, recover_and_export)
-                deps = default_deps(enqueue=TASK_QUEUE.put_nowait)
+                # `TASK_QUEUE` is an asyncio.Queue and `put_nowait` is NOT thread-safe,
+                # but `recover_and_export` runs in the worker thread below. Called from
+                # there it can append without ever waking this loop's waiting consumer,
+                # so recovered work sits in the queue undispatched — a silent recovery
+                # failure that looks exactly like "there was nothing to recover", which
+                # is precisely the outage shape 547dc56 added this block to end.
+                #
+                # SINK-ENUMERATED (the 3132fea lesson — sinks are plural; do not fix only
+                # the one in front of you): `put_nowait` has three call sites in this
+                # file; the other two are async route handlers already running ON this
+                # loop and are correct unchanged. Only this one crosses a thread boundary.
+                #
+                # The loop is captured HERE, on the loop thread, and the marshalling is
+                # folded into the SAME `default_deps(enqueue=...)` call — deliberately NOT
+                # a second construction site, the divergence this file has been bitten by.
+                loop = asyncio.get_running_loop()
+                deps = default_deps(
+                    enqueue=lambda t: loop.call_soon_threadsafe(TASK_QUEUE.put_nowait, t))
                 resumed, exported = await asyncio.to_thread(
                     recover_and_export, deps=deps,
                     locked_by=f"startup:{os.environ.get('K_REVISION', 'local')}")
@@ -1694,8 +1711,14 @@ async def eval_external_answer(req: Request):
     from pro.evaluation.server_integration import (
         default_deps, handle_external_answer_ingress)
     raw = await req.body()                       # exact original bytes (B2)
+    # `enqueue` passed EXACTLY as `/slack/eval-compare` passes it: an admitted answer
+    # RE-DISPATCHES its comparison, and without it the requeue hits its `enqueue is None`
+    # guard and silently does nothing — the answer lands, the submitter is told it was
+    # recorded, and the comparison still waits for a restart. The loop-marshalling that
+    # off-thread dispatch needs lives in the shared handler, so this route stays identical
+    # to its sibling rather than becoming a third way of building these deps.
     status, body = await handle_external_answer_ingress(
-        dict(req.headers), raw, deps=default_deps())
+        dict(req.headers), raw, deps=default_deps(enqueue=TASK_QUEUE.put_nowait))
     return JSONResponse(status_code=status, content=body)
 
 
