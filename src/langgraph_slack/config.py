@@ -108,10 +108,13 @@ except Exception as e:
     SERVICE_ACCOUNT_INFO = {}
     CREDENTIALS = None
 
-# ───────────────────── CollectiWise Central Service Account ─────────────────────
-CW_SERVICE_ACCOUNT_BASE64 = environ.get("CW_SERVICE_ACCOUNT_BASE64", "")
+# ───────────────────── Central (telemetry) Service Account ─────────────────────
+# The DEDICATED central key, if one is mounted, kept separate from the fallback below —
+# because whether the key is dedicated decides whether it may answer "which project is
+# central". A client key manifestly cannot.
+_DEDICATED_CW_SA_BASE64 = environ.get("CW_SERVICE_ACCOUNT_BASE64", "")
+CW_SERVICE_ACCOUNT_BASE64 = _DEDICATED_CW_SA_BASE64
 
-# Fallback logic with appropriate warnings
 if not CW_SERVICE_ACCOUNT_BASE64:
     CW_SERVICE_ACCOUNT_BASE64 = GCP_SERVICE_ACCOUNT_BASE64
     if GCP_SERVICE_ACCOUNT_BASE64:
@@ -120,21 +123,102 @@ if not CW_SERVICE_ACCOUNT_BASE64:
             "This is only valid for canary or dev deployments."
         )
 
-# Parse CollectiWise credentials
+# Parse the central credentials.
 try:
     if CW_SERVICE_ACCOUNT_BASE64:
         cw_service_account_json = base64.b64decode(CW_SERVICE_ACCOUNT_BASE64).decode("utf-8")
         CW_SERVICE_ACCOUNT_INFO: dict = json.loads(cw_service_account_json)
         CW_CREDENTIALS = service_account.Credentials.from_service_account_info(CW_SERVICE_ACCOUNT_INFO)
-        CW_PROJECT_ID = CW_SERVICE_ACCOUNT_INFO.get("project_id", "collectiwise-nicer")
     else:
         CW_SERVICE_ACCOUNT_INFO = {}
         CW_CREDENTIALS = None
-        CW_PROJECT_ID = "collectiwise-nicer"
 except Exception as e:
-    LOGGER.error("Failed to load CollectiWise central SA: %s", e, exc_info=True)
+    LOGGER.error("Failed to load central SA: %s", e, exc_info=True)
+    CW_SERVICE_ACCOUNT_INFO = {}
     CW_CREDENTIALS = None
-    CW_PROJECT_ID = "collectiwise-nicer"
+
+# ── WHICH PROJECT IS CENTRAL — declared, never guessed (checklist I1) ──────────────
+#
+# This was derived from the mounted key with a hardcoded fallback in THREE places. With one
+# central that was harmless. With two it misroutes, and silently: a deployment that failed
+# to mount its key would not fail — it would quietly become the other company and write its
+# telemetry into their project. A misroute that SUCCEEDS is strictly worse than one that
+# raises.
+#
+# Precedence, and why each step:
+#   1. CW_PROJECT_ID — an explicit declaration, always wins.
+#   2. a DEDICATED central key's own project_id — the established convention, and such a
+#      key genuinely identifies its project.
+#   3. nothing. NOT the client project and NOT a literal: when the "central" key is only
+#      the CLIENT key wearing a second hat (the fallback above), inferring from it makes
+#      central silently become the client. That is precisely the misroute, so it must be
+#      declared instead.
+#
+# Declaring the two EQUAL remains fully supported — same-SA mode is sanctioned, and the
+# controlling ruling permits central and client to resolve to one project — but it has to
+# be SAID (CW_PROJECT_ID=<the client project>), not inferred.
+_declared_central = environ.get("CW_PROJECT_ID", "").strip()
+_central_from_key = (
+    CW_SERVICE_ACCOUNT_INFO.get("project_id") if _DEDICATED_CW_SA_BASE64 else None
+)
+
+if _declared_central and _central_from_key and _declared_central != _central_from_key:
+    raise RuntimeError(
+        f"Central project mismatch: CW_PROJECT_ID={_declared_central!r} but the mounted "
+        f"CW_SERVICE_ACCOUNT_BASE64 belongs to {_central_from_key!r}. One of them is wrong, "
+        "and guessing which would route telemetry into a project nobody chose."
+    )
+
+CW_PROJECT_ID = _declared_central or _central_from_key
+
+if not CW_PROJECT_ID:
+    # Nothing declared, no dedicated key. TWO different situations reach here and only ONE
+    # is dangerous, so only that one fails.
+    #
+    # NOTE the scope: CREDENTIALS falling back to the client SA stays exactly as it was —
+    # that is documented production behaviour for the dual-SA manager. What is refused is
+    # inferring the central PROJECT from those borrowed credentials. Central telemetry is
+    # OUR data (cognitive_decisions, call_cost_metrics, dspy_*, …); a wrong central project
+    # writes it inside a CLIENT's project, which is the boundary the 2026-06-11 correction
+    # exists to protect.
+    if GCP_SERVICE_ACCOUNT_BASE64:
+        raise RuntimeError(
+            "The central project is undeclared while a CLIENT service account is mounted. "
+            "Set CW_PROJECT_ID, or mount a dedicated CW_SERVICE_ACCOUNT_BASE64 whose key "
+            "names it. Refusing to infer the central from client credentials, which would "
+            "silently make this client its own central and write our agent telemetry into "
+            "their project. If they ARE one project here, say so: CW_PROJECT_ID=<that "
+            "project>."
+        )
+    # No credentials at all: a test run, a lint pass, an import by tooling. Nothing can be
+    # written, so nothing can be misrouted, and importing must keep working — this module
+    # is imported well beyond the test suite (.claude hooks, scripts/), so a
+    # conftest-declared value (drive-ingest's answer to the same problem, which cost 28
+    # files' collection — docs/testing.md:102-105) would not reach every caller here.
+    # The client project is the honest placeholder: it names no company, unlike the
+    # literal this replaced.
+    CW_PROJECT_ID = PROJECT_ID
+    LOGGER.warning(
+        "⚠️  No central project declared and no service account mounted — using the client "
+        "project %r as central. Valid only where nothing is written; set CW_PROJECT_ID for "
+        "any real deployment.",
+        PROJECT_ID,
+    )
+
+# ── WHICH PROJECT OWNS THE SHARED WAREHOUSE — a SEPARATE question (checklist I2) ───
+#
+# Deliberately NOT derived from CW_PROJECT_ID. The geo warehouse is parked in ONE project
+# and read by every tenant; a second central does not get a copy of it (ruling G9 — Labbera
+# does not use geo at all). Deriving this from the central would point a second-central
+# deployment at a dataset that does not exist, turning a working cross-project read into a
+# 404. "Central" means two different things here — telemetry-central and warehouse-central —
+# and collapsing them is the bug, not the simplification.
+#
+# The default keeps today's behaviour for every existing deployment: where the warehouse is
+# unset, it is the central project, which is exactly what the old literal encoded.
+SHARED_WAREHOUSE_PROJECT = environ.get("SHARED_WAREHOUSE_PROJECT", "").strip() or CW_PROJECT_ID
+SHARED_WAREHOUSE_DATASET = environ.get(
+    "SHARED_WAREHOUSE_DATASET", "geospatial_knowledge_base").strip()
 
 # Location-aware dataset naming
 CENTRAL_DATASET_ID = f"agent_cognitive_processes_{BQ_DATASET_SUFFIX}"
