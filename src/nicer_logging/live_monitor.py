@@ -30,6 +30,12 @@ from google.cloud import bigquery
 from google.oauth2 import service_account
 import pandas as pd
 
+# The project comes from config, never a literal. This is the idiom the sibling
+# module in this same package already uses (conversation_logger.py:36 imports
+# PROJECT_ID and :232 defaults to it), so this follows the established pattern
+# rather than introducing a second one.
+from src.langgraph_slack.config import PROJECT_ID
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -38,8 +44,8 @@ logger = logging.getLogger(__name__)
 class ConversationMonitor:
     """Real-time conversation monitoring system."""
     
-    def __init__(self, 
-                 project_id: str = "datawarehouse-447422",
+    def __init__(self,
+                 project_id: str = PROJECT_ID or "",
                  dataset_id: str = "conversation_logs"):
         """Initialize the conversation monitor."""
         self.project_id = project_id
