@@ -59,6 +59,36 @@ LOCATION = environ.get("GCP_LOCATION", GCP_REGION)
 # New clients should set this to match their region (e.g. "us" for US clients).
 BQ_DATASET_SUFFIX = environ.get("BQ_DATASET_SUFFIX", "eu")
 
+# THE TENANT'S DRIVE CORPUS ROOT — the ADDRESS of the ingested corpus.
+#
+# The corpus catalog lives in the semantic-memory namespace
+# ("gcs_files", "{drive_root_folder_id}") (pro/datasources/corpus_catalog.py:29) and
+# the FileAgent resolves that template from the RUN CONFIG
+# (pro/agents/file_agent.py:223). When the run config omits it the template resolves
+# to a namespace nobody ever wrote to, so the agent searches an EMPTY corpus and
+# reports that it cannot access the files — with the data sitting right there.
+#
+# MEASURED 2026-08-12 on labbera-agentic: the catalog holds 1,579 rows under
+# gcs_files.1e8Sl6iRT-kDLYr1tp4d6Oa-Qx7h2-Liq (the registered Results_sample_20GB
+# root). The EVAL path reaches them because pro/evaluation/live_arms.py:198 passes
+# the id explicitly; the PRODUCT paths (POST /runs, and the Slack handler) never did.
+# So the corpus looked broken from the product and healthy from the eval.
+#
+# A DEPLOYMENT-LEVEL CONSTANT, not a per-request value: drive_root_folder_id is the
+# registered root that the writer populates and the reader checks, and that model is
+# single-tenant by construction (docs/corpus_manifest_contract.md) — the same shape as
+# SUPERSET_TENANT above. It therefore belongs here, resolved once, rather than being
+# threaded through every caller.
+#
+# EVAL_CORPUS_DRIVE_ROOT is accepted as a fallback because that is the name already
+# mounted on deployed services; DRIVE_ROOT_FOLDER_ID is the name to set going forward,
+# so the product does not depend on an eval-specific spelling.
+DRIVE_ROOT_FOLDER_ID = (
+    environ.get("DRIVE_ROOT_FOLDER_ID")
+    or environ.get("EVAL_CORPUS_DRIVE_ROOT")
+    or ""
+).strip()
+
 if DEPLOY_MODAL:
     if not environ.get("SLACK_BOT_TOKEN"):
         environ["SLACK_BOT_TOKEN"] = "fake-token"
