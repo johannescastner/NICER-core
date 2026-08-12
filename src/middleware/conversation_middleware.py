@@ -15,6 +15,7 @@ Design Philosophy:
 from __future__ import annotations
 import logging
 import time
+from collections.abc import Mapping
 from typing import Dict, Any, Optional
 from functools import lru_cache
 from langchain_core.messages import (
@@ -59,6 +60,42 @@ def _as_text(content: Any) -> str:
                 parts.append(str(c))
         return " ".join(p for p in parts if p)
     return str(content)
+
+
+# The reasoning field names, imported rather than restated: the capture side
+# (pro/ml_inference/qwen_tool_model.py) owns the definition, so the writer and
+# the reader cannot drift about what the field is called.
+from pro.ml_inference.qwen_tool_model import REASONING_KEYS
+
+
+def _extract_reasoning(message: Any) -> Optional[str]:
+    """The model's chain of thought for this turn, or None if it emitted none.
+
+    None must mean "the model did not reason", NEVER "we dropped it" — so this reads
+    every container a capture could plausibly have used and takes the first non-empty
+    string, instead of assuming one shape.
+
+    Why a capture is needed at all: langchain_openai lifts neither key into the
+    message. Its `_convert_dict_to_message` allowlist is function_call / tool_calls /
+    audio (chat_models/base.py:158-173) and the streaming
+    `_convert_delta_to_message_chunk` is narrower still (:332-346), so an unrecognised
+    field is discarded at conversion. The engine emits the reasoning, the gateway
+    forwards it, and it dies one step from here.
+    """
+    if message is None:
+        return None
+    for container in (
+        getattr(message, "additional_kwargs", None),
+        getattr(message, "response_metadata", None),
+        message if isinstance(message, dict) else None,
+    ):
+        if not isinstance(container, Mapping):
+            continue
+        for key in REASONING_KEYS:
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+    return None
 
 async def _log_turn_middleware(
     state: Dict[str, Any],
@@ -238,6 +275,12 @@ async def _log_turn_middleware(
             ),
             metadata=metadata,
             agent_name=agent_name,
+            # THE MODEL'S CHAIN OF THOUGHT, when it emitted one. A reasoning model
+            # returns its thinking separately from its answer, and a scientist must
+            # be able to reconstruct HOW a conclusion was reached — so the chain is
+            # persisted beside the answer instead of being dropped with the turn.
+            # None for models that emit none (deepseek-chat on chat_pro does not).
+            reasoning=_extract_reasoning(message_to_log),
             # Lightweight context for observability
             memory_token_length=len(str(messages)),
             full_context_content=str(messages[-3:]) if messages else None,

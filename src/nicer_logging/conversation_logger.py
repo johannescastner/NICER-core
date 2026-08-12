@@ -55,6 +55,17 @@ from src.graphs.memory import _embed_cache_get, _embed_cache_put
 # Set up logging
 logger = logging.getLogger(__name__)
 
+# The bound on a stored chain of thought. NOT a chosen ceiling — BigQuery's
+# streaming-insert row limit is the real constraint, and left unbounded ONE
+# pathological chain fails the insert and loses the WHOLE TURN, answer included.
+# 1 MiB of characters leaves ample room for the other 29 columns inside that
+# limit. Deliberately NOT the 12,000-char CONVERSATION_MAX_CONTENT_CHARS applied
+# to `content`: reasoning is routinely longer than the answer it produced, and
+# this column exists so a conclusion can be reconstructed later. Truncation, if
+# it ever happens, is recorded in metadata under `truncation_reasoning` — silently
+# clipped provenance is provenance nobody can trust.
+_REASONING_MAX_CHARS = 1_048_576
+
 
 # Bounded executor for conversation-logger telemetry writes (BQ inserts +
 # error logging). Mirrors PR-A0-3a / PR-A0-3e / PR-A0-3f pattern with
@@ -169,6 +180,11 @@ class ConversationTurn:
     error_details: Optional[Dict[str, Any]] = None
     # Context tracking
     memory_token_length: Optional[int] = None
+    # The model's chain of thought for this turn, when the served engine emits one
+    # (vLLM exposes it under ``reasoning`` with a --reasoning-parser). Stored so a
+    # scientist can reconstruct HOW a conclusion was reached, months later.
+    # None means the model emitted no reasoning, never that one was discarded.
+    reasoning: Optional[str] = None
     full_context_content: Optional[str] = None
     # 🎯 UNIVERSAL TONE ANALYSIS: Applied to every turn regardless of agent
     agent_name: Optional[str] = None
@@ -362,6 +378,7 @@ class ConversationLogger:
             memory_token_length: Optional[int] = None,
             full_context_content: Optional[str] = None,
             agent_name: Optional[str] = None,
+            reasoning: Optional[str] = None,
             *,
             turn_number: int,
     ) -> str:
@@ -384,8 +401,38 @@ class ConversationLogger:
             else content
         )
 
+        # THE CHAIN OF THOUGHT, bounded by what BigQuery can actually take —
+        # NOT by the 12,000-char content cap above. Reasoning is routinely longer
+        # than the answer it produced (MEASURED: 345 completion tokens for a
+        # two-line answer), and this column exists so a scientist can reconstruct
+        # how a conclusion was reached. Clipping it to the answer's budget would
+        # defeat that quietly.
+        #
+        # The bound that IS real: BigQuery's streaming-insert row limit. Left
+        # unbounded, one pathological chain fails the insert and loses the WHOLE
+        # TURN — answer included — which is far worse than a marked truncation.
+        # 1 MiB of characters leaves ample room for the other 29 columns inside
+        # that limit, so it is a resource bound rather than a chosen ceiling.
+        reasoning = reasoning or None
+        safe_reasoning = reasoning
+        reasoning_chars = len(reasoning) if reasoning else 0
+        if reasoning and reasoning_chars > _REASONING_MAX_CHARS:
+            safe_reasoning = reasoning[:_REASONING_MAX_CHARS]
+
         # Annotate truncation
         meta = dict(metadata or {})
+        if reasoning and len(safe_reasoning or "") != reasoning_chars:
+            # Named, because provenance that was silently clipped is provenance
+            # nobody can trust. A reader must be able to tell "this is all of it"
+            # from "this is the first megabyte of it".
+            try:
+                meta.setdefault("truncation_reasoning", {}).update({
+                    "field": "reasoning",
+                    "original_chars": reasoning_chars,
+                    "stored_chars": len(safe_reasoning or ""),
+                })
+            except Exception:  # noqa: BLE001 — annotation may never break logging
+                pass
         if original_chars != len(safe_content):
             try:
                 trunc = meta.setdefault("truncation", {})
@@ -439,6 +486,7 @@ class ConversationLogger:
             langsmith_trace_id=langsmith_trace_id,
             error_details=error_details or {},
             memory_token_length=memory_token_length,
+            reasoning=safe_reasoning,
             full_context_content=full_context_content,
             agent_name=tone_analysis.get("agent_name"),
             sentiment_score=tone_analysis.get("sentiment_score"),
