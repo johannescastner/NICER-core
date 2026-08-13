@@ -439,9 +439,22 @@ MODEL_PROVIDERS = {
         "supports_response_format": True,
     },
     "deepseek": {
-        "chat": "deepseek-chat",
-        "reasoning": "deepseek-reasoner",
-        "cheap": "deepseek-chat",
+        # EXPLICIT ids, never the legacy aliases. MEASURED against
+        # api.deepseek.com 2026-08-13: `GET /v1/models` now returns exactly
+        # ``deepseek-v4-flash`` and ``deepseek-v4-pro`` — the old line is retired —
+        # and BOTH legacy aliases silently resolve to the FLASH tier:
+        #     requested deepseek-chat      -> served as deepseek-v4-flash
+        #     requested deepseek-reasoner  -> served as deepseek-v4-flash
+        # So `deepseek-reasoner` stopped getting a reasoner, and chat_pro (the
+        # front-door ROUTER) and sql_agent were both downgraded to flash without a
+        # single line of our code changing. Confirmed live in production: the
+        # 2026-08-13 16:40Z chat_pro turn reports `model_name: deepseek-v4-flash`,
+        # and that turn NARRATED its handoff ("Let me send that over") with
+        # finish_reason=stop instead of emitting transfer_to_file_agent.
+        # An alias is a name the vendor may repoint; pin the id we actually want.
+        "chat": "deepseek-v4-pro",
+        "reasoning": "deepseek-v4-pro",
+        "cheap": "deepseek-v4-flash",
         "import_class": "ChatDeepSeek",
         "import_module": "langchain_deepseek",
         "api_key_env": "DEEPSEEK_API_KEY",
