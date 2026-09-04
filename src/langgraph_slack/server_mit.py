@@ -22,6 +22,7 @@ import src.langgraph_slack.patch_typing  # must run before any Pydantic model lo
 import os
 os.environ["LANGGRAPH_MIT_MODE"] = "true"
 import asyncio
+import time
 import logging
 import re
 import json
@@ -327,6 +328,12 @@ async def _resume_interrupted_graph(
 
     try:
         graph = get_graph(DEFAULT_GRAPH)
+
+        # Refresh the absolute lifecycle deadline for THIS resume invoke (same
+        # budget the asyncio.wait_for below enforces); the value stamped when
+        # the run was first invoked may be long past.
+        if isinstance(graph_config, dict):
+            graph_config.setdefault("configurable", {})["graph_deadline"] = time.monotonic() + GRAPH_TIMEOUT
 
         # Retry on stale DB connection (same pattern as _handle_slack_message)
         result = None
@@ -830,6 +837,10 @@ async def _handle_slack_message(
     # row of this run. Cloud parity: server.py B2.g.
     if run_purpose:
         graph_config["configurable"]["run_purpose"] = run_purpose
+    # The run's absolute lifecycle deadline (same budget the asyncio.wait_for
+    # below enforces) so in-run consumers — e.g. the FileAgent's endpoint
+    # readiness wait — share ONE budget instead of inventing a second timeout.
+    graph_config["configurable"]["graph_deadline"] = time.monotonic() + GRAPH_TIMEOUT
 
     # ════════════════════════════════════════════════════════════════════
     # PR5 (Bug E, 2026-05-12): compute turn_number from checkpointer
@@ -1754,6 +1765,9 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
     if "configurable" not in config_data:
         config_data["configurable"] = {}
     config_data["configurable"]["thread_id"] = thread_id
+    # Same absolute lifecycle deadline as the asyncio.wait_for below, so in-run
+    # consumers (e.g. the FileAgent's endpoint readiness wait) share ONE budget.
+    config_data["configurable"]["graph_deadline"] = time.monotonic() + GRAPH_TIMEOUT
     
     try:
         graph = get_graph(graph_name)
