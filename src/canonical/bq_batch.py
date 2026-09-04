@@ -245,10 +245,7 @@ def merge_upsert_json_rows(
         )
         bq.query(merge_stmt.sql(dialect="bigquery")).result()
     finally:
-        # DROP TABLE IF EXISTS staging via sqlglot AST.
-        drop_stmt = exp.Drop(
-            this=exp.to_table(staging_fqn, dialect="bigquery"),
-            kind="TABLE",
-            exists=True,
-        )
-        bq.query(drop_stmt.sql(dialect="bigquery")).result()
+        # Use BigQuery's native table-deletion API. Rendering this cleanup as
+        # SQL is unnecessary and, with the deployed sqlglot version, emitted
+        # ``DROP TABLE IF EXISTS`` without the table identifier.
+        bq.delete_table(staging_fqn, not_found_ok=True)
