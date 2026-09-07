@@ -841,6 +841,11 @@ async def _handle_slack_message(
     # below enforces) so in-run consumers — e.g. the FileAgent's endpoint
     # readiness wait — share ONE budget instead of inventing a second timeout.
     graph_config["configurable"]["graph_deadline"] = time.monotonic() + GRAPH_TIMEOUT
+    # MIT parity with cloud server.py: propagate conversation_id on the run
+    # config plane so inner swarm nodes can read it even after state channels
+    # are stripped at the langgraph_swarm boundary. turn_number is added below
+    # once it has been computed from the checkpointer.
+    graph_config["configurable"]["conversation_id"] = conversation_id
 
     # ════════════════════════════════════════════════════════════════════
     # PR5 (Bug E, 2026-05-12): compute turn_number from checkpointer
@@ -880,6 +885,10 @@ async def _handle_slack_message(
         exc_info=True)
         prior_turn = 0
     turn_number = prior_turn + 1
+    # MIT parity with cloud server.py: computed turn_number now travels on the
+    # run config plane so inner swarm nodes see the real turn after state
+    # channels are stripped at the langgraph_swarm boundary.
+    graph_config["configurable"]["turn_number"] = turn_number
 
     LOGGER.info(
         "[%s].[%s] 🚀 Invoking graph '%s' (turn %d) with message: %s...",
