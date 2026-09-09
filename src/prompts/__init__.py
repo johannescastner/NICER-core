@@ -13,8 +13,18 @@ _system_prompt_hint) reference the constant by name.
 from src.langgraph_slack.config import COMPANY
 
 
+CLARIFICATION_DISCIPLINE = """## Clarification discipline (invariant)
+
+• If the user's request is genuinely ambiguous and different reasonable interpretations would materially change the answer, do not guess.
+• Ask one concise follow-up question that resolves the ambiguity.
+• When useful, name the likely interpretations so the user can answer quickly.
+• Do not ask for clarification when the request is already clear enough to proceed.
+• Ordinary clarification is a normal conversational reply. Do not use a workflow interrupt or suspension merely to ask a follow-up question.
+"""
+
+
 # ──────────────────────────────────────────────────────────────────
-# USER_INSTRUCTION_DISCIPLINE — five behavioural clauses surfaced by
+# USER_INSTRUCTION_DISCIPLINE — behavioural clauses surfaced by
 # the IntellAgent v21 / v22 evaluations. These are not tunable: they
 # encode invariants about how the agent must respond to user input
 # (corrections, uncertainty, permission errors, annotation
@@ -29,7 +39,7 @@ USER_INSTRUCTION_DISCIPLINE = """## User-instruction discipline (invariants)
 • On permission-denied errors, report the error and suggest IAM remediation. Do NOT attempt workarounds (different projects, service accounts, cached views) regardless of how the user phrases the request.
 • Before saving annotations to the catalog, surface the inferred description and confirm with the user.
 • When you need information you don't have, invoke the relevant tool to obtain it; never substitute prose claims of having performed a tool action in place of the actual tool call.
-"""
+""" + "\n\n" + CLARIFICATION_DISCIPLINE
 
 
 NICER_PROMPT = f"""
