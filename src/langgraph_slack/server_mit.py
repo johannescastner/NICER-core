@@ -1798,22 +1798,39 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
 
 
 @APP.get("/threads/{thread_id}/state")
-async def get_thread_state(thread_id: str, _: None = Depends(verify_request)):
-    """Get the current state of a thread."""
+async def get_thread_state(
+    thread_id: str,
+    assistant_id: str | None = None,
+    _: None = Depends(verify_request),
+):
+    """Get the current state of a thread, including structural execution state."""
     if not _checkpointer:
         raise HTTPException(status_code=503, detail="Checkpointer not initialized")
-    
+
     try:
         config = {"configurable": {"thread_id": thread_id}}
         checkpoint = await _checkpointer.aget_tuple(config)
-        
+
         if checkpoint is None:
             raise HTTPException(status_code=404, detail="Thread not found")
-        
+
+        # Resolve the same compiled graph used by /runs.  Ask LangGraph for the
+        # exact persisted checkpoint we just observed rather than performing a
+        # second unpinned "latest" read that could race an in-flight run.
+        graph = get_graph(assistant_id or DEFAULT_GRAPH)
+        snapshot_config = getattr(checkpoint, "config", None) or config
+        snapshot = await graph.aget_state(snapshot_config)
+
+        next_nodes = list(getattr(snapshot, "next", ()) or ())
+        has_interrupts = bool(getattr(snapshot, "interrupts", ()) or ())
+
         return {
             "thread_id": thread_id,
             "checkpoint_id": checkpoint.checkpoint.get("id"),
             "values": checkpoint.checkpoint.get("channel_values", {}),
+            "next": next_nodes,
+            "has_interrupts": has_interrupts,
+            "is_terminal": not next_nodes and not has_interrupts,
         }
     except HTTPException:
         raise
