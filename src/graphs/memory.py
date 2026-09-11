@@ -1720,11 +1720,60 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         # Pass combined_sql as the ``filter`` arg — ``BigQueryVectorStore``'s
         # ``_create_filters`` treats non-dict filter values as a literal SQL
         # WHERE clause, which is exactly what we want.
-        hits = await loop.run_in_executor(
+        search_trace = uuid.uuid4().hex[:12]
+        submitted_at = time.monotonic()
+
+        logger.info(
+            "[asearch:vector] trace=%s executor-submit",
+            search_trace,
+        )
+
+        def _run_similarity_search():
+            worker_started_at = time.monotonic()
+
+            logger.info(
+                "[asearch:vector] trace=%s worker-start queue_ms=%.0f",
+                search_trace,
+                (worker_started_at - submitted_at) * 1000,
+            )
+
+            try:
+                result = self.vectorstore.similarity_search_with_score(
+                    query=query,
+                    filter=combined_sql,
+                    k=limit + offset,
+                )
+            except BaseException:
+                logger.exception(
+                    "[asearch:vector] trace=%s worker-failed elapsed_ms=%.0f",
+                    search_trace,
+                    (time.monotonic() - worker_started_at) * 1000,
+                )
+                raise
+
+            worker_finished_at = time.monotonic()
+
+            logger.info(
+                "[asearch:vector] trace=%s worker-complete elapsed_ms=%.0f hits=%d",
+                search_trace,
+                (worker_finished_at - worker_started_at) * 1000,
+                len(result),
+            )
+
+            return result, worker_finished_at
+
+        hits, worker_finished_at = await loop.run_in_executor(
             _MEMORY_STORE_EXECUTOR,
-            lambda: self.vectorstore.similarity_search_with_score(
-                query=query, filter=combined_sql, k=limit + offset
-            ),
+            _run_similarity_search,
+        )
+
+        resumed_at = time.monotonic()
+
+        logger.info(
+            "[asearch:vector] trace=%s await-resumed total_ms=%.0f resume_lag_ms=%.0f",
+            search_trace,
+            (resumed_at - submitted_at) * 1000,
+            (resumed_at - worker_finished_at) * 1000,
         )
         hits = hits[offset:]
 
