@@ -1755,6 +1755,94 @@ async def webhook_callback(req: Request):
 # Direct Graph Invocation Endpoints (new for MIT version)
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+
+async def _persist_thread_terminal_error(
+    checkpointer,
+    graph,
+    config,
+    error,
+) -> None:
+    """Persist a terminal error on every unfinished task in the exact snapshot.
+
+    LangGraph 0.6.x materializes the reserved ``__error__`` pending-write
+    channel as ``StateSnapshot.tasks[*].error``. This repository pins
+    LangGraph below 1.0 and regression-tests this exact installed behavior.
+
+    The server owns the outer GRAPH_TIMEOUT, so it must also make that timeout
+    durable; otherwise cancellation leaves ``snapshot.next`` populated with
+    ``task.error=None`` and reconnect can mistake a dead attempt for live work.
+    """
+    if checkpointer is None:
+        return
+
+    checkpoint = await checkpointer.aget_tuple(config)
+    if checkpoint is None:
+        return
+
+    snapshot_config = getattr(checkpoint, "config", None) or config
+    snapshot = await graph.aget_state(snapshot_config)
+
+    error_text = (
+        repr(error)
+        if isinstance(error, BaseException)
+        else str(error)
+    )
+
+    for task in tuple(getattr(snapshot, "tasks", ()) or ()):
+        if getattr(task, "error", None) is not None:
+            continue
+
+        task_id = getattr(task, "id", None)
+        if not task_id:
+            continue
+
+        await checkpointer.aput_writes(
+            snapshot_config,
+            [("__error__", error_text)],
+            task_id=task_id,
+        )
+
+
+def _thread_state_terminal_metadata(snapshot):
+    """Interpret one persisted LangGraph snapshot for reconnect recovery."""
+    tasks = tuple(getattr(snapshot, "tasks", ()) or ())
+
+    task_error = next(
+        (
+            getattr(task, "error", None)
+            for task in tasks
+            if getattr(task, "error", None) is not None
+        ),
+        None,
+    )
+
+    if task_error is not None:
+        return {
+            "status": "failed",
+            "error": str(task_error),
+            "is_terminal": True,
+        }
+
+    next_nodes = tuple(getattr(snapshot, "next", ()) or ())
+    has_interrupts = bool(
+        getattr(snapshot, "interrupts", ()) or ()
+    )
+
+    if not next_nodes and not has_interrupts:
+        return {
+            "status": "completed",
+            "error": None,
+            "is_terminal": True,
+        }
+
+    return {
+        "status": "running",
+        "error": None,
+        "is_terminal": False,
+    }
+
+
 @APP.post("/runs")
 async def create_run(req: Request, _: None = Depends(verify_request)):
     """
@@ -1791,7 +1879,20 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
             "values": result,
         }
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail=f"Request timed out after {GRAPH_TIMEOUT}s")
+        detail = f"Request timed out after {GRAPH_TIMEOUT}s"
+        try:
+            await _persist_thread_terminal_error(
+                _checkpointer,
+                graph,
+                config_data,
+                TimeoutError(detail),
+            )
+        except Exception:
+            LOGGER.exception(
+                "Failed to persist terminal timeout for thread %s",
+                thread_id,
+            )
+        raise HTTPException(status_code=504, detail=detail)
     except Exception as e:
         LOGGER.exception("Run failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -1823,6 +1924,7 @@ async def get_thread_state(
 
         next_nodes = list(getattr(snapshot, "next", ()) or ())
         has_interrupts = bool(getattr(snapshot, "interrupts", ()) or ())
+        terminal = _thread_state_terminal_metadata(snapshot)
 
         return {
             "thread_id": thread_id,
@@ -1830,7 +1932,9 @@ async def get_thread_state(
             "values": checkpoint.checkpoint.get("channel_values", {}),
             "next": next_nodes,
             "has_interrupts": has_interrupts,
-            "is_terminal": not next_nodes and not has_interrupts,
+            "is_terminal": terminal["is_terminal"],
+            "status": terminal["status"],
+            "error": terminal["error"],
         }
     except HTTPException:
         raise
