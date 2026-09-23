@@ -73,6 +73,7 @@ from pro.graphs.ambient_sql_graph import create_ambient_sql_graph_standalone  # 
 
 # Import swarm_graph module to access both the factory AND any existing instance
 import pro.graphs.swarm_graph as swarm_module
+from pro.graphs.swarm_bridge import merge_checkpointed_turn_input
 
 # LangSmith tracing (MIT-licensed, continues to work!)
 # Note: LangSmith observability is SEPARATE from LangGraph Platform licensing.
@@ -142,6 +143,7 @@ _INTERRUPT_THREAD_MAP: Dict[str, Dict[str, Any]] = {}
 # DMs at the resume site (a shared channel uses thread-ts matching, to avoid
 # resuming on an unrelated message).
 _CHANNEL_PENDING_INTERRUPT: Dict[str, str] = {}
+
 
 async def _detect_interrupt(graph, config: dict) -> tuple[bool, Any]:
     """
@@ -878,6 +880,7 @@ async def _handle_slack_message(
         _prior_values = getattr(_prior_state, "values", None) or {}
         prior_turn = int(_prior_values.get("turn_number", 0) or 0)
     except Exception as _state_exc:  # noqa: BLE001
+        _prior_values = {}
         LOGGER.warning(
             "[%s].[%s] Could not fetch prior state for turn_number "
             "(using 0 fallback): %s",
@@ -900,7 +903,7 @@ async def _handle_slack_message(
     )
 
     # Build input for the graph
-    graph_input = {
+    graph_input = merge_checkpointed_turn_input(_prior_values, {
         "messages": [
             {
                 "role": "user",
@@ -919,7 +922,7 @@ async def _handle_slack_message(
         # state so reflective.py / sql_graph.py / swarm_graph.py read
         # the correct value via ``state.get("turn_number", 0)``.
         "turn_number": turn_number,
-    }
+    })
     
     # Store metadata for callback (we'll process response inline)
     metadata = {
@@ -1881,6 +1884,23 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
 
     try:
         graph = get_graph(graph_name)
+        try:
+            prior_snapshot = await graph.aget_state(config_data)
+            prior_values = getattr(prior_snapshot, "values", None) or {}
+            input_data = merge_checkpointed_turn_input(
+                prior_values,
+                input_data,
+            )
+        except Exception as state_exc:  # noqa: BLE001
+            # Graphs without a checkpointer still support one-shot runs.
+            # Continuity degrades explicitly rather than blocking the request.
+            LOGGER.warning(
+                "run_checkpoint_hydration_failed thread_id=%s graph=%s: %s",
+                thread_id,
+                graph_name,
+                state_exc,
+                exc_info=True,
+            )
         result = await asyncio.wait_for(
             graph.ainvoke(input_data, config=config_data),
             timeout=GRAPH_TIMEOUT
