@@ -20,9 +20,9 @@ MULTI-TENANT SUPPORT preserved:
 import src.langgraph_slack.patch_typing  # must run before any Pydantic model loading
 # Set MIT mode BEFORE importing swarm_graph to prevent auto-creation
 import os
+import time
 os.environ["LANGGRAPH_MIT_MODE"] = "true"
 import asyncio
-import time
 import logging
 import re
 import json
@@ -397,7 +397,7 @@ async def _resume_interrupted_graph(
 def _build_database_uri() -> str:
     """
     Build PostgreSQL connection URI from environment variables.
-    
+
     Connection modes:
     1. Cloud SQL via Proxy (TCP on localhost) - CLOUD_SQL_INSTANCE set
        The entrypoint starts cloud-sql-proxy on localhost:5432
@@ -1857,6 +1857,8 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
     thread_id = body.get("thread_id", str(uuid.uuid4()))
     input_data = body.get("input", {})
     config_data = body.get("config", {})
+    metadata = body.get("metadata") or {}
+    client_message_id = metadata.get("client_message_id")
     
     # Ensure thread_id is in config
     if "configurable" not in config_data:
@@ -1866,6 +1868,17 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
     # consumers (e.g. the FileAgent's endpoint readiness wait) share ONE budget.
     config_data["configurable"]["graph_deadline"] = time.monotonic() + GRAPH_TIMEOUT
     
+    # A run-scoped id so callers can correlate retries and logs. NOT a
+    # correctness mechanism: idempotency for the Labbera frontend lives in the
+    # client_message_id carried as the HumanMessage `id` (add_messages upserts
+    # by id), so a re-delivered turn cannot duplicate its human row.
+    run_id = str(uuid.uuid4())
+    started = time.monotonic()
+    LOGGER.info(
+        "run_start thread_id=%s run_id=%s client_message_id=%s graph=%s",
+        thread_id, run_id, client_message_id, graph_name,
+    )
+
     try:
         graph = get_graph(graph_name)
         result = await asyncio.wait_for(
@@ -1873,13 +1886,27 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
             timeout=GRAPH_TIMEOUT
         )
         
+        LOGGER.info(
+            "run_end thread_id=%s run_id=%s client_message_id=%s status=success duration_s=%.1f",
+            thread_id, run_id, client_message_id, time.monotonic() - started,
+        )
         return {
             "thread_id": thread_id,
+            "run_id": run_id,
+            "client_message_id": client_message_id,
             "status": "success",
             "values": result,
         }
     except asyncio.TimeoutError:
         detail = f"Request timed out after {GRAPH_TIMEOUT}s"
+        LOGGER.warning(
+            "run_end thread_id=%s run_id=%s client_message_id=%s "
+            "status=timeout duration_s=%.1f",
+            thread_id,
+            run_id,
+            client_message_id,
+            time.monotonic() - started,
+        )
         try:
             await _persist_thread_terminal_error(
                 _checkpointer,
@@ -1894,7 +1921,10 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
             )
         raise HTTPException(status_code=504, detail=detail)
     except Exception as e:
-        LOGGER.exception("Run failed: %s", e)
+        LOGGER.exception(
+            "run_end thread_id=%s run_id=%s client_message_id=%s status=failed duration_s=%.1f: %s",
+            thread_id, run_id, client_message_id, time.monotonic() - started, e,
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
 

@@ -18,6 +18,7 @@ from typing import (
 )
 import httpx
 import requests
+from langchain_core.runnables import Runnable
 
 
 logger = logging.getLogger(__name__)
@@ -319,9 +320,19 @@ def wrap_llm_with_deepseek_backoff(
     if not enable_backoff or provider.lower() != "deepseek":
         return llm
 
-    class _Wrapper:
+    class _Wrapper(Runnable):
+        """Runnable wrapper so create_react_agent accepts it (prompt_runnable | model).
+
+        The typed DeepSeek backoff (429/5xx retry, 402 passthrough, exhaustion)
+        lives on invoke/ainvoke; bind_tools rewraps so tool-calling turns keep it.
+        """
+
         def __init__(self, inner):
             self.llm = inner
+
+        def bind_tools(self, tools, **kw):
+            "bind tools on the inner model and re-wrap the result with backoff"
+            return _Wrapper(self.llm.bind_tools(tools, **kw))
 
         @deepseek_exponential_backoff(cfg, balance_checker=balance_checker)
         def invoke(self, *a, **kw):

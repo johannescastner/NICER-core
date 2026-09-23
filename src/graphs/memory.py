@@ -2144,6 +2144,90 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             offset=offset,
         )
 
+    async def alist_namespaces(
+        self,
+        *,
+        prefix: NamespacePath | None = None,
+        suffix: NamespacePath | None = None,
+        max_depth: int | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[tuple[str, ...]]:
+        """List persisted namespaces with the standard LangGraph semantics.
+
+        ``AsyncBatchedBaseStore.alist_namespaces`` reaches this store through a
+        ``ListNamespacesOp``.  The old ``abatch`` branch returned ``[]`` for
+        that operation, which made structural semantic-edge recall impossible
+        even though the namespaces were present in BigQuery.
+
+        Namespace values are stored by this class as dot-joined strings.  Read
+        the distinct values once, then apply LangGraph's prefix/suffix wildcard,
+        depth, sorting, and pagination rules in Python.  This deliberately
+        mirrors ``InMemoryStore._handle_list_namespaces`` rather than inventing
+        a second matching contract.
+        """
+        match_conditions = []
+        if prefix is not None:
+            match_conditions.append(("prefix", tuple(prefix)))
+        if suffix is not None:
+            match_conditions.append(("suffix", tuple(suffix)))
+        return await self._alist_namespaces_for_conditions(
+            match_conditions=match_conditions,
+            max_depth=max_depth,
+            limit=limit,
+            offset=offset,
+        )
+
+    async def _alist_namespaces_for_conditions(
+        self,
+        *,
+        match_conditions: Sequence[tuple[str, tuple[str, ...]]],
+        max_depth: int | None,
+        limit: int,
+        offset: int,
+    ) -> list[tuple[str, ...]]:
+        def _matches(kind: str, path: tuple[str, ...], namespace: tuple[str, ...]) -> bool:
+            if len(namespace) < len(path):
+                return False
+            compared = (
+                zip(namespace, path)
+                if kind == "prefix"
+                else zip(reversed(namespace), reversed(path))
+            )
+            if kind not in {"prefix", "suffix"}:
+                raise ValueError(f"Unsupported match type: {kind}")
+            return all(expected == "*" or actual == expected for actual, expected in compared)
+
+        def _read() -> list[tuple[str, ...]]:
+            bq_client = self.vectorstore._bq_client
+            full_table = self.vectorstore.full_table_id
+            rows = bq_client.query(
+                f"SELECT DISTINCT namespace FROM `{full_table}` "
+                "WHERE namespace IS NOT NULL"
+            )
+            found = []
+            for row in rows:
+                row_dict = dict(row.items())
+                raw = row_dict.get("namespace")
+                if raw:
+                    found.append(tuple(str(raw).split(".")))
+            return found
+
+        loop = asyncio.get_running_loop()
+        namespaces = await loop.run_in_executor(_MEMORY_STORE_EXECUTOR, _read)
+        filtered = [
+            namespace
+            for namespace in namespaces
+            if all(
+                _matches(kind, path, namespace)
+                for kind, path in match_conditions
+            )
+        ]
+        if max_depth is not None:
+            filtered = list({namespace[:max_depth] for namespace in filtered})
+        filtered.sort()
+        return filtered[offset : offset + limit]
+
     async def abatch(self, ops: Iterable[Op]) -> List[Result]:
         """Single dispatch path for write/read ops.
 
@@ -2184,7 +2268,16 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
                 )
                 results.append(items)
             elif isinstance(op, ListNamespacesOp):
-                results.append([])
+                conditions = [
+                    (condition.match_type, tuple(condition.path))
+                    for condition in (op.match_conditions or ())
+                ]
+                results.append(await self._alist_namespaces_for_conditions(
+                    match_conditions=conditions,
+                    max_depth=op.max_depth,
+                    limit=op.limit,
+                    offset=op.offset,
+                ))
             else:
                 raise NotImplementedError(f"Unsupported op: {op}")
         return results
