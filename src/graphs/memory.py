@@ -62,7 +62,7 @@ from langmem import create_manage_memory_tool, create_search_memory_tool
 from src.canonical.bq_batch import merge_upsert_json_rows
 
 
-import src.langgraph_slack.patch_typing  # must run before any Pydantic model loading
+import src.langgraph_slack.patch_typing  # noqa: F401  # must run before any Pydantic model loading
 
 from src.langgraph_slack.config import (
     PROJECT_ID, DATASET_ID, LOCATION,
@@ -1911,7 +1911,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             )
 
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             # No running loop: safe to create one and run to completion
             return asyncio.run(_runner())
@@ -2341,12 +2341,28 @@ async def _build_store_in_thread(
     """
 
     def _builder() -> "BigQueryMemoryStore":
+        project_id = (
+            getattr(CREDENTIALS, "project_id", None)
+            or PROJECT_ID
+        )
+        if not project_id or project_id == "default_project_id":
+            raise RuntimeError(
+                "BigQuery memory store requires a real client project from "
+                "src.langgraph_slack.config; set GCP_PROJECT_ID or provide a "
+                "valid GCP_SERVICE_ACCOUNT_BASE64 whose project_id can be used."
+            )
+        client = bigquery.Client(
+            credentials=CREDENTIALS,
+            project=project_id,
+            location=LOCATION,
+        )
         return BigQueryMemoryStore.from_client(
             dataset_name=DATASET_ID,
             table_name=table_name,
             content_field=content_field,
             content_model=model,
             schema=schema,
+            bq_client=client,
         )
 
     # PR-A0-13c: route through the bounded _MEMORY_STORE_EXECUTOR
