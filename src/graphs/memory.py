@@ -2389,6 +2389,23 @@ class MemoryBundle(NamedTuple):
     procedural_store: "BigQueryMemoryStore"
 
 
+class MemoryToolList(list):
+    """Native memory tools plus the exact stores used to build them."""
+
+    def __init__(
+        self,
+        tools: Iterable[Any],
+        *,
+        semantic_store: Any,
+        episodic_store: Any,
+        procedural_store: Any,
+    ) -> None:
+        super().__init__(tools)
+        self.semantic_store = semantic_store
+        self.episodic_store = episodic_store
+        self.procedural_store = procedural_store
+
+
 async def _build_three_stores():
     """Construct the 3 physically-distinct memory stores ONCE, in worker threads,
     so the synchronous BigQuery dataset/table validation runs off the main event
@@ -2497,7 +2514,12 @@ async def get_memory_tools(
     byte-for-byte unaffected.
     """
     sem, epi, proc = await _build_three_stores()
-    return _build_tools_for(namespace_templates, sem, epi, proc)
+    return MemoryToolList(
+        _build_tools_for(namespace_templates, sem, epi, proc),
+        semantic_store=sem,
+        episodic_store=epi,
+        procedural_store=proc,
+    )
 
 
 async def get_memory_tools_and_stores(
