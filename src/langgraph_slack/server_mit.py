@@ -55,6 +55,7 @@ from langgraph_slack.auth_fastapi import verify_request  # New auth module
 from pro.http.ambient import router as ambient_router
 from pro.http.cron_lifecycle import ensure_ambient_cron_exists
 from pro.persistence import close_persistence_manager
+from langgraph_slack.run_tool_telemetry import persist_run_tool_usage
 from pro.utils.blocking_detector import install_blocking_detector
 # Impact-report feature surface (multi-tenant port — server_mit IS the DEPLOYED
 # self-hosted server; the feature was previously only wired in server.py):
@@ -1905,6 +1906,24 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
             graph.ainvoke(input_data, config=config_data),
             timeout=GRAPH_TIMEOUT
         )
+
+        try:
+            persisted_tool_calls = await persist_run_tool_usage(
+                result.get("messages", []) if isinstance(result, dict) else [],
+                run_id=run_id,
+            )
+            LOGGER.info(
+                "run_tool_telemetry thread_id=%s run_id=%s persisted=%s",
+                thread_id,
+                run_id,
+                persisted_tool_calls,
+            )
+        except Exception:
+            LOGGER.exception(
+                "run_tool_telemetry_failed thread_id=%s run_id=%s",
+                thread_id,
+                run_id,
+            )
         
         LOGGER.info(
             "run_end thread_id=%s run_id=%s client_message_id=%s status=success duration_s=%.1f",
