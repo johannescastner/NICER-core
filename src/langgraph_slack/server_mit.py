@@ -83,6 +83,11 @@ from pro.monitoring.langsmith_integration import get_langsmith_integration
 
 LOGGER = logging.getLogger(__name__)
 
+def _apply_graph_config_defaults(graph_config: dict) -> dict:
+    """Apply graph-wide runtime defaults shared by every MIT invocation path."""
+    graph_config.setdefault("recursion_limit", config.AGENT_RECURSION_LIMIT)
+    return graph_config
+
 # Initialize LangSmith integration (for tracing)
 # This is optional but recommended for observability
 try:
@@ -336,6 +341,7 @@ async def _resume_interrupted_graph(
         # budget the asyncio.wait_for below enforces); the value stamped when
         # the run was first invoked may be long past.
         if isinstance(graph_config, dict):
+            _apply_graph_config_defaults(graph_config)
             graph_config.setdefault("configurable", {})["graph_deadline"] = time.monotonic() + GRAPH_TIMEOUT
 
         # Retry on stale DB connection (same pattern as _handle_slack_message)
@@ -832,6 +838,7 @@ async def _handle_slack_message(
             "thread_ts": event.get("thread_ts") or event["ts"],
         }
     }
+    _apply_graph_config_defaults(graph_config)
     # Bundle A keystone (cloud parity: server.py:997-998).
     if scenario_id:
         graph_config["configurable"]["scenario_id"] = scenario_id
@@ -1867,6 +1874,7 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
     # Ensure thread_id is in config
     if "configurable" not in config_data:
         config_data["configurable"] = {}
+    _apply_graph_config_defaults(config_data)
     config_data["configurable"]["thread_id"] = thread_id
     # Same absolute lifecycle deadline as the asyncio.wait_for below, so in-run
     # consumers (e.g. the FileAgent's endpoint readiness wait) share ONE budget.
