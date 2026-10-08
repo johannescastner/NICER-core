@@ -245,6 +245,9 @@ from src.http.retry_after import parse_retry_after as _parse_embed_retry_after
 # separately track an exponential ceiling).
 _RETRY_AFTER_MAX_EMBED = float(os.getenv("MODAL_EMBED_RETRY_AFTER_MAX", "180.0"))
 _EMBED_MAX_RETRIES = 4
+#: Statuses that mean "try again": a 408 is the server timing out on the request, as transient
+#: as a 429 or a 5xx (run A1, 2026-10-06: a 408 at store start ended a whole replay).
+_EMBED_RETRY_STATUSES = frozenset({408, 429})
 
 
 def _is_transient_http_exc(exc) -> bool:
@@ -264,7 +267,7 @@ def _is_transient_http_exc(exc) -> bool:
 
 
 def _sync_modal_post_with_retry(client, url: str, payload: dict):
-    """POST to Modal with retry on 429/5xx + transient network errors.
+    """POST to Modal with retry on 408/429/5xx + transient network errors.
 
     Raises the last exception / HTTPStatusError when all retries exhausted.
     """
@@ -273,7 +276,7 @@ def _sync_modal_post_with_retry(client, url: str, payload: dict):
     for attempt in range(_EMBED_MAX_RETRIES):
         try:
             response = client.post(url, json=payload)
-            if response.status_code == 429 or 500 <= response.status_code < 600:
+            if response.status_code in _EMBED_RETRY_STATUSES or 500 <= response.status_code < 600:
                 if attempt >= _EMBED_MAX_RETRIES - 1:
                     response.raise_for_status()
                 wait = min(
@@ -322,7 +325,7 @@ async def _async_modal_post_with_retry(client, url: str, payload: dict):
     for attempt in range(_EMBED_MAX_RETRIES):
         try:
             response = await client.post(url, json=payload)
-            if response.status_code == 429 or 500 <= response.status_code < 600:
+            if response.status_code in _EMBED_RETRY_STATUSES or 500 <= response.status_code < 600:
                 if attempt >= _EMBED_MAX_RETRIES - 1:
                     response.raise_for_status()
                 wait = min(
@@ -780,11 +783,50 @@ PYDANTIC_MODELS = {
 }
 
 
+def _with_exhaustive_vector_search(query: str) -> str:
+    """The query with VECTOR_SEARCH searching every filtered row (``use_brute_force``), set on the
+    parsed call rather than by editing its text. BigQuery renders it as ``options => '...'``."""
+    import sqlglot
+    from sqlglot import exp
+
+    tree = sqlglot.parse_one(query, read="bigquery")
+    for call in tree.find_all(exp.VectorSearch):
+        call.set(
+            "options",
+            exp.Kwarg(this=exp.var("options"), expression=exp.Literal.string(json.dumps({"use_brute_force": True}))),
+        )
+    return tree.sql(dialect="bigquery")
+
+
 class PatchedBigQueryVectorStore(BigQueryVectorStore):
     """
     The original BigQueryVectorStore has to be patched
     so that it allows for struct types
     """
+
+    def _create_search_query(
+        self,
+        num_embeddings: int,
+        filter: Optional[Union[Dict[str, Any], str]] = None,
+        k: int = 5,
+        table_to_query: Any = None,
+        fields_to_exclude: Optional[List[str]] = None,
+    ) -> str:
+        """The base query, searched exhaustively whenever it carries a filter (batch D, 2026-10-07).
+        The table's vector index (IVF, no stored columns) applies a filter after it has chosen its
+        nearest rows, so a namespace's search could return fewer rows than asked, silently
+        (BigQuery's "Manage vector indexes"). BigQuery already chose exhaustive search for these
+        reads on its own cost estimate; this makes it the rule. A search without a filter is the
+        base query unchanged. langchain-google-community 5.x takes this option itself (its
+        ``options``); on that upgrade, pass it there and drop this override."""
+        query = super()._create_search_query(
+            num_embeddings=num_embeddings,
+            filter=filter,
+            k=k,
+            table_to_query=table_to_query,
+            fields_to_exclude=fields_to_exclude,
+        )
+        return _with_exhaustive_vector_search(query) if filter else query
     def _normalize_page_content(self, content: Any) -> str:
         if isinstance(content, dict):
             return json.dumps(content)
@@ -2231,22 +2273,31 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
     async def abatch(self, ops: Iterable[Op]) -> List[Result]:
         """Single dispatch path for write/read ops.
 
-        Every ``PutOp`` — whether 1 or N — flows through ``aput_batch``.
-        That keeps a single source of truth for upsert (LOAD-staging +
-        MERGE-by-doc_id, atomic, no DELETE-INSERT race) regardless of
-        batch size. ``aput_batch`` itself is a no-op on empty input.
-        ``GetOp`` / ``SearchOp`` / ``ListNamespacesOp`` go individually
-        because they don't share a batched primitive.
+        Every ``PutOp`` with a value — whether 1 or N — flows through
+        ``aput_batch``. That keeps a single source of truth for upsert
+        (LOAD-staging + MERGE-by-doc_id, atomic, no DELETE-INSERT race)
+        regardless of batch size. ``aput_batch`` itself is a no-op on empty
+        input. A ``PutOp`` without a value is a delete (LangGraph's
+        ``PutOp`` contract; ``BaseStore.delete`` builds one) and goes to
+        ``amdelete``: run P75d (2026-10-07) sent the FileAgent's first
+        delete into the upsert, which failed in ``_build_row_for_batch``.
+        For several ops on one item, the last one counts, as in
+        ``aput_batch``'s own dedup. ``GetOp`` / ``SearchOp`` /
+        ``ListNamespacesOp`` go individually because they don't share a
+        batched primitive.
         """
         ops_list = list(ops)
         logger.info("[abatch] Executing %s batch operations", len(ops_list))
 
-        put_indices = [i for i, op in enumerate(ops_list) if isinstance(op, PutOp)]
-        if put_indices:
-            put_items = [
-                (ops_list[i].namespace, ops_list[i].key, ops_list[i].value)
-                for i in put_indices
-            ]
+        last_writes: dict[tuple[tuple[str, ...], str], PutOp] = {}
+        for op in ops_list:
+            if isinstance(op, PutOp):
+                last_writes[(tuple(op.namespace), op.key)] = op
+        delete_keys = [op.key for op in last_writes.values() if op.value is None]
+        if delete_keys:
+            await self.amdelete(delete_keys)
+        put_items = [(op.namespace, op.key, op.value) for op in last_writes.values() if op.value is not None]
+        if put_items:
             await self.aput_batch(put_items)
 
         results: List[Result] = []
