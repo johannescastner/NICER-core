@@ -31,11 +31,7 @@ def _json_safe(value: Any) -> Any:
                 "media_type": header[5:].split(";", 1)[0],
                 "encoded_length": len(encoded),
             }
-        return (
-            value
-            if len(value) <= 100_000
-            else {"truncated_text": value[:100_000], "original_length": len(value)}
-        )
+        return value
     if isinstance(value, Mapping):
         return {str(key): _json_safe(item) for key, item in value.items()}
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
@@ -90,7 +86,7 @@ def tool_usage_rows(
                 "error_message": None
                 if success
                 else (
-                    str(content)[:4_000]
+                    str(content)
                     if content is not None
                     else "missing tool observation"
                 ),

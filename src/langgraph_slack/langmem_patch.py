@@ -21,9 +21,9 @@ its result: for every ``AIMessage(tool_calls)`` in
 ``messages_to_summarize``, append any matching ``ToolMessage`` from the
 source conversation that's missing — exactly mirroring PR #141.
 
-Delete this module (and the ``import`` at the bottom of patch_typing.py
-that activates it) when langmem releases a version that includes PR #141
-and we upgrade.
+Remove the pairing wrapper after upgrading to a release with the verified
+PR #141 fix. Keep the complete-input adjustment below until upstream also stops
+trimming selected messages before marking all their ids summarized.
 
 Tracking issues:
   * https://github.com/langchain-ai/langmem/pull/141 (the fix)
@@ -79,8 +79,8 @@ if _original_preprocess is None:
         f"{getattr(_langmem, '__version__', '<unknown>')!r}. "
         "Expected version range per pyproject.toml: ``langmem>=0.0.30,<0.1.0``. "
         "If upstream PR #141 (https://github.com/langchain-ai/langmem/pull/141) "
-        "has merged into a newer langmem release, DELETE this entire module "
-        "and the import at the bottom of src/langgraph_slack/patch_typing.py. "
+        "has merged into a newer langmem release, verify the pairing wrapper "
+        "and independently verify the complete-input guard before removing this module. "
         "If the venv has drifted off the pin, run ``pip install -e .`` or "
         "the equivalent to restore the pinned version. "
         "Failing loudly here per the 'Bugs Should Scream' lessons-learned "
@@ -198,3 +198,19 @@ def _patched_preprocess_messages(
 
 # Apply the patch at import time.
 _ls._preprocess_messages = _patched_preprocess_messages
+
+
+# langmem 0.0.30 otherwise trims the selected prefix, then records ALL selected
+# ids as summarized. That makes unseen evidence disappear from later turns.
+# Keep its selection/pairing/reducer bookkeeping, but never trim its model input.
+# If the complete input exceeds the provider's context, the existing safe wrapper
+# retains the full messages on failure. No fabricated partial summary is stored.
+if not callable(getattr(_ls, "_adjust_messages_before_summarization", None)):
+    raise ImportError("Pinned LangMem summary adjustment contract is unavailable; verify langmem>=0.0.30,<0.1.0")
+
+
+def _complete_messages_before_summarization(preprocessed_messages, token_counter):
+    return preprocessed_messages.messages_to_summarize
+
+
+_ls._adjust_messages_before_summarization = _complete_messages_before_summarization
