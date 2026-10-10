@@ -93,6 +93,8 @@ DRIVE_ROOT_FOLDER_ID = (
 # values have no tenant fallback: attachment endpoints validate them before IO.
 LANDING_BUCKET = environ.get("LANDING_BUCKET", "").strip()
 INGESTION_SERVICE_URL = environ.get("INGESTION_SERVICE_URL", "").strip().rstrip("/")
+# Full Cloud Run Job resource in the hosting project, set by deployment.
+CHAT_UPLOAD_MEMORY_JOB = environ.get("CHAT_UPLOAD_MEMORY_JOB", "").strip()
 CHAT_UPLOAD_MAX_BYTES = int(environ.get("CHAT_UPLOAD_MAX_BYTES", str(20 * 1024 * 1024)))
 
 
