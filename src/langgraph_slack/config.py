@@ -89,6 +89,13 @@ DRIVE_ROOT_FOLDER_ID = (
     or ""
 ).strip()
 
+# Chat acquisition uses the same client landing bucket as drive-ingest. These
+# values have no tenant fallback: attachment endpoints validate them before IO.
+LANDING_BUCKET = environ.get("LANDING_BUCKET", "").strip()
+INGESTION_SERVICE_URL = environ.get("INGESTION_SERVICE_URL", "").strip().rstrip("/")
+CHAT_UPLOAD_MAX_BYTES = int(environ.get("CHAT_UPLOAD_MAX_BYTES", str(20 * 1024 * 1024)))
+
+
 if DEPLOY_MODAL:
     if not environ.get("SLACK_BOT_TOKEN"):
         environ["SLACK_BOT_TOKEN"] = "fake-token"

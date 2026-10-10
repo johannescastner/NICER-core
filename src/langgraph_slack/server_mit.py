@@ -1854,6 +1854,10 @@ def _thread_state_terminal_metadata(snapshot):
     }
 
 
+from pro.http.attachments import create_attachment_router
+APP.include_router(create_attachment_router(config, verify_request))
+
+
 @APP.post("/runs")
 async def create_run(req: Request, _: None = Depends(verify_request)):
     """
