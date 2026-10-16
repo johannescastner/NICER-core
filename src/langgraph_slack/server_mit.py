@@ -1896,6 +1896,10 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
     )
 
     try:
+        from pro.supplied_data import incoming_series, supplied_series_context
+        # Capture the authenticated incoming turn BEFORE checkpoint history is merged.
+        supplied_source = incoming_series(input_data.get("messages", []))
+        prior_turn = 0
         graph = get_graph(graph_name)
         try:
             prior_snapshot = await graph.aget_state(config_data)
@@ -1904,6 +1908,7 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
                 prior_values,
                 input_data,
             )
+            prior_turn = int(prior_values.get("turn_number", 0) or 0)
         except Exception as state_exc:  # noqa: BLE001
             # Graphs without a checkpointer still support one-shot runs.
             # Continuity degrades explicitly rather than blocking the request.
@@ -1914,10 +1919,21 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
                 state_exc,
                 exc_info=True,
             )
-        result = await asyncio.wait_for(
-            graph.ainvoke(input_data, config=config_data),
-            timeout=GRAPH_TIMEOUT
-        )
+        # Match the maintained Slack entry point: the same identity must reach
+        # the outer finalizer (state) and inner swarm SQL nodes (config).
+        # Otherwise SQL costs are tagged unknown/0 and the finalizer sees no
+        # successful execution for this request, even after a chart renders.
+        turn_identity = {
+            "conversation_id": thread_id,
+            "turn_number": prior_turn + 1,
+        }
+        input_data.update(turn_identity)
+        config_data["configurable"].update(turn_identity)
+        with supplied_series_context(supplied_source):
+            result = await asyncio.wait_for(
+                graph.ainvoke(input_data, config=config_data),
+                timeout=GRAPH_TIMEOUT
+            )
 
         try:
             persisted_tool_calls = await persist_run_tool_usage(

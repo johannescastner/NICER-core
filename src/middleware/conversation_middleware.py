@@ -108,7 +108,8 @@ async def _log_turn_middleware(
     Logs either a human or agent turn with full metadata.
     - Never raises: logging failures are reported to logs but do not break the graph.
     - Turn numbering:
-        * Increments once per human turn (including ask_human resumes).
+        * Uses an explicit run turn when supplied; otherwise increments once
+          per human turn (including ask_human resumes).
         * Agent/tool turns reuse the last human turn_number.
     """
     try:
@@ -139,8 +140,11 @@ async def _log_turn_middleware(
 
         # ---- Human turn: increment counter + last_human_ts -------------------
         if turn_type == "human":
-            # Bump once per *human* turn (includes ask_human resumes).
-            turn_number += 1
+            # Entry points may already compute this run's turn from the
+            # checkpoint. Honor that same config value used by SQL cost tagging;
+            # incrementing it again splits outer grounding from executed queries.
+            configured_turn = configurable.get("turn_number")
+            turn_number = int(configured_turn) if configured_turn is not None else turn_number + 1
             state["turn_number"] = turn_number
 
             # Ensure we have a dict context for idle/engagement tracking.
