@@ -8,14 +8,17 @@ MAX_PNG_BYTES = 16 * 1024 * 1024
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
-def chart_object(uri: str, bucket_name: str) -> str:
+def chart_object(uri: str, bucket_name: str) -> tuple[str, int]:
     parsed = urlsplit(uri)
     if (parsed.scheme != "gs" or parsed.netloc != bucket_name
-            or parsed.query or parsed.fragment
+            or parsed.query or not parsed.fragment.isdecimal()
             or not parsed.path.startswith("/dashboards/")
             or not parsed.path.endswith(".png")):
         raise ValueError("Invalid chart artifact")
-    return parsed.path.lstrip("/")
+    generation = int(parsed.fragment)
+    if generation <= 0:
+        raise ValueError("Invalid chart generation")
+    return parsed.path.lstrip("/"), generation
 
 
 def approved_chart_uris(messages, bucket_name: str) -> list[str]:
@@ -47,11 +50,12 @@ def approved_chart_uris(messages, bucket_name: str) -> list[str]:
 
 
 def read_chart_png(uri: str, bucket_name: str, storage_client) -> bytes:
-    blob = storage_client.bucket(bucket_name).blob(chart_object(uri, bucket_name))
-    blob.reload()
+    name, generation = chart_object(uri, bucket_name)
+    blob = storage_client.bucket(bucket_name).blob(name, generation=generation)
+    blob.reload(if_generation_match=generation)
     if blob.size is None or blob.size > MAX_PNG_BYTES:
         raise ValueError("Chart artifact is too large")
-    data = blob.download_as_bytes(if_generation_match=blob.generation, end=MAX_PNG_BYTES)
+    data = blob.download_as_bytes(if_generation_match=generation, end=MAX_PNG_BYTES)
     if len(data) > MAX_PNG_BYTES or not data.startswith(PNG_SIGNATURE):
         raise ValueError("Chart artifact is not a PNG")
     return data
