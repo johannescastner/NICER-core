@@ -1995,6 +1995,40 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@APP.get("/threads/{thread_id}/chart-artifacts")
+async def get_chart_artifacts(
+    thread_id: str,
+    uri: str | None = None,
+    _: None = Depends(verify_request),
+):
+    """List or preview private charts from successful receipts in this thread."""
+    from fastapi.responses import Response
+    from google.cloud import storage
+    from src.langgraph_slack.config import CREDENTIALS, PROJECT_ID, SUPERSET_TENANT
+    from src.langgraph_slack.chart_artifacts import approved_chart_uris, read_chart_png
+
+    if not _checkpointer:
+        raise HTTPException(status_code=503, detail="Checkpointer not initialized")
+    config = {"configurable": {"thread_id": thread_id}}
+    checkpoint = await _checkpointer.aget_tuple(config)
+    if checkpoint is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    bucket = f"{SUPERSET_TENANT}-nicer-charts"
+    messages = checkpoint.checkpoint.get("channel_values", {}).get("messages", [])
+    approved = approved_chart_uris(messages, bucket)
+    if uri is None:
+        return JSONResponse({"charts": approved}, headers={"Cache-Control": "private, no-store"})
+    if uri not in approved:
+        raise HTTPException(status_code=404, detail="Chart not found")
+    try:
+        client = storage.Client(project=PROJECT_ID, credentials=CREDENTIALS)
+        png = await asyncio.to_thread(read_chart_png, uri, bucket, client)
+    except Exception:
+        LOGGER.warning("Chart preview unavailable for thread_id=%s", thread_id)
+        raise HTTPException(status_code=404, detail="Chart not found")
+    return Response(png, media_type="image/png", headers={"Cache-Control": "private, no-store"})
+
+
 @APP.get("/threads/{thread_id}/state")
 async def get_thread_state(
     thread_id: str,
