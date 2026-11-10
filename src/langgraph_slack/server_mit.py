@@ -451,6 +451,9 @@ async def _init_checkpointer() -> AsyncPostgresSaver:
     global _checkpointer, _connection_pool
     
     database_uri = _build_database_uri()
+    from pro.checkpoint_budget import checkpoint_budget, connection_name
+    from pro.checkpoint_population import active_population_count
+    budget = checkpoint_budget(populations=active_population_count())
     
     # Create connection pool (stays open for app lifetime)
     # CRITICAL: All three kwargs are REQUIRED for reliable operation
@@ -463,10 +466,10 @@ async def _init_checkpointer() -> AsyncPostgresSaver:
     # crashes on aget_tuple with stale pool connection.)
     _connection_pool = AsyncConnectionPool(
         conninfo=database_uri,
-        max_size=20,
-        min_size=2,          # Keep 2 warm connections ready (avoid cold-start)
+        max_size=budget.outer_max,
+        min_size=budget.outer_min,
         max_lifetime=1200,   # Recycle connections every 20 min (before proxy timeout)
-        max_idle=600,        # Close idle connections after 10 min
+        max_idle=budget.idle_seconds,
         open=False,
         # Validate connection before handing it to a caller.
         # This is THE critical fix: without it, stale connections from the pool
@@ -476,6 +479,7 @@ async def _init_checkpointer() -> AsyncPostgresSaver:
             "autocommit": True,
             "row_factory": dict_row,
             "prepare_threshold": 0,  # Prevents DuplicatePreparedStatement errors
+            "application_name": connection_name('outer'),
             # TCP keepalives: detect dead connections before Cloud SQL Proxy
             # drops them. Probe every 60s after 60s idle, close after 5 failures.
             "keepalives": 1,
@@ -485,10 +489,13 @@ async def _init_checkpointer() -> AsyncPostgresSaver:
         }
     )
     await _connection_pool.open(wait=True, timeout=30)
-    LOGGER.info(
-        "✅ Connection pool opened (max_size=20, min_size=2, "
-        "max_lifetime=1200, check=check_connection, keepalives=on)"
-    )
+    async with _connection_pool.connection() as connection:
+        cursor = await connection.execute(
+            "SELECT current_setting('max_connections')::int AS capacity, "
+            "current_setting('superuser_reserved_connections')::int AS reserved")
+        capacity = await cursor.fetchone()
+        budget.verify_database(capacity['capacity'], capacity['reserved'])
+    LOGGER.info('Checkpoint connection budget: %s', budget.describe(active_population_count()))
     
     # Create checkpointer with the pool
     _checkpointer = AsyncPostgresSaver(conn=_connection_pool)
@@ -1351,6 +1358,8 @@ async def lifespan(app: FastAPI):
             pass
         
         # Close checkpointer connection pool
+        from pro.checkpoint_population import reset_populations
+        await asyncio.to_thread(reset_populations)
         await _cleanup_checkpointer()
 
 
@@ -1367,6 +1376,8 @@ APP.include_router(ambient_router)
 @APP.get("/health")
 async def health():
     """Health check endpoint with connection pool status."""
+    from pro.checkpoint_budget import checkpoint_budget
+    from pro.checkpoint_population import population_pool_stats, active_population_count
     pool_info = {}
     if _connection_pool:
         pool_stats = _connection_pool.get_stats()
@@ -1381,6 +1392,8 @@ async def health():
         "graphs": list(_compiled_graphs.keys()),
         "checkpointer": "connected" if _checkpointer else "disconnected",
         "pool": pool_info,
+        "checkpoint_budget": checkpoint_budget(populations=active_population_count()).describe(active_population_count()),
+        "inner_pools": population_pool_stats(),
     }
 
 

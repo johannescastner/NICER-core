@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -38,6 +39,16 @@ def _json_safe(value: Any) -> Any:
         return [_json_safe(item) for item in value]
     dump = getattr(value, "model_dump", None)
     return _json_safe(dump(mode="json")) if callable(dump) else str(value)
+
+
+def _bq_json(value: Any) -> str:
+    """Encode a value for BigQuery's native JSON streaming field.
+
+    ``insert_rows_json`` does not encode values for JSON-typed columns.  It
+    expects a valid JSON literal string; passing a Python mapping is treated as
+    a RECORD and passing an ordinary string is parsed as invalid JSON.
+    """
+    return json.dumps(_json_safe(value), ensure_ascii=False, separators=(",", ":"))
 
 
 def tool_usage_rows(
@@ -90,8 +101,8 @@ def tool_usage_rows(
                     if content is not None
                     else "missing tool observation"
                 ),
-                "tool_input": call["tool_input"],
-                "tool_output": _json_safe(content),
+                "tool_input": _bq_json(call["tool_input"]),
+                "tool_output": _bq_json(content),
             }
         )
     return rows
