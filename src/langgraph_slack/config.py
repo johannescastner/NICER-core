@@ -12,11 +12,6 @@ import re
 from os import environ
 from google.oauth2 import service_account
 
-from .deepseek_utils import (
-    wrap_llm_with_deepseek_backoff,
-    make_balance_checker,
-    BackoffConfig,
-)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -575,6 +570,13 @@ def create_llm(
     # Apply DeepSeek-specific rate limiting if enabled
     if with_backoff and provider == "deepseek":
         try:
+            # Deployment tools read these settings without model-runtime SDKs.
+            # Load the optional backoff dependencies only when creating a model.
+            from .deepseek_utils import (
+                wrap_llm_with_deepseek_backoff,
+                make_balance_checker,
+                BackoffConfig,
+            )
             balance_checker = make_balance_checker(
                 api_key=environ.get(config["api_key_env"]),
                 base_url=config["base_url"],
