@@ -26,6 +26,7 @@ import asyncio
 import logging
 import re
 import json
+import hmac
 import uuid
 from urllib.parse import urlparse, quote_plus
 from typing import Awaitable, Callable, Optional, Dict, Any
@@ -1908,6 +1909,25 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
         thread_id, run_id, client_message_id, graph_name,
     )
 
+    # Keep the opaque capability outside model input, graph config and durable
+    # checkpoints. Generic Studio/router authentication never admits delegation:
+    # this private frontend transport must also present the exact service key.
+    from pro.civic.delegation_context import HEADER as DELEGATION_HEADER, set_delegation, reset_delegation
+    delegation_token = req.headers.get(DELEGATION_HEADER)
+    delegation_handle = None
+    if delegation_token:
+        expected = os.getenv("LANGGRAPH_API_KEY", "")
+        presented = req.headers.get("x-api-key", "")
+        actor_id = config_data["configurable"].get("superset_user_id")
+        if not expected or not hmac.compare_digest(expected, presented) or type(actor_id) is not int:
+            raise HTTPException(status_code=401, detail="Frontend delegation transport rejected")
+        try:
+            delegation_handle = set_delegation(delegation_token, actor_id, thread_id)
+        except ValueError:
+            raise HTTPException(status_code=401, detail="Invalid frontend delegation")
+    elif metadata.get("source") == "superset" and os.getenv("CW_AGENT_DELEGATION_REQUIRED", "false").lower() == "true":
+        raise HTTPException(status_code=401, detail="Frontend delegation is required")
+
     try:
         from pro.supplied_data import incoming_series, supplied_series_context
         # Capture the authenticated incoming turn BEFORE checkpoint history is merged.
@@ -2006,6 +2026,9 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
             thread_id, run_id, client_message_id, time.monotonic() - started, e,
         )
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if delegation_handle is not None:
+            reset_delegation(delegation_handle)
 
 
 @APP.get("/threads/{thread_id}/chart-artifacts")

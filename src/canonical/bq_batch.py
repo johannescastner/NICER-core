@@ -28,6 +28,7 @@ from __future__ import annotations
 import io
 import json
 import time
+import uuid
 
 import sqlglot.expressions as exp
 from google.cloud import bigquery
@@ -74,6 +75,8 @@ def merge_upsert_json_rows(
     *,
     merge_keys: list[str],
     delete_unmatched: bool = False,
+    version_column: str | None = None,
+    staging_dataset_fqn: str | None = None,
 ) -> None:
     """Idempotent upsert: batch-LOAD ``rows`` into a temp staging table,
     then ``MERGE`` into ``target_table_fqn`` matching on ``merge_keys``.
@@ -98,6 +101,11 @@ def merge_upsert_json_rows(
             target rows.  For ``canonical_regions``: ``["region_id"]``.
             For ``canonical_decomposition_edges``:
             ``["parent_region_id", "child_region_id", "set_name"]``.
+        version_column: optional monotonic integer column. A matched row is
+            updated only when the incoming version is newer; callers must
+            deduplicate source keys within their batch.
+        staging_dataset_fqn: optional private project.dataset for staging a
+            shared target, so intermediate/replayed rows never become public.
         delete_unmatched: opt-in, default ``False``. When ``True``, target
             rows NOT present in ``rows`` are DELETED in the SAME atomic MERGE
             (``WHEN NOT MATCHED BY SOURCE THEN DELETE``) — for a FULL re-seed
@@ -118,6 +126,8 @@ def merge_upsert_json_rows(
     if not rows:
         return
     cols = list(rows[0].keys())
+    if version_column is not None and version_column not in cols:
+        raise ValueError("version_column must be present in every source row")
     assert merge_keys, "merge_keys must be non-empty"
     for k in merge_keys:
         assert k in cols, f"merge_key {k!r} missing from row keys {cols}"
@@ -147,7 +157,8 @@ def merge_upsert_json_rows(
             f"rows contain columns not in target {target_table_fqn}: {missing}"
         )
 
-    staging_fqn = f"{target_table_fqn}_merge_staging_{int(time.time() * 1000)}"
+    staging_base = (staging_dataset_fqn + "." + table_name) if staging_dataset_fqn else target_table_fqn
+    staging_fqn = f"{staging_base}_merge_staging_{uuid.uuid4().hex}"
 
     # CREATE OR REPLACE TABLE staging via sqlglot AST.
     create_stmt = exp.Create(
@@ -197,6 +208,9 @@ def merge_upsert_json_rows(
             when_clauses.append(
                 exp.When(
                     matched=True,
+                    condition=(exp.GT(this=exp.column(version_column, table=source_alias, quoted=True),
+                                      expression=exp.column(version_column, table=target_alias, quoted=True))
+                               if version_column else None),
                     then=exp.Update(
                         expressions=[
                             exp.EQ(

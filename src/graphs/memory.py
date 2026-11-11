@@ -8,6 +8,7 @@ from functools import lru_cache
 import asyncio
 import atexit
 import concurrent.futures
+import contextvars
 import os
 import time
 from collections.abc import Iterable as IterableABC
@@ -71,6 +72,45 @@ from src.langgraph_slack.config import (
 )
 
 NamespaceTemplate = Tuple[str, ...]
+_MEMORY_NAMESPACE_POLICY = None
+_MEMORY_SYNC_EXECUTOR = None
+
+
+def configure_memory_namespace_policy(policy, *, sync_executor=None):
+    """Optional native deployment policy; this OSS module imports no app authority."""
+    global _MEMORY_NAMESPACE_POLICY, _MEMORY_SYNC_EXECUTOR
+    if not callable(policy):
+        raise TypeError("A memory namespace policy must be callable")
+    _MEMORY_NAMESPACE_POLICY = policy
+    if sync_executor is not None:
+        _MEMORY_SYNC_EXECUTOR = sync_executor
+
+
+def _memory_namespaces(namespace, action):
+    logical = tuple(namespace)
+    values = _MEMORY_NAMESPACE_POLICY(logical, action) if _MEMORY_NAMESPACE_POLICY else [logical]
+    if not values or any(not isinstance(value, tuple) for value in values):
+        raise PermissionError("Memory namespace access was not authorized")
+    return values
+
+
+async def _memory_namespaces_async(namespace, action):
+    if _MEMORY_NAMESPACE_POLICY is None:
+        return [tuple(namespace)]
+    return await asyncio.get_running_loop().run_in_executor(
+        _MEMORY_STORE_EXECUTOR, contextvars.copy_context().run, _memory_namespaces, tuple(namespace), action)
+
+
+def _logical_memory_namespace(stored, logical, authorized):
+    for prefix in authorized:
+        if tuple(stored[:len(prefix)]) == prefix:
+            return tuple(stored[len(prefix)-len(logical):])
+    return None
+
+
+def _require_namespaced_memory_api():
+    if _memory_namespaces((), "read") != [()]:
+        raise PermissionError("Delegated memory operations require the native namespace and key API")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1587,18 +1627,26 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
 
         # Build rows + embedding texts; drop malformed items.
         rows_with_texts: List[Tuple[dict, str]] = []
+        authorized_namespaces = {}
         for namespace, key, value in items:
-            built = self._build_row_for_batch(namespace, key, value)
+            logical = tuple(namespace)
+            scopes = authorized_namespaces.get(logical)
+            if scopes is None:
+                scopes = await _memory_namespaces_async(logical, "write")
+                authorized_namespaces[logical] = scopes
+            if len(scopes) != 1:
+                raise PermissionError("A memory write requires exactly one authorized namespace")
+            built = self._build_row_for_batch(scopes[0], key, value)
             if built is not None:
                 rows_with_texts.append(built)
 
         if not rows_with_texts:
             return
 
-        # Last-wins dedup on doc_id within this batch.
-        deduped: dict[str, Tuple[dict, str]] = {}
+        # BaseStore identifies an item by (namespace, key), not key alone.
+        deduped: dict[tuple[str, str], Tuple[dict, str]] = {}
         for data, text in rows_with_texts:
-            deduped[data["doc_id"]] = (data, text)
+            deduped[(data["namespace"], data["doc_id"])] = (data, text)
         ordered = list(deduped.values())
 
         rows = [d for d, _ in ordered]
@@ -1617,7 +1665,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
                 self.vectorstore._bq_client,
                 self.vectorstore.full_table_id,
                 rows,
-                merge_keys=[self.vectorstore.doc_id_field],
+                merge_keys=["namespace", self.vectorstore.doc_id_field],
             ),
         )
 
@@ -1630,6 +1678,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
     ) -> Optional[Item]:
         logger.debug("[aget] Retrieving doc_id=%s from namespace=%s", key, namespace)
 
+        scopes = await _memory_namespaces_async(namespace, "read")
         loop = asyncio.get_running_loop()
         docs = await loop.run_in_executor(
             _MEMORY_STORE_EXECUTOR,
@@ -1638,7 +1687,11 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         )
         if not docs:
             return None
-        doc = docs[0]
+        matches = {ns_join(scope): index for index, scope in enumerate(scopes)}
+        docs = [doc for doc in docs if doc.metadata.get("namespace", "") in matches]
+        if not docs:
+            return None
+        doc = min(docs, key=lambda value: matches[value.metadata.get("namespace", "")])
         metadata = doc.metadata
 
         # Per BaseStore.aget contract, the (namespace, key) pair identifies one
@@ -1646,14 +1699,15 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         # namespace would violate the contract and could leak across scopes.
         # Reuse ``ns_join`` so the comparison is symmetric with ``aput``'s write.
         stored_ns_str = metadata.get("namespace", "")
-        expected_ns_str = ns_join(namespace)
-        if stored_ns_str != expected_ns_str:
+        if stored_ns_str not in matches:
             logger.debug(
                 "[aget] doc_id=%s found but namespace mismatch (stored=%r, expected=%r)",
-                key, stored_ns_str, expected_ns_str,
+                key, stored_ns_str, tuple(matches),
             )
             return None
-        ns = tuple(stored_ns_str.split(".")) if stored_ns_str else ()
+        ns = tuple(namespace)
+        metadata = dict(metadata)
+        metadata["namespace"] = ns_join(ns)
 
         content_val = doc.page_content
         if isinstance(content_val, str) and self.content_model:
@@ -1728,7 +1782,9 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         # a dict (column = value equality only) OR a literal SQL string. We
         # take the latter path so we can express prefix matching + Mongo-style
         # operators in one combined clause.
-        ns_clause = _namespace_prefix_to_sql(namespace_prefix)
+        scopes = await _memory_namespaces_async(namespace_prefix, "search")
+        clauses = [_namespace_prefix_to_sql(scope) for scope in scopes]
+        ns_clause = _sqlglot_exp.or_(*clauses) if all(clauses) and len(clauses) > 1 else clauses[0]
         user_clause = _filter_dict_to_sql(filter) if filter else None
         combined_sql = _combine_sql_clauses(ns_clause, user_clause)
 
@@ -1750,13 +1806,14 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         # search. ``similarity_search_with_score`` requires a query string, so
         # we bypass it and run a direct SELECT against the vectorstore's table.
         if not query:
-            return await loop.run_in_executor(
+            values = await loop.run_in_executor(
                 _MEMORY_STORE_EXECUTOR,
                 self._search_filter_only,
                 combined_sql,
                 limit,
                 offset,
             )
+            return self._logical_search_results(values, namespace_prefix, scopes)
 
         # ── Standard similarity-search path ────────────────────────────────
         # Pass combined_sql as the ``filter`` arg — ``BigQueryVectorStore``'s
@@ -1858,7 +1915,20 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
                     updated_at=updated_at,
                 )
             )
-        return out
+        return self._logical_search_results(out, namespace_prefix, scopes)
+
+    @staticmethod
+    def _logical_search_results(values, namespace_prefix, scopes):
+        result = []
+        for item in values:
+            logical = _logical_memory_namespace(item.namespace, namespace_prefix, scopes)
+            if logical is None:
+                continue
+            value = dict(item.value)
+            value["namespace"] = ns_join(logical)
+            result.append(SearchItem(namespace=logical, key=item.key, value=value,
+                score=item.score, created_at=item.created_at, updated_at=item.updated_at))
+        return result
 
     def _search_filter_only(
         self, where_sql: str, limit: int, offset: int
@@ -1971,28 +2041,36 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             finally:
                 new_loop.close()
 
-        return _MEMORY_STORE_EXECUTOR.submit(_thread_runner).result()
+        executor = _MEMORY_SYNC_EXECUTOR or _MEMORY_STORE_EXECUTOR
+        return executor.submit(contextvars.copy_context().run, _thread_runner).result()
 
     async def adelete(self, namespace: Tuple[str, ...], key: str) -> None:
         logger.info("[adelete] Deleting doc_id=%s from namespace=%s", key, namespace)
-
-        adelete = getattr(self.vectorstore, "adelete", None)
-        if callable(adelete):
-            await adelete(ids=[key])  # type: ignore[misc]
-            return
-
-        delete = getattr(self.vectorstore, "delete", None)
-        if not callable(delete):
-            raise NotImplementedError("Vector store does not support delete/adelete")
-
+        scopes = await _memory_namespaces_async(namespace, "delete")
+        if len(scopes) != 1:
+            raise PermissionError("A memory deletion requires one authorized namespace")
+        # Native BaseStore's composite key prevents a supplied ID from deleting
+        # another citizen's memory or a shared authoritative catalog record.
+        config = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ScalarQueryParameter("namespace", "STRING", ns_join(scopes[0])),
+            bigquery.ScalarQueryParameter("key", "STRING", key)])
+        table = self.vectorstore.full_table_id
+        field = self.vectorstore.doc_id_field
+        if "`" in table or "`" in field:
+            raise ValueError("Invalid native memory table identity")
+        def remove():
+            self.vectorstore._bq_client.query(
+                f"DELETE FROM `{table}` WHERE namespace=@namespace AND `{field}`=@key",
+                job_config=config).result()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(_MEMORY_STORE_EXECUTOR, delete, [key])
+        await loop.run_in_executor(_MEMORY_STORE_EXECUTOR, remove)
 
     def mget(self, keys: Sequence[str]) -> List[Optional[dict]]:
         """
         Synchronous multi-get. BigQueryVectorStore only exposes a synchronous
         get_documents() API, so we call it directly here.
         """
+        _require_namespaced_memory_api()
         return self.vectorstore.get_documents(ids=list(keys))
 
     async def amget(self, keys: Sequence[str]) -> List[Optional[dict]]:
@@ -2004,12 +2082,15 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         This keeps the Store API consistent for callers and avoids any
         un-awaited coroutine warnings.
         """
+        if await _memory_namespaces_async((), "read") != [()]:
+            raise PermissionError("Delegated memory reads require a namespace")
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             _MEMORY_STORE_EXECUTOR, self.vectorstore.get_documents, list(keys)
         )
 
     def mset(self, key_value_pairs: Sequence[Tuple[str, dict]]) -> None:
+        _require_namespaced_memory_api()
         documents = [
             Document(page_content=value.get(self.content_field), metadata={**value, "doc_id": key})
             for key, value in key_value_pairs
@@ -2026,6 +2107,8 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         BigQueryVectorStore.add_documents is synchronous, so we offload it to
         a worker thread to avoid blocking the event loop.
         """
+        if await _memory_namespaces_async((), "write") != [()]:
+            raise PermissionError("Delegated memory writes require a namespace")
         documents = [
             Document(
                 page_content=value.get(self.content_field),
@@ -2050,6 +2133,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         one-shot event loop so callers do not get a `coroutine was never awaited`
         warning.
         """
+        _require_namespaced_memory_api()
         delete = getattr(self.vectorstore, "delete", None)
         if callable(delete):
             delete(ids=list(keys))
@@ -2079,7 +2163,8 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             finally:
                 loop.close()
 
-        _MEMORY_STORE_EXECUTOR.submit(_runner).result()
+        executor = _MEMORY_SYNC_EXECUTOR or _MEMORY_STORE_EXECUTOR
+        executor.submit(contextvars.copy_context().run, _runner).result()
 
     async def amdelete(self, keys: Sequence[str]) -> None:
         """
@@ -2088,6 +2173,8 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         If the underlying vectorstore exposes `adelete`, await it directly;
         otherwise fall back to running the sync `delete()` in a worker thread.
         """
+        if await _memory_namespaces_async((), "delete") != [()]:
+            raise PermissionError("Delegated memory deletes require a namespace")
         adelete = getattr(self.vectorstore, "adelete", None)
         if callable(adelete):
             await adelete(ids=list(keys))  # type: ignore[misc]
@@ -2102,6 +2189,7 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
 
     def yield_keys(self, prefix: Optional[str] = None) -> Iterator[str]:
         "yields keys"
+        _require_namespaced_memory_api()
         return self.vectorstore.yield_keys(prefix=prefix)
 
     async def ayield_keys(self, prefix: Optional[str] = None) -> AsyncIterator[str]:
@@ -2109,6 +2197,8 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         Async adapter for yield_keys.
         BigQueryVectorStore.yield_keys is synchronous; offload collection.
         """
+        if await _memory_namespaces_async((), "list") != [()]:
+            raise PermissionError("Delegated key listing requires a namespace")
         loop = asyncio.get_running_loop()
         keys = await loop.run_in_executor(
             _MEMORY_STORE_EXECUTOR, lambda: list(self.vectorstore.yield_keys(prefix=prefix))
@@ -2143,7 +2233,8 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             finally:
                 new_loop.close()
 
-        return _MEMORY_STORE_EXECUTOR.submit(_thread_runner).result()
+        executor = _MEMORY_SYNC_EXECUTOR or _MEMORY_STORE_EXECUTOR
+        return executor.submit(contextvars.copy_context().run, _thread_runner).result()
 
     def get(
         self,
@@ -2228,6 +2319,13 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         limit: int,
         offset: int,
     ) -> list[tuple[str, ...]]:
+        logical_prefix = next((path for kind, path in match_conditions if kind == "prefix"), ())
+        # A wildcard remains a logical matching rule, not an authority selector.
+        concrete_prefix = logical_prefix[:next((i for i, value in enumerate(logical_prefix) if value == "*"), len(logical_prefix))]
+        scopes = await _memory_namespaces_async(concrete_prefix, "list")
+        clauses = [_namespace_prefix_to_sql(scope) for scope in scopes]
+        clause = _sqlglot_exp.or_(*clauses) if all(clauses) and len(clauses) > 1 else clauses[0]
+        where = _combine_sql_clauses(clause, None)
         def _matches(kind: str, path: tuple[str, ...], namespace: tuple[str, ...]) -> bool:
             if len(namespace) < len(path):
                 return False
@@ -2245,14 +2343,16 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             full_table = self.vectorstore.full_table_id
             rows = bq_client.query(
                 f"SELECT DISTINCT namespace FROM `{full_table}` "
-                "WHERE namespace IS NOT NULL"
+                f"WHERE namespace IS NOT NULL AND ({where})"
             )
             found = []
             for row in rows:
                 row_dict = dict(row.items())
                 raw = row_dict.get("namespace")
                 if raw:
-                    found.append(tuple(str(raw).split(".")))
+                    logical = _logical_memory_namespace(tuple(str(raw).split(".")), concrete_prefix, scopes)
+                    if logical is not None:
+                        found.append(logical)
             return found
 
         loop = asyncio.get_running_loop()
@@ -2293,9 +2393,9 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
         for op in ops_list:
             if isinstance(op, PutOp):
                 last_writes[(tuple(op.namespace), op.key)] = op
-        delete_keys = [op.key for op in last_writes.values() if op.value is None]
-        if delete_keys:
-            await self.amdelete(delete_keys)
+        for op in last_writes.values():
+            if op.value is None:
+                await self.adelete(op.namespace, op.key)
         put_items = [(op.namespace, op.key, op.value) for op in last_writes.values() if op.value is not None]
         if put_items:
             await self.aput_batch(put_items)
