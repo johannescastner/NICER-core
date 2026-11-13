@@ -541,6 +541,9 @@ def create_llm(
     # Import the appropriate class
     module = importlib.import_module(config["import_module"])
     model_class = getattr(module, config["import_class"])
+    if provider == "deepseek":
+        from src.langgraph_slack.deepseek_model import DeepSeekWithReasoning
+        model_class = DeepSeekWithReasoning
     
     # Validate model_type for this provider
     if model_type not in config:

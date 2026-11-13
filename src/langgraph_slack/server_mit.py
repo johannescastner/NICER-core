@@ -152,6 +152,17 @@ _INTERRUPT_THREAD_MAP: Dict[str, Dict[str, Any]] = {}
 _CHANNEL_PENDING_INTERRUPT: Dict[str, str] = {}
 
 
+def _interrupt_payloads(snapshot):
+    """Read native top-level and nested task interrupts without losing their payloads."""
+    values = []
+    for source in (snapshot, *(getattr(snapshot, "tasks", ()) or ())):
+        for item in (getattr(source, "interrupts", ()) or ()):
+            value = getattr(item, "value", None)
+            if isinstance(value, dict) and value not in values:
+                values.append(value)
+    return values
+
+
 async def _detect_interrupt(graph, config: dict) -> tuple[bool, Any]:
     """
     Version-safe interrupt detection (works on langgraph 0.2.x through 0.6.x).
@@ -159,10 +170,10 @@ async def _detect_interrupt(graph, config: dict) -> tuple[bool, Any]:
     """
     try:
         state = await graph.aget_state(config)
+        payloads = _interrupt_payloads(state)
+        if payloads:
+            return True, payloads[0]
         if state.next:
-            for task in (state.tasks or []):
-                for intr in (task.interrupts or ()):
-                    return True, intr.value
             return True, None
     except Exception as exc:
         LOGGER.warning("Failed to check graph state for interrupt: %s", exc, exc_info=True)
@@ -1850,9 +1861,9 @@ def _thread_state_terminal_metadata(snapshot):
         }
 
     next_nodes = tuple(getattr(snapshot, "next", ()) or ())
-    has_interrupts = bool(
-        getattr(snapshot, "interrupts", ()) or ()
-    )
+    has_interrupts = bool(_interrupt_payloads(snapshot))
+    if has_interrupts:
+        return {"status": "interrupted", "error": None, "is_terminal": False}
 
     if not next_nodes and not has_interrupts:
         return {
@@ -1933,15 +1944,41 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
         # Capture the authenticated incoming turn BEFORE checkpoint history is merged.
         supplied_source = incoming_series(input_data.get("messages", []))
         prior_turn = 0
+        resume_payload = None
+        origin_message_id = client_message_id
+        origin_user_id = config_data["configurable"].get("superset_user_id")
         graph = get_graph(graph_name)
         try:
             prior_snapshot = await graph.aget_state(config_data)
             prior_values = getattr(prior_snapshot, "values", None) or {}
+            pending = _interrupt_payloads(prior_snapshot)
+            prior_metadata = getattr(prior_snapshot, "metadata", None) or {}
+            if pending:
+                prior_humans = [message for message in prior_values.get("messages", [])
+                    if (message.get("type", message.get("role")) if isinstance(message, dict) else getattr(message, "type", None)) in {"human", "user"}]
+                previous = prior_humans[-1] if prior_humans else None
+                previous_id = prior_metadata.get("origin_message_id") or (previous.get("id") if isinstance(previous, dict) else getattr(previous, "id", None))
+                origin_user_id = prior_metadata.get("origin_user_id")
+                if client_message_id and client_message_id in {previous_id, prior_metadata.get("client_message_id")} :
+                    return {"thread_id": thread_id, "run_id": run_id, "client_message_id": client_message_id,
+                        "status": "interrupted", "interrupts": pending, "values": prior_values,
+                        "origin_message_id": previous_id, "origin_user_id": origin_user_id}
+                replies = [message.get("content", "") for message in input_data.get("messages", [])
+                    if isinstance(message, dict) and message.get("role", message.get("type")) in {"user", "human"}]
+                answer = replies[-1] if replies else ""
+                if not isinstance(answer, str) or not answer.strip():
+                    raise HTTPException(status_code=400, detail="A human clarification is required to resume")
+                resume_payload = {"answers": [answer], "status": "answered",
+                    "responders": [{"id": config_data["configurable"].get("langgraph_auth_user_id", "")}],
+                    "thread_ts": thread_id}
+                origin_message_id = previous_id or client_message_id
             input_data = merge_checkpointed_turn_input(
                 prior_values,
                 input_data,
             )
             prior_turn = int(prior_values.get("turn_number", 0) or 0)
+        except HTTPException:
+            raise
         except Exception as state_exc:  # noqa: BLE001
             # Graphs without a checkpointer still support one-shot runs.
             # Continuity degrades explicitly rather than blocking the request.
@@ -1958,15 +1995,27 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
         # successful execution for this request, even after a chart renders.
         turn_identity = {
             "conversation_id": thread_id,
-            "turn_number": prior_turn + 1,
+            "turn_number": prior_turn if resume_payload is not None else prior_turn + 1,
         }
         input_data.update(turn_identity)
         config_data["configurable"].update(turn_identity)
+        # Native checkpoint metadata preserves scalar turn identity even when
+        # Command(resume) correctly does not append another HumanMessage.
+        durable_identity = {"client_message_id": client_message_id,
+            "origin_message_id": origin_message_id, "origin_user_id": origin_user_id}
+        config_data["configurable"].update({k: v for k, v in durable_identity.items() if v is not None})
+        config_data.setdefault("metadata", {}).update({k: v for k, v in durable_identity.items() if v is not None})
         with supplied_series_context(supplied_source):
             result = await asyncio.wait_for(
-                graph.ainvoke(input_data, config=config_data),
+                graph.ainvoke(Command(resume=resume_payload) if resume_payload is not None else input_data, config=config_data),
                 timeout=GRAPH_TIMEOUT
             )
+        interrupts = []
+        try:
+            interrupts = _interrupt_payloads(await graph.aget_state(config_data))
+        except Exception:
+            LOGGER.warning("run_completion_state_unavailable thread_id=%s run_id=%s", thread_id, run_id)
+        outcome = "interrupted" if interrupts else "success"
 
         try:
             persisted_tool_calls = await persist_run_tool_usage(
@@ -1987,15 +2036,18 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
             )
         
         LOGGER.info(
-            "run_end thread_id=%s run_id=%s client_message_id=%s status=success duration_s=%.1f",
-            thread_id, run_id, client_message_id, time.monotonic() - started,
+            "run_end thread_id=%s run_id=%s client_message_id=%s status=%s duration_s=%.1f",
+            thread_id, run_id, client_message_id, outcome, time.monotonic() - started,
         )
         return {
             "thread_id": thread_id,
             "run_id": run_id,
             "client_message_id": client_message_id,
-            "status": "success",
+            "status": outcome,
             "values": result,
+            "interrupts": interrupts,
+            "origin_message_id": origin_message_id,
+            "origin_user_id": origin_user_id,
         }
     except asyncio.TimeoutError:
         detail = f"Request timed out after {GRAPH_TIMEOUT}s"
@@ -2090,15 +2142,26 @@ async def get_thread_state(
         snapshot = await graph.aget_state(snapshot_config)
 
         next_nodes = list(getattr(snapshot, "next", ()) or ())
-        has_interrupts = bool(getattr(snapshot, "interrupts", ()) or ())
+        interrupt_payloads = _interrupt_payloads(snapshot)
+        has_interrupts = bool(interrupt_payloads)
         terminal = _thread_state_terminal_metadata(snapshot)
 
+        checkpoint_values = checkpoint.checkpoint.get("channel_values", {})
+        humans = [message for message in checkpoint_values.get("messages", [])
+            if (message.get("type", message.get("role")) if isinstance(message, dict) else getattr(message, "type", None)) in {"human", "user"}]
+        last_human = humans[-1] if humans else None
+        checkpoint_metadata = getattr(checkpoint, "metadata", None) or {}
+        origin_message_id = checkpoint_metadata.get("origin_message_id") or (last_human.get("id") if isinstance(last_human, dict) else getattr(last_human, "id", None))
         return {
             "thread_id": thread_id,
+            "client_message_id": checkpoint_metadata.get("client_message_id"),
+            "origin_message_id": origin_message_id,
+            "origin_user_id": checkpoint_metadata.get("origin_user_id"),
             "checkpoint_id": checkpoint.checkpoint.get("id"),
             "values": checkpoint.checkpoint.get("channel_values", {}),
             "next": next_nodes,
             "has_interrupts": has_interrupts,
+            "interrupts": interrupt_payloads,
             "is_terminal": terminal["is_terminal"],
             "status": terminal["status"],
             "error": terminal["error"],
