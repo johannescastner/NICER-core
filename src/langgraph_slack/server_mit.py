@@ -510,7 +510,8 @@ async def _init_checkpointer() -> AsyncPostgresSaver:
     LOGGER.info('Checkpoint connection budget: %s', budget.describe(active_population_count()))
     
     # Create checkpointer with the pool
-    _checkpointer = AsyncPostgresSaver(conn=_connection_pool)
+    from pro.checkpoint_population import checkpoint_serializer
+    _checkpointer = AsyncPostgresSaver(conn=_connection_pool, serde=checkpoint_serializer())
     
     # Setup tables (idempotent - safe to call every startup)
     # Creates: checkpoint_migrations, checkpoints, checkpoint_blobs, checkpoint_writes
