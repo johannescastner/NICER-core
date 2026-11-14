@@ -823,50 +823,9 @@ PYDANTIC_MODELS = {
 }
 
 
-def _with_exhaustive_vector_search(query: str) -> str:
-    """The query with VECTOR_SEARCH searching every filtered row (``use_brute_force``), set on the
-    parsed call rather than by editing its text. BigQuery renders it as ``options => '...'``."""
-    import sqlglot
-    from sqlglot import exp
-
-    tree = sqlglot.parse_one(query, read="bigquery")
-    for call in tree.find_all(exp.VectorSearch):
-        call.set(
-            "options",
-            exp.Kwarg(this=exp.var("options"), expression=exp.Literal.string(json.dumps({"use_brute_force": True}))),
-        )
-    return tree.sql(dialect="bigquery")
-
-
 class PatchedBigQueryVectorStore(BigQueryVectorStore):
-    """
-    The original BigQueryVectorStore has to be patched
-    so that it allows for struct types
-    """
+    """Retain RECORD content support while using native search/filter builders."""
 
-    def _create_search_query(
-        self,
-        num_embeddings: int,
-        filter: Optional[Union[Dict[str, Any], str]] = None,
-        k: int = 5,
-        table_to_query: Any = None,
-        fields_to_exclude: Optional[List[str]] = None,
-    ) -> str:
-        """The base query, searched exhaustively whenever it carries a filter (batch D, 2026-10-07).
-        The table's vector index (IVF, no stored columns) applies a filter after it has chosen its
-        nearest rows, so a namespace's search could return fewer rows than asked, silently
-        (BigQuery's "Manage vector indexes"). BigQuery already chose exhaustive search for these
-        reads on its own cost estimate; this makes it the rule. A search without a filter is the
-        base query unchanged. langchain-google-community 5.x takes this option itself (its
-        ``options``); on that upgrade, pass it there and drop this override."""
-        query = super()._create_search_query(
-            num_embeddings=num_embeddings,
-            filter=filter,
-            k=k,
-            table_to_query=table_to_query,
-            fields_to_exclude=fields_to_exclude,
-        )
-        return _with_exhaustive_vector_search(query) if filter else query
     def _normalize_page_content(self, content: Any) -> str:
         if isinstance(content, dict):
             return json.dumps(content)
@@ -925,28 +884,26 @@ class PatchedBigQueryVectorStore(BigQueryVectorStore):
             ids: List of ids of documents to retrieve from the vectorstore.
             filter: (Optional) A dictionary or a string specifying filter criteria.
                 - If a dictionary is provided, it should map column names to their
-                corresponding values. The method will generate SQL expressions based
-                on the data types defined in `self.table_schema`. The value is enclosed
-                in single quotes unless the column is of type "INTEGER" or "FLOAT", in
-                which case the value is used directly. E.g., `{"str_property": "foo",
-                "int_property": 123}`.
-                - If a string is provided, it is assumed to be a valid SQL WHERE clause.
+                corresponding values. The native builder validates column types and
+                binds values as query parameters alongside the document IDs.
+                E.g., `{"str_property": "foo", "int_property": 123}`.
+                - SQL strings require the native allow_raw_sql_filters opt-in and
+                must come only from a trusted predicate compiler.
         Returns:
             List of ids from adding the texts into the vectorstore.
         """
 
         if ids and len(ids) > 0:
-            job_config = bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ArrayQueryParameter("ids", "STRING", ids),
-                ]
-            )
+            id_parameters = [bigquery.ArrayQueryParameter("ids", "STRING", ids)]
             id_expr = f"{self.doc_id_field} IN UNNEST(@ids)"
         else:
-            job_config = None
+            id_parameters = []
             id_expr = "TRUE"
 
-        where_filter_expr = self._create_filters(filter)
+        # Native 5.x returns SQL and bound filter parameters together.
+        where_filter_expr, filter_parameters = self._create_filters(filter)
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=id_parameters + filter_parameters)
 
         job = self._bq_client.query(  # type: ignore[union-attr]
             f"""
@@ -1456,6 +1413,10 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             )
         # =====================================================================
 
+        # asearch builds its namespace/actor/operator predicate exclusively with
+        # the sqlglot compiler below. Native 5.x requires explicit opt-in for this
+        # trusted SQL path; generic vector stores still reject raw SQL by default.
+        kwargs.setdefault("allow_raw_sql_filters", True)
         vectorstore = PatchedBigQueryVectorStore(
             embedding=get_embedding(),
             project_id=bq_client.project,
@@ -1837,11 +1798,16 @@ class BigQueryMemoryStore(AsyncBatchedBaseStore):
             )
 
             try:
-                result = self.vectorstore.similarity_search_with_score(
-                    query=query,
+                # Native 5.x's text-with-score helper drops **kwargs. Use its
+                # public batch-vector entrypoint so validated VECTOR_SEARCH
+                # options and all query/filter parameters reach the BQ request.
+                result = self.vectorstore.similarity_search_by_vectors(
+                    embeddings=[self.vectorstore.embedding.embed_query(query)],
                     filter=combined_sql,
                     k=limit + offset,
-                )
+                    with_scores=True,
+                    options={"use_brute_force": True},
+                )[0]
             except BaseException:
                 logger.exception(
                     "[asearch:vector] trace=%s worker-failed elapsed_ms=%.0f",
