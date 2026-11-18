@@ -3,6 +3,7 @@ from urllib.parse import urlsplit
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.messages.utils import convert_to_messages
 from pro.tools.superset.ops import ToolEnvelope
+from pro.superset.lumi_copilot.shared_civic.chart_artifact_family import authenticated_family_links
 
 MAX_PNG_BYTES = 16 * 1024 * 1024
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -41,7 +42,9 @@ def approved_chart_uris(messages, bucket_name: str) -> list[str]:
             uri = receipt.superset_receipt.links.get("chart_png_uri")
             if not receipt.ok or not uri:
                 continue
-            chart_object(uri, bucket_name)
+            if receipt.chart_file_delivery and receipt.chart_file_delivery.get("family_id"):
+                if authenticated_family_links(receipt.chart_file_delivery).get("chart_png_uri")!=uri:continue
+            else:chart_object(uri, bucket_name)
         except (ValueError, TypeError):
             continue
         if uri not in approved:
