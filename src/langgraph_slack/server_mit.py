@@ -1893,7 +1893,26 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
     Most Slack traffic goes through /slack/event.
     """
     body = await req.json()
-    
+    if "text/event-stream" in req.headers.get("accept", "").lower():
+        from fastapi.responses import StreamingResponse
+        from langgraph_slack.run_progress import canonical_uuid, stream_run
+
+        try:
+            thread_id = canonical_uuid(body.get("thread_id"))
+            client_message_id = canonical_uuid((body.get("metadata") or {}).get("client_message_id"))
+        except (AttributeError, TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Run activity requires an exact thread and turn")
+        return StreamingResponse(
+            stream_run(lambda progress: _execute_run_request(req, body, progress),
+                       thread_id, client_message_id),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
+    return await _execute_run_request(req, body)
+
+
+async def _execute_run_request(req: Request, body: dict, progress=None):
+    """The unchanged run lifecycle, shared by JSON and opt-in activity."""
     graph_name = body.get("assistant_id", DEFAULT_GRAPH)
     thread_id = body.get("thread_id", str(uuid.uuid4()))
     input_data = body.get("input", {})
@@ -1915,6 +1934,12 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
     # client_message_id carried as the HumanMessage `id` (add_messages upserts
     # by id), so a re-delivered turn cannot duplicate its human row.
     run_id = str(uuid.uuid4())
+    if progress is not None:
+        from langchain_core.runnables.config import merge_configs
+        progress.bind_run(run_id)
+        # The maintained nested Runnable config inherits this request's
+        # callbacks. Never attach the handler to a shared model/agent.
+        config_data = merge_configs(config_data, {"callbacks": [progress]})
     started = time.monotonic()
     LOGGER.info(
         "run_start thread_id=%s run_id=%s client_message_id=%s graph=%s",
