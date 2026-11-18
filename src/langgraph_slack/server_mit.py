@@ -1900,11 +1900,18 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
         try:
             thread_id = canonical_uuid(body.get("thread_id"))
             client_message_id = canonical_uuid((body.get("metadata") or {}).get("client_message_id"))
+            activity_metadata = body.get('metadata') or {}
+            protocol = activity_metadata.get('activity_protocol', 1)
+            if type(protocol) is not int or protocol not in (1,2):raise ValueError('Invalid activity protocol')
+            native_run_id = canonical_uuid(activity_metadata.get('native_run_id')) if protocol == 2 else None
+            activity_actor = activity_metadata.get('superset_user_id') if protocol == 2 else None
+            if protocol == 2 and (type(activity_actor) is not int or activity_actor <= 0 or activity_metadata.get('source') != 'superset' or (body.get('config') or {}).get('configurable', {}).get('superset_user_id') != activity_actor):raise ValueError('Invalid activity actor')
         except (AttributeError, TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Run activity requires an exact thread and turn")
         return StreamingResponse(
             stream_run(lambda progress: _execute_run_request(req, body, progress),
-                       thread_id, client_message_id),
+                       thread_id, client_message_id, protocol=protocol,
+                       actor_id=activity_actor, native_run_id=native_run_id),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )

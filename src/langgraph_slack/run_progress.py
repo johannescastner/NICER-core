@@ -11,6 +11,7 @@ from typing import Any, Callable
 from langchain_core.callbacks import BaseCallbackHandler
 from langgraph.errors import GraphBubbleUp
 from fastapi.encoders import jsonable_encoder
+from pro.superset.lumi_copilot.shared_civic import run_activity as activity_contract
 
 
 PHASES = frozenset({"preparing", "catalogue", "data", "sources", "visual",
@@ -42,21 +43,28 @@ class RunProgress(BaseCallbackHandler):
     """
 
     def __init__(self, thread_id: str, client_message_id: str,
-                 emit: Callable[[dict], None]):
+                 emit: Callable[[dict], None], *, protocol: int = 1, actor_id: int | None = None,
+                 native_run_id: str | None = None):
         self.thread_id = canonical_uuid(thread_id)
         self.client_message_id = canonical_uuid(client_message_id)
         self._emit = emit
         self._lock = threading.RLock()
-        self._active: dict[str, tuple[str, str, float]] = {}
+        self._active: dict[str, tuple[str, str, float, str, str]] = {}
         self._run_id: str | None = None
         self._sequence = 0
         self._closed = False
+        self.protocol = protocol
+        self._trace_bytes = 1024
+        self._trace_stopped = False
+        self._trace = (activity_contract.empty(actor_id, self.thread_id, self.client_message_id,
+            canonical_uuid(native_run_id)) if protocol == 2 else None)
 
     def bind_run(self, run_id: str) -> None:
         with self._lock:
             if self._run_id is not None:
                 raise ValueError("Run activity is already bound")
             self._run_id = canonical_uuid(run_id)
+            if self._trace is not None:self._trace['agent_run_id'] = self._run_id
 
     def close(self) -> None:
         with self._lock:
@@ -64,7 +72,10 @@ class RunProgress(BaseCallbackHandler):
             self._active.clear()
 
     def _event(self, task_id: str, phase: str, state: str,
-               elapsed_ms: int | None = None) -> None:
+               elapsed_ms: int | None = None, *, action: str = 'model_response', kind: str = 'model') -> None:
+        if self._sequence >= 1000000:
+            if self._trace is not None:self._trace['truncated']=True
+            return
         self._sequence += 1
         event = {"type": "activity", "thread_id": self.thread_id,
                  "client_message_id": self.client_message_id,
@@ -72,17 +83,29 @@ class RunProgress(BaseCallbackHandler):
                  "task_id": task_id, "phase": phase, "state": state}
         if elapsed_ms is not None:
             event["elapsed_ms"] = max(0, elapsed_ms)
+        if self.protocol == 2:
+            event.update(protocol=2, action=action, kind=kind)
+            compact = {k:event[k] for k in activity_contract.EVENT_FIELDS if k in event}
+            self._trace['observed_count'] = self._sequence
+            if not self._trace_stopped:
+                size = len(activity_contract.canonical(compact).encode()) + 1
+                if len(self._trace['events']) >= activity_contract.MAX_EVENTS or self._trace_bytes + size > activity_contract.MAX_BYTES:
+                    self._trace['truncated'] = True
+                    self._trace_stopped = True
+                else:
+                    self._trace['events'].append(compact);self._trace_bytes += size
         self._emit(event)
 
-    def _start(self, callback_id: Any, phase: str) -> None:
+    def _start(self, callback_id: Any, phase: str, *, action: str = 'model_response', kind: str = 'model') -> None:
         key = canonical_uuid(callback_id)
         with self._lock:
             if (self._closed or self._run_id is None or key in self._active
                     or len(self._active) >= MAX_ACTIVE):
+                if self._trace is not None and len(self._active) >= MAX_ACTIVE:self._trace['truncated'] = True
                 return
             task_id = str(uuid.uuid4())
-            self._active[key] = (task_id, phase, time.monotonic())
-            self._event(task_id, phase, "started")
+            self._active[key] = (task_id, phase, time.monotonic(), action, kind)
+            self._event(task_id, phase, "started", action=action, kind=kind)
 
     def _end(self, callback_id: Any, failed: bool = False) -> None:
         key = canonical_uuid(callback_id)
@@ -92,14 +115,20 @@ class RunProgress(BaseCallbackHandler):
             active = self._active.pop(key, None)
             if active is None:
                 return
-            task_id, phase, started = active
+            task_id, phase, started, action, kind = active
             self._event(task_id, phase, "failed" if failed else "finished",
-                        int((time.monotonic() - started) * 1000))
+                        int((time.monotonic() - started) * 1000), action=action, kind=kind)
 
     def on_tool_start(self, serialized: dict | None, input_str: str, *,
                       run_id: uuid.UUID, **kwargs: Any) -> None:
         name = serialized.get("name") if isinstance(serialized, dict) else None
-        self._start(run_id, TOOL_PHASES.get(name, "step") if isinstance(name, str) else "step")
+        # This identifier comes from the registered BaseTool's maintained
+        # callback, never tool-call text, arguments or returned content.
+        action = name if isinstance(name,str) and activity_contract.ACTION.fullmatch(name) else 'unidentified_tool'
+        if self._trace is not None and action == 'unidentified_tool':
+            self._trace['truncated'] = True
+            return
+        self._start(run_id, TOOL_PHASES.get(name, "step") if isinstance(name, str) else "step", action=action, kind='tool')
 
     def on_tool_end(self, output: Any, *, run_id: uuid.UUID, **kwargs: Any) -> None:
         # A handled tool error is a ToolMessage, not necessarily an exception.
@@ -134,7 +163,16 @@ class RunProgress(BaseCallbackHandler):
         self._end(run_id, True)
 
 
-async def stream_run(invoke: Callable, thread_id: str, client_message_id: str):
+    def snapshot(self, outcome: str):
+        with self._lock:
+            if self._trace is None:return None
+            value = activity_contract.validate(self._trace)
+            value.update(state='sealed', outcome=outcome,
+                complete=not value['truncated'] and value['observed_count']==len(value['events']))
+            return activity_contract.validate(value)
+
+
+async def stream_run(invoke: Callable, thread_id: str, client_message_id: str, *, protocol=1, actor_id=None, native_run_id=None):
     """Stream safe activity and one private service-to-service result.
 
     The graph task has one owner and is never reinvoked. A disconnected consumer
@@ -152,17 +190,20 @@ async def stream_run(invoke: Callable, thread_id: str, client_message_id: str):
     def emit(event):
         loop.call_soon_threadsafe(enqueue, event)
 
-    progress = RunProgress(thread_id, client_message_id, emit)
+    progress = RunProgress(thread_id, client_message_id, emit, protocol=protocol, actor_id=actor_id, native_run_id=native_run_id)
 
     async def produce():
         try:
             result = await invoke(progress)
+            if protocol == 2 and isinstance(result,dict):
+                result = {**result, 'activity_trace': progress.snapshot(result.get('status','success'))}
             event = {"type": "result", "result": result}
         except Exception as error:
             # The existing handler already logs failures. Never relay its raw
             # detail/exception (which may contain private data) as activity.
             code = getattr(error, "status_code", 500)
             event = {"type": "run_error", "status_code": code if type(code) is int else 500}
+            if protocol == 2 and progress._run_id is not None:event['activity_trace'] = progress.snapshot('failed')
         finally:
             progress.close()
         if accepting:
