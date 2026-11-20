@@ -15,6 +15,18 @@ class DeepSeekWithReasoning(ChatDeepSeek):
         # The SDK has already applied invocation overrides to instance defaults.
         # Explicit non-thinking requests must retain its unmodified serializer.
         extra = payload.get("extra_body")
+        choice = payload.get("tool_choice")
+        forced = choice == "required" or (
+            isinstance(choice, dict) and choice.get("type") == "function"
+        )
+        if payload.get("tools") and forced:
+            # DeepSeek rejects required/named tool choices in thinking mode.
+            # Keep the caller's forced-tool contract, using the provider's native
+            # non-thinking mode for this invocation only. Never mutate defaults
+            # on the shared model or weaken a clarification-only tool registry.
+            extra = dict(extra or {})
+            extra["thinking"] = {"type": "disabled"}
+            payload["extra_body"] = extra
         thinking = extra.get("thinking") if isinstance(extra, dict) else None
         if isinstance(thinking, dict) and thinking.get("type") == "disabled":
             return payload
