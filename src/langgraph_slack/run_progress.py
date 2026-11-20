@@ -26,6 +26,7 @@ TOOL_PHASES = {
 }
 MAX_ACTIVE = 16
 MAX_QUEUED = 128
+MAX_ANCESTRY = 8192
 
 
 def canonical_uuid(value: Any) -> str:
@@ -44,7 +45,7 @@ class RunProgress(BaseCallbackHandler):
 
     def __init__(self, thread_id: str, client_message_id: str,
                  emit: Callable[[dict], None], *, protocol: int = 1, actor_id: int | None = None,
-                 native_run_id: str | None = None):
+                 native_run_id: str | None = None, include_parent_ids: bool = False):
         self.thread_id = canonical_uuid(thread_id)
         self.client_message_id = canonical_uuid(client_message_id)
         self._emit = emit
@@ -53,6 +54,10 @@ class RunProgress(BaseCallbackHandler):
         self._run_id: str | None = None
         self._sequence = 0
         self._closed = False
+        self._include_parent_ids = protocol == 2 and include_parent_ids
+        self._parents: dict[str, str | None] = {}
+        self._callback_tasks: dict[str, str] = {}
+        self._task_parents: dict[str, str] = {}
         self.protocol = protocol
         self._trace_bytes = 1024
         self._trace_stopped = False
@@ -70,6 +75,9 @@ class RunProgress(BaseCallbackHandler):
         with self._lock:
             self._closed = True
             self._active.clear()
+            self._parents.clear()
+            self._callback_tasks.clear()
+            self._task_parents.clear()
 
     def _event(self, task_id: str, phase: str, state: str,
                elapsed_ms: int | None = None, *, action: str = 'model_response', kind: str = 'model') -> None:
@@ -85,6 +93,8 @@ class RunProgress(BaseCallbackHandler):
             event["elapsed_ms"] = max(0, elapsed_ms)
         if self.protocol == 2:
             event.update(protocol=2, action=action, kind=kind)
+            if task_id in self._task_parents:
+                event['parent_task_id'] = self._task_parents[task_id]
             compact = {k:event[k] for k in activity_contract.EVENT_FIELDS if k in event}
             self._trace['observed_count'] = self._sequence
             if not self._trace_stopped:
@@ -96,7 +106,26 @@ class RunProgress(BaseCallbackHandler):
                     self._trace['events'].append(compact);self._trace_bytes += size
         self._emit(event)
 
-    def _start(self, callback_id: Any, phase: str, *, action: str = 'model_response', kind: str = 'model') -> None:
+    def _remember_parent(self, callback_id: Any, parent_id: Any) -> None:
+        if not self._include_parent_ids or self._closed:return
+        key = canonical_uuid(callback_id)
+        parent = canonical_uuid(parent_id) if parent_id is not None else None
+        if key in self._parents:
+            if self._parents[key] != parent:self._trace['truncated'] = True
+            return
+        if len(self._parents) >= MAX_ANCESTRY:
+            self._trace['truncated'] = True
+            return
+        self._parents[key] = parent
+
+    def on_chain_start(self, serialized: dict | None, inputs: Any, *,
+                       run_id: uuid.UUID, parent_run_id: uuid.UUID | None = None,
+                       **kwargs: Any) -> None:
+        # Native callback ancestry crosses Pregel/ToolNode scopes. Retain only
+        # their identities, never graph inputs, prompts or private reasoning.
+        with self._lock:self._remember_parent(run_id, parent_run_id)
+
+    def _start(self, callback_id: Any, phase: str, *, action: str = 'model_response', kind: str = 'model', parent_run_id: Any = None) -> None:
         key = canonical_uuid(callback_id)
         with self._lock:
             if (self._closed or self._run_id is None or key in self._active
@@ -104,6 +133,22 @@ class RunProgress(BaseCallbackHandler):
                 if self._trace is not None and len(self._active) >= MAX_ACTIVE:self._trace['truncated'] = True
                 return
             task_id = str(uuid.uuid4())
+            if self._include_parent_ids:
+                self._remember_parent(key, parent_run_id)
+                parent = self._parents.get(key)
+                seen = {key}
+                while parent is not None and parent not in seen:
+                    if parent in self._callback_tasks:
+                        if len(self._task_parents) < activity_contract.MAX_EVENTS:
+                            self._task_parents[task_id] = self._callback_tasks[parent]
+                        else:self._trace['truncated'] = True
+                        break
+                    seen.add(parent)
+                    parent = self._parents.get(parent)
+                if parent in seen:self._trace['truncated'] = True
+                if len(self._callback_tasks) < activity_contract.MAX_EVENTS:
+                    self._callback_tasks[key] = task_id
+                else:self._trace['truncated'] = True
             self._active[key] = (task_id, phase, time.monotonic(), action, kind)
             self._event(task_id, phase, "started", action=action, kind=kind)
 
@@ -128,7 +173,7 @@ class RunProgress(BaseCallbackHandler):
         if self._trace is not None and action == 'unidentified_tool':
             self._trace['truncated'] = True
             return
-        self._start(run_id, TOOL_PHASES.get(name, "step") if isinstance(name, str) else "step", action=action, kind='tool')
+        self._start(run_id, TOOL_PHASES.get(name, "step") if isinstance(name, str) else "step", action=action, kind='tool', parent_run_id=kwargs.get('parent_run_id'))
 
     def on_tool_end(self, output: Any, *, run_id: uuid.UUID, **kwargs: Any) -> None:
         # A handled tool error is a ToolMessage, not necessarily an exception.
@@ -148,11 +193,11 @@ class RunProgress(BaseCallbackHandler):
 
     def on_chat_model_start(self, serialized: dict, messages: list, *,
                             run_id: uuid.UUID, **kwargs: Any) -> None:
-        self._start(run_id, "preparing")
+        self._start(run_id, "preparing", parent_run_id=kwargs.get('parent_run_id'))
 
     def on_llm_start(self, serialized: dict, prompts: list, *,
                      run_id: uuid.UUID, **kwargs: Any) -> None:
-        self._start(run_id, "preparing")
+        self._start(run_id, "preparing", parent_run_id=kwargs.get('parent_run_id'))
 
     def on_llm_end(self, response: Any, *, run_id: uuid.UUID,
                    **kwargs: Any) -> None:
@@ -172,7 +217,7 @@ class RunProgress(BaseCallbackHandler):
             return activity_contract.validate(value)
 
 
-async def stream_run(invoke: Callable, thread_id: str, client_message_id: str, *, protocol=1, actor_id=None, native_run_id=None):
+async def stream_run(invoke: Callable, thread_id: str, client_message_id: str, *, protocol=1, actor_id=None, native_run_id=None, include_parent_ids=False):
     """Stream safe activity and one private service-to-service result.
 
     The graph task has one owner and is never reinvoked. A disconnected consumer
@@ -190,7 +235,7 @@ async def stream_run(invoke: Callable, thread_id: str, client_message_id: str, *
     def emit(event):
         loop.call_soon_threadsafe(enqueue, event)
 
-    progress = RunProgress(thread_id, client_message_id, emit, protocol=protocol, actor_id=actor_id, native_run_id=native_run_id)
+    progress = RunProgress(thread_id, client_message_id, emit, protocol=protocol, actor_id=actor_id, native_run_id=native_run_id, include_parent_ids=include_parent_ids)
 
     async def produce():
         try:
