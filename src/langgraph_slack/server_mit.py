@@ -1905,6 +1905,12 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
             if type(protocol) is not int or protocol not in (1,2):raise ValueError('Invalid activity protocol')
             include_parent_ids = activity_metadata.get('activity_parent_ids', False)
             if type(include_parent_ids) is not bool or include_parent_ids and protocol != 2:raise ValueError('Invalid activity hierarchy')
+            include_sql_queries = activity_metadata.get('activity_sql_queries', False)
+            if type(include_sql_queries) is not bool or include_sql_queries and protocol != 2:raise ValueError('Invalid SQL activity inspection')
+            include_graph_scopes = activity_metadata.get('activity_graph_scopes', False)
+            if type(include_graph_scopes) is not bool or include_graph_scopes and (protocol != 2 or not include_parent_ids):raise ValueError('Invalid graph activity scopes')
+            include_step_details = activity_metadata.get('activity_step_details', False)
+            if type(include_step_details) is not bool or include_step_details and (protocol != 2 or not include_parent_ids):raise ValueError('Invalid activity step details')
             native_run_id = canonical_uuid(activity_metadata.get('native_run_id')) if protocol == 2 else None
             activity_actor = activity_metadata.get('superset_user_id') if protocol == 2 else None
             if protocol == 2 and (type(activity_actor) is not int or activity_actor <= 0 or activity_metadata.get('source') != 'superset' or (body.get('config') or {}).get('configurable', {}).get('superset_user_id') != activity_actor):raise ValueError('Invalid activity actor')
@@ -1914,7 +1920,7 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
             stream_run(lambda progress: _execute_run_request(req, body, progress),
                        thread_id, client_message_id, protocol=protocol,
                        actor_id=activity_actor, native_run_id=native_run_id,
-                       include_parent_ids=include_parent_ids),
+                       include_parent_ids=include_parent_ids, include_sql_queries=include_sql_queries, include_graph_scopes=include_graph_scopes, include_step_details=include_step_details),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
@@ -1950,6 +1956,7 @@ async def _execute_run_request(req: Request, body: dict, progress=None):
         # The maintained nested Runnable config inherits this request's
         # callbacks. Never attach the handler to a shared model/agent.
         config_data = merge_configs(config_data, {"callbacks": [progress]})
+        if progress._include_graph_scopes and graph_name == "swarm":config_data["run_name"] = graph_name
     started = time.monotonic()
     LOGGER.info(
         "run_start thread_id=%s run_id=%s client_message_id=%s graph=%s",
