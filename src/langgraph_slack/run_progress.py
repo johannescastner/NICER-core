@@ -237,7 +237,12 @@ class RunProgress(BaseCallbackHandler):
             inputs = kwargs.get('inputs')
             if inputs is None and isinstance(input_str,str) and len(input_str)<=200000:
                 try:inputs=json.loads(input_str)
-                except (ValueError,TypeError):pass
+                except (ValueError,TypeError):
+                    # BaseTool.invoke(str) passes the exact sole argument here
+                    # and inputs=None. It is not a JSON-encoded argument dict.
+                    # This fallback belongs only to the registered query tool;
+                    # other raw tool input must not become SQL or configuration.
+                    if action == 'sql_database_query':inputs={'query':input_str}
             sql = inputs.get('query' if action == 'sql_database_query' else 'sql') if isinstance(inputs,dict) else None
             if isinstance(sql,str) and sql.strip() and '\x00' not in sql:
                 try:
@@ -289,7 +294,13 @@ class RunProgress(BaseCallbackHandler):
 
     def on_chat_model_start(self, serialized: dict, messages: list, *,
                             run_id: uuid.UUID, **kwargs: Any) -> None:
-        self._start(run_id, "preparing", parent_run_id=kwargs.get('parent_run_id'))
+        # This registered wrapper performs the existing chart-image review.
+        # LangChain supplies its class identity; never infer the stage from a
+        # prompt, model response, tool argument or provider-supplied name.
+        review = isinstance(serialized, dict) and serialized.get('id') == [
+            'pro', 'ml_inference', 'qwen_vl_chat', 'ChatQwen25VL']
+        self._start(run_id, "visual" if review else "preparing",
+                    parent_run_id=kwargs.get('parent_run_id'))
 
     def on_llm_start(self, serialized: dict, prompts: list, *,
                      run_id: uuid.UUID, **kwargs: Any) -> None:
@@ -319,6 +330,16 @@ class RunProgress(BaseCallbackHandler):
                         if self._include_step_details:self._tool_arguments[origin]=self._inspection_value('call_arguments',call.get('args',{}))
                     else:self._trace['truncated'] = True
             returned=self._inspection_value('returned_value',message.content) if self._include_step_details and message is not None else {}
+            active = self._active.get(key)
+            if self._include_step_details and active and active[1] == 'visual' and message is not None:
+                # The structured reviewer returns its decision as a tool call,
+                # with empty message content. Retain that actual bounded result
+                # under the same callback, not a fictional executed tool step.
+                reviews = [call['args'] for call in getattr(message, 'tool_calls', []) or []
+                           if isinstance(call, dict) and call.get('name') == 'ChartValidation'
+                           and isinstance(call.get('args'), dict)]
+                if len(reviews) == 1:
+                    returned = self._inspection_value('returned_value', reviews[0])
             self._end(run_id,returned=returned)
 
     def on_llm_error(self, error: BaseException, *, run_id: uuid.UUID,
