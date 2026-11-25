@@ -453,18 +453,10 @@ class ConversationLogger:
                 max_chars
             )
 
-        # Apply tone analysis via Modal API (non-blocking HTTP call)
-        tone_analysis = await self.analyze_turn_tone(
-            safe_content,
-            speaker,
-            agent_name
+        tone_analysis, embed_result = await asyncio.gather(
+            self.analyze_turn_tone(safe_content, speaker, agent_name),
+            self.generate_embedding(safe_content),
         )
-
-        # Generate embedding via Modal API (non-blocking HTTP call).
-        # PR-A0-13b: result is an explicit ``EmbeddingAttempt`` —
-        # on failure, embedding is None (not []) and status carries
-        # the exception class name for the audit trail.
-        embed_result = await self.generate_embedding(safe_content)
 
         # Validate turn_number
         if not isinstance(turn_number, int) or turn_number < 1:
