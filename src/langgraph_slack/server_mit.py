@@ -107,6 +107,10 @@ _checkpointer: Optional[AsyncPostgresSaver] = None
 
 # Global connection pool - initialized in lifespan, cleaned up on shutdown
 _connection_pool: Optional[AsyncConnectionPool] = None
+# The existing startup verification already reads these server settings. Keep
+# its non-secret measurement so the release operator can reconcile autoscaling
+# against the actual server, rather than guessing from a declared budget.
+_checkpoint_capacity: Optional[Dict[str, Any]] = None
 
 # Compiled graphs - initialized in lifespan
 _compiled_graphs: Dict[str, CompiledStateGraph] = {}
@@ -460,7 +464,8 @@ async def _init_checkpointer() -> AsyncPostgresSaver:
     - row_factory=dict_row: Required because AsyncPostgresSaver uses dict-style row access
     - prepare_threshold=0: Prevents DuplicatePreparedStatement errors in connection pools
     """
-    global _checkpointer, _connection_pool
+    global _checkpointer, _connection_pool, _checkpoint_capacity
+    _checkpoint_capacity = None
     
     database_uri = _build_database_uri()
     from pro.checkpoint_budget import checkpoint_budget, connection_name
@@ -507,6 +512,9 @@ async def _init_checkpointer() -> AsyncPostgresSaver:
             "current_setting('superuser_reserved_connections')::int AS reserved")
         capacity = await cursor.fetchone()
         budget.verify_database(capacity['capacity'], capacity['reserved'])
+        _checkpoint_capacity = {"max_connections": capacity['capacity'],
+            "superuser_reserved_connections": capacity['reserved'],
+            "measured_at_epoch": time.time(), "measurement": "startup"}
     LOGGER.info('Checkpoint connection budget: %s', budget.describe(active_population_count()))
     
     # Create checkpointer with the pool
@@ -523,7 +531,7 @@ async def _init_checkpointer() -> AsyncPostgresSaver:
 
 async def _cleanup_checkpointer():
     """Cleanup connection pool on shutdown."""
-    global _connection_pool, _checkpointer
+    global _connection_pool, _checkpointer, _checkpoint_capacity
     
     if _connection_pool:
         try:
@@ -534,6 +542,7 @@ async def _cleanup_checkpointer():
         _connection_pool = None
     
     _checkpointer = None
+    _checkpoint_capacity = None
 
 
 async def _compile_graphs(checkpointer: AsyncPostgresSaver) -> Dict[str, CompiledStateGraph]:
@@ -1374,6 +1383,10 @@ async def lifespan(app: FastAPI):
         from pro.checkpoint_population import reset_populations
         await asyncio.to_thread(reset_populations)
         await _cleanup_checkpointer()
+        # Native SDK batching stays off the citizen response path. Its own
+        # bounded drain preserves pending traces during graceful termination.
+        from pro.monitoring.langsmith_integration import close_langsmith_integration
+        await asyncio.to_thread(close_langsmith_integration, timeout=3.0)
 
 
 APP = FastAPI(lifespan=lifespan)
@@ -1406,6 +1419,7 @@ async def health():
         "checkpointer": "connected" if _checkpointer else "disconnected",
         "pool": pool_info,
         "checkpoint_budget": checkpoint_budget(populations=active_population_count()).describe(active_population_count()),
+        "checkpoint_capacity": dict(_checkpoint_capacity) if _connection_pool and _checkpoint_capacity else None,
         "inner_pools": population_pool_stats(),
     }
 
@@ -1911,6 +1925,8 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
             if type(include_graph_scopes) is not bool or include_graph_scopes and (protocol != 2 or not include_parent_ids):raise ValueError('Invalid graph activity scopes')
             include_step_details = activity_metadata.get('activity_step_details', False)
             if type(include_step_details) is not bool or include_step_details and (protocol != 2 or not include_parent_ids):raise ValueError('Invalid activity step details')
+            include_failure_details = activity_metadata.get('activity_failure_details',False)
+            if type(include_failure_details) is not bool or include_failure_details and protocol != 2:raise ValueError('Invalid failure detail negotiation')
             native_run_id = canonical_uuid(activity_metadata.get('native_run_id')) if protocol == 2 else None
             activity_actor = activity_metadata.get('superset_user_id') if protocol == 2 else None
             if protocol == 2 and (type(activity_actor) is not int or activity_actor <= 0 or activity_metadata.get('source') != 'superset' or (body.get('config') or {}).get('configurable', {}).get('superset_user_id') != activity_actor):raise ValueError('Invalid activity actor')
@@ -1920,7 +1936,7 @@ async def create_run(req: Request, _: None = Depends(verify_request)):
             stream_run(lambda progress: _execute_run_request(req, body, progress),
                        thread_id, client_message_id, protocol=protocol,
                        actor_id=activity_actor, native_run_id=native_run_id,
-                       include_parent_ids=include_parent_ids, include_sql_queries=include_sql_queries, include_graph_scopes=include_graph_scopes, include_step_details=include_step_details),
+                       include_parent_ids=include_parent_ids, include_sql_queries=include_sql_queries, include_graph_scopes=include_graph_scopes, include_step_details=include_step_details, include_failure_details=include_failure_details),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
@@ -1983,6 +1999,22 @@ async def _execute_run_request(req: Request, body: dict, progress=None):
         raise HTTPException(status_code=401, detail="Frontend delegation is required")
 
     try:
+        # A human applying reviewed source configuration uses the same renderer,
+        # delegation and run lifecycle. This closed command never invokes an LLM.
+        has_command = "command" in body
+        if has_command and (not delegation_token or metadata.get("source") != "superset"
+                or type(metadata.get("superset_user_id")) is not int
+                or metadata["superset_user_id"] != config_data["configurable"].get("superset_user_id")):
+            raise HTTPException(status_code=401, detail="Source configuration requires the current Native delegation")
+        if has_command:
+            from langgraph_slack.run_progress import canonical_uuid
+            try:
+                canonical_uuid(thread_id)
+                canonical_uuid(client_message_id)
+                if config_data["configurable"].get("client_message_id") != client_message_id:
+                    raise ValueError("Mismatched turn")
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail="Source configuration requires the exact Native thread and initiating message")
         from pro.supplied_data import incoming_series, supplied_series_context
         # Capture the authenticated incoming turn BEFORE checkpoint history is merged.
         supplied_source = incoming_series(input_data.get("messages", []))
@@ -1997,6 +2029,8 @@ async def _execute_run_request(req: Request, body: dict, progress=None):
             pending = _interrupt_payloads(prior_snapshot)
             prior_metadata = getattr(prior_snapshot, "metadata", None) or {}
             if pending:
+                if has_command:
+                    raise HTTPException(status_code=409, detail="Resolve the current conversation clarification before applying a source configuration")
                 prior_humans = [message for message in prior_values.get("messages", [])
                     if (message.get("type", message.get("role")) if isinstance(message, dict) else getattr(message, "type", None)) in {"human", "user"}]
                 previous = prior_humans[-1] if prior_humans else None
@@ -2023,6 +2057,8 @@ async def _execute_run_request(req: Request, body: dict, progress=None):
         except HTTPException:
             raise
         except Exception as state_exc:  # noqa: BLE001
+            if has_command:
+                raise HTTPException(status_code=503, detail="The saved conversation could not be checked; no map configuration was applied") from None
             # Graphs without a checkpointer still support one-shot runs.
             # Continuity degrades explicitly rather than blocking the request.
             LOGGER.warning(
@@ -2049,10 +2085,32 @@ async def _execute_run_request(req: Request, body: dict, progress=None):
         config_data["configurable"].update({k: v for k, v in durable_identity.items() if v is not None})
         config_data.setdefault("metadata", {}).update({k: v for k, v in durable_identity.items() if v is not None})
         with supplied_series_context(supplied_source):
-            result = await asyncio.wait_for(
-                graph.ainvoke(Command(resume=resume_payload) if resume_payload is not None else input_data, config=config_data),
-                timeout=GRAPH_TIMEOUT
-            )
+            if has_command:
+                if _checkpointer is None:
+                    raise HTTPException(status_code=503, detail="The existing conversation checkpoint is required for source configuration")
+                # LangGraph's existing terminal writer preserves actual command
+                # history without running any graph node or scheduling work.
+                from langgraph.graph import END
+                terminal_nodes = {edge.source for edge in graph.get_graph().edges
+                    if edge.target == END and not edge.conditional}
+                if len(terminal_nodes) != 1:
+                    raise HTTPException(status_code=409, detail="This conversation graph has no unambiguous source-command checkpoint")
+                from pro.civic.geographic_config_command import (
+                    build_geographic_config_command_tools, execute_geographic_config_command)
+                def render_source_configuration():
+                    client, render_tool = build_geographic_config_command_tools()
+                    return execute_geographic_config_command(body["command"], client=client,
+                        render_tool=render_tool, config=config_data)
+                executed = await asyncio.wait_for(asyncio.to_thread(render_source_configuration), timeout=GRAPH_TIMEOUT)
+                result = {"messages": [*input_data.get("messages", []), *executed["messages"]],
+                    **turn_identity, "command_result": executed["artifactresult"]}
+                await graph.aupdate_state(config_data,
+                    {"messages": result["messages"], **turn_identity}, as_node=next(iter(terminal_nodes)))
+            else:
+                result = await asyncio.wait_for(
+                    graph.ainvoke(Command(resume=resume_payload) if resume_payload is not None else input_data, config=config_data),
+                    timeout=GRAPH_TIMEOUT
+                )
         interrupts = []
         try:
             interrupts = _interrupt_payloads(await graph.aget_state(config_data))
@@ -2116,6 +2174,8 @@ async def _execute_run_request(req: Request, body: dict, progress=None):
             )
         raise HTTPException(status_code=504, detail=detail)
     except Exception as e:
+        if has_command and isinstance(e, HTTPException):
+            raise
         LOGGER.exception(
             "run_end thread_id=%s run_id=%s client_message_id=%s status=failed duration_s=%.1f: %s",
             thread_id, run_id, client_message_id, time.monotonic() - started, e,

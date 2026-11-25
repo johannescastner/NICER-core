@@ -233,6 +233,14 @@ class RunProgress(BaseCallbackHandler):
             self._trace['truncated'] = True
             return
         query = {}
+        # Programmatic catalogue calls and resumed/native ToolNode calls do
+        # not always have a preceding model callback in this request. The
+        # registered tool's actual inputs still identify discovery vs reading.
+        # Keep the same task lifecycle and negotiated bounded detail contract.
+        if self._include_step_details and action == 'civic_evidence':
+            inputs = kwargs.get('inputs')
+            if isinstance(inputs, dict):
+                query.update(self._inspection_value('call_arguments', inputs))
         if self._include_sql_queries and action in activity_contract.QUERY_ACTIONS:
             inputs = kwargs.get('inputs')
             if inputs is None and isinstance(input_str,str) and len(input_str)<=200000:
@@ -356,7 +364,7 @@ class RunProgress(BaseCallbackHandler):
             return activity_contract.validate(value)
 
 
-async def stream_run(invoke: Callable, thread_id: str, client_message_id: str, *, protocol=1, actor_id=None, native_run_id=None, include_parent_ids=False, include_sql_queries=False, include_graph_scopes=False, include_step_details=False):
+async def stream_run(invoke: Callable, thread_id: str, client_message_id: str, *, protocol=1, actor_id=None, native_run_id=None, include_parent_ids=False, include_sql_queries=False, include_graph_scopes=False, include_step_details=False, include_failure_details=False):
     """Stream safe activity and one private service-to-service result.
 
     The graph task has one owner and is never reinvoked. A disconnected consumer
@@ -388,6 +396,7 @@ async def stream_run(invoke: Callable, thread_id: str, client_message_id: str, *
             code = getattr(error, "status_code", 500)
             event = {"type": "run_error", "status_code": code if type(code) is int else 500}
             if protocol == 2 and progress._run_id is not None:event['activity_trace'] = progress.snapshot('failed')
+            if protocol == 2 and include_failure_details:event['failure_kind'] = activity_contract.failure_kind(error)
         finally:
             progress.close()
         if accepting:
