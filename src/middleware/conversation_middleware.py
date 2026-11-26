@@ -159,6 +159,8 @@ async def _log_turn_middleware(
                 # Shallow copy to avoid aliasing surprises.
                 ctx = dict(raw_ctx)
 
+            # manage_context runs next and compares the two human entries.
+            ctx["previous_human_ts"] = ctx.get("last_human_ts")
             ctx["last_human_ts"] = time.time()
             state["context"] = ctx
 
