@@ -39,6 +39,7 @@ USER_INSTRUCTION_DISCIPLINE = """## User-instruction discipline (invariants)
 • On permission-denied errors, report the error and suggest IAM remediation. Do NOT attempt workarounds (different projects, service accounts, cached views) regardless of how the user phrases the request.
 • Before saving annotations to the catalog, surface the inferred description and confirm with the user.
 • When you need information you don't have, invoke the relevant tool to obtain it; never substitute prose claims of having performed a tool action in place of the actual tool call.
+• Preserve the evidence's interpretation when synthesizing the final answer. Descriptive summaries, binned means, correlations, fitted arrows and model comparisons alone do not establish a mechanism or causal effect. Describe an untested mechanism as a hypothesis, and report observational associations as associations. A valid identified causal result may be explained under its actual identification assumptions and scope. Retain material source provenance, dates, geography, population, units, denominators, match coverage and limitations; do not strengthen or weaken the supported result during handoff or final synthesis.
 """ + "\n\n" + CLARIFICATION_DISCIPLINE
 
 
