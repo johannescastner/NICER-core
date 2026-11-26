@@ -1813,12 +1813,13 @@ async def _persist_thread_terminal_error(
     graph,
     config,
     error,
+    replace_existing=False,
 ) -> None:
     """Persist a terminal error on every unfinished task in the exact snapshot.
 
-    LangGraph 0.6.x materializes the reserved ``__error__`` pending-write
-    channel as ``StateSnapshot.tasks[*].error``. This repository pins
-    LangGraph below 1.0 and regression-tests this exact installed behavior.
+    The installed LangGraph materializes the reserved ``__error__`` pending-
+    write channel as ``StateSnapshot.tasks[*].error``. The mandatory agent
+    stack tests exercise its real MemorySaver and PostgresSaver contracts.
 
     The server owns the outer GRAPH_TIMEOUT, so it must also make that timeout
     durable; otherwise cancellation leaves ``snapshot.next`` populated with
@@ -1841,7 +1842,11 @@ async def _persist_thread_terminal_error(
     )
 
     for task in tuple(getattr(snapshot, "tasks", ()) or ()):
-        if getattr(task, "error", None) is not None:
+        # A parallel task may already have a cached successful result, even
+        # while another same-name task is interrupted. Preserve that record.
+        if replace_existing and getattr(task, "result", None) is not None:
+            continue
+        if getattr(task, "error", None) is not None and not replace_existing:
             continue
 
         task_id = getattr(task, "id", None)
@@ -1853,6 +1858,51 @@ async def _persist_thread_terminal_error(
             [("__error__", error_text)],
             task_id=task_id,
         )
+
+
+
+async def _persist_resumed_turn_identity(checkpointer, config, prior_snapshot):
+    """Bind a settled resumed invocation without rewriting its graph state.
+
+    Command(resume) may fail before a new checkpoint is produced. Its pending
+    writes retain the error/resume but not the current Native message identity.
+    The Native running-claim admission supplies serialization; saver.aput is
+    the installed checkpoint writer, not an additional compare-and-swap lock.
+    """
+    if checkpointer is None:
+        return
+    identity = {key: (config.get("metadata") or {}).get(key)
+                for key in ("client_message_id", "origin_message_id", "origin_user_id")}
+    if identity["client_message_id"] is None:
+        return
+    previous = getattr(prior_snapshot, "metadata", None) or {}
+    if (identity["origin_message_id"] != previous.get("origin_message_id")
+            or identity["origin_user_id"] != previous.get("origin_user_id")):
+        raise ValueError("The resumed invocation origin changed")
+    expected = (getattr(prior_snapshot, "config", None) or {}).get("configurable") or {}
+    scope = {key: expected.get(key) for key in ("thread_id", "checkpoint_ns")}
+    if (not expected.get("checkpoint_id")
+            or scope["thread_id"] != config.get("configurable", {}).get("thread_id")):
+        raise ValueError("The resumed invocation has no exact checkpoint")
+    saved = await checkpointer.aget_tuple({"configurable": scope})
+    if saved is None:
+        raise ValueError("The resumed checkpoint is unavailable")
+    # A normal advancing invocation has already stored its own identity.
+    if saved.metadata.get("client_message_id") == identity["client_message_id"]:
+        if any(saved.metadata.get(key) != identity[key]
+               for key in ("origin_message_id", "origin_user_id")):
+            raise ValueError("The current checkpoint origin changed")
+        return
+    actual = saved.config.get("configurable", {})
+    if (any(actual.get(key) != expected.get(key)
+            for key in ("thread_id", "checkpoint_ns", "checkpoint_id"))
+            or saved.metadata.get("client_message_id") != previous.get("client_message_id")
+            or any(saved.metadata.get(key) != identity[key]
+                   for key in ("origin_message_id", "origin_user_id"))):
+        raise ValueError("A different invocation owns the current checkpoint")
+    parent = saved.parent_config or {"configurable": scope}
+    await checkpointer.aput(parent, saved.checkpoint,
+                            {**saved.metadata, **identity}, {})
 
 
 def _thread_state_terminal_metadata(snapshot):
@@ -1998,6 +2048,9 @@ async def _execute_run_request(req: Request, body: dict, progress=None):
     elif metadata.get("source") == "superset" and os.getenv("CW_AGENT_DELEGATION_REQUIRED", "false").lower() == "true":
         raise HTTPException(status_code=401, detail="Frontend delegation is required")
 
+    resumed_checkpoint = None
+    resumed_invocation_started = False
+    resumed_invocation_settled = False
     try:
         # A human applying reviewed source configuration uses the same renderer,
         # delegation and run lifecycle. This closed command never invokes an LLM.
@@ -2049,6 +2102,7 @@ async def _execute_run_request(req: Request, body: dict, progress=None):
                     "responders": [{"id": config_data["configurable"].get("langgraph_auth_user_id", "")}],
                     "thread_ts": thread_id}
                 origin_message_id = previous_id or client_message_id
+                resumed_checkpoint = prior_snapshot
             input_data = merge_checkpointed_turn_input(
                 prior_values,
                 input_data,
@@ -2107,10 +2161,12 @@ async def _execute_run_request(req: Request, body: dict, progress=None):
                 await graph.aupdate_state(config_data,
                     {"messages": result["messages"], **turn_identity}, as_node=next(iter(terminal_nodes)))
             else:
+                resumed_invocation_started = resume_payload is not None
                 result = await asyncio.wait_for(
                     graph.ainvoke(Command(resume=resume_payload) if resume_payload is not None else input_data, config=config_data),
                     timeout=GRAPH_TIMEOUT
                 )
+                resumed_invocation_settled = resumed_invocation_started
         interrupts = []
         try:
             interrupts = _interrupt_payloads(await graph.aget_state(config_data))
@@ -2151,6 +2207,7 @@ async def _execute_run_request(req: Request, body: dict, progress=None):
             "origin_user_id": origin_user_id,
         }
     except asyncio.TimeoutError:
+        resumed_invocation_settled = resumed_invocation_started
         detail = f"Request timed out after {GRAPH_TIMEOUT}s"
         LOGGER.warning(
             "run_end thread_id=%s run_id=%s client_message_id=%s "
@@ -2166,22 +2223,38 @@ async def _execute_run_request(req: Request, body: dict, progress=None):
                 graph,
                 config_data,
                 TimeoutError(detail),
+                resumed_invocation_started,
             )
         except Exception:
+            resumed_invocation_settled = False
             LOGGER.exception(
                 "Failed to persist terminal timeout for thread %s",
                 thread_id,
             )
         raise HTTPException(status_code=504, detail=detail)
     except Exception as e:
+        resumed_invocation_settled = resumed_invocation_started
         if has_command and isinstance(e, HTTPException):
             raise
+        if resumed_invocation_started:
+            try:
+                await _persist_thread_terminal_error(
+                    _checkpointer, graph, config_data, e, True)
+            except Exception:
+                resumed_invocation_settled = False
+                LOGGER.exception("Failed to persist resumed error for thread %s", thread_id)
         LOGGER.exception(
             "run_end thread_id=%s run_id=%s client_message_id=%s status=failed duration_s=%.1f: %s",
             thread_id, run_id, client_message_id, time.monotonic() - started, e,
         )
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        if resumed_invocation_settled:
+            try:
+                await _persist_resumed_turn_identity(
+                    _checkpointer, config_data, resumed_checkpoint)
+            except Exception:
+                LOGGER.exception("Failed to persist resumed turn identity for thread %s", thread_id)
         if delegation_handle is not None:
             reset_delegation(delegation_handle)
 
